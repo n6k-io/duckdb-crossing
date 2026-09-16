@@ -3,7 +3,7 @@ DUCKDB_SOURCE_DIR := $(PROJ_DIR)duckdb
 DUCKDB_BUILD_DIR := $(PROJ_DIR)build/duckdb
 BUILD_DIR := $(PROJ_DIR)build/crossing
 TEST_ARGS ?=
-JOBS ?= $(shell sysctl -n hw.ncpu)
+JOBS ?= $(shell nproc 2>/dev/null || sysctl -n hw.ncpu 2>/dev/null || echo 2)
 
 duckdb: $(DUCKDB_BUILD_DIR)/src/libduckdb_static.a
 
