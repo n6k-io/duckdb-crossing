@@ -166,8 +166,25 @@ bool IsRangeBoundary(WindowBoundary boundary) {
 	}
 }
 
+bool TryConstantValue(const Expression &expr, Value &out) {
+	if (expr.GetExpressionClass() == ExpressionClass::BOUND_CONSTANT) {
+		out = expr.Cast<BoundConstantExpression>().value;
+		return true;
+	}
+	if (expr.GetExpressionClass() == ExpressionClass::BOUND_CAST) {
+		Value inner;
+		if (!TryConstantValue(*expr.Cast<BoundCastExpression>().child, inner)) {
+			return false;
+		}
+		out = inner.DefaultCastAs(expr.return_type);
+		return true;
+	}
+	return false;
+}
+
 bool IsConstantOrNull(const unique_ptr<Expression> &expr) {
-	return !expr || expr->GetExpressionClass() == ExpressionClass::BOUND_CONSTANT;
+	Value ignored;
+	return !expr || TryConstantValue(*expr, ignored);
 }
 
 string WindowObstacle(const BoundWindowExpression &window) {
@@ -437,7 +454,8 @@ private:
 		case WindowBoundary::EXPR_FOLLOWING_ROWS:
 		case WindowBoundary::EXPR_FOLLOWING_RANGE: {
 			auto *side = yyjson_mut_obj(doc);
-			auto &constant = offset->Cast<BoundConstantExpression>().value;
+			Value constant;
+			TryConstantValue(*offset, constant);
 			yyjson_mut_obj_add_strcpy(doc, side, "offset", constant.ToString().c_str());
 			bool preceding =
 			    boundary == WindowBoundary::EXPR_PRECEDING_ROWS || boundary == WindowBoundary::EXPR_PRECEDING_RANGE;
