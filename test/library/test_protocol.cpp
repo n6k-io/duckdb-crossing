@@ -82,7 +82,7 @@ TEST_CASE("a partitioned reader that waits is drained on every partition", "[pro
 	twin.store->read_partitions = 3;
 	twin.Seed();
 
-	twin.Same("SELECT count(*) FROM far.orders");
+	twin.Same("SELECT id FROM far.orders");
 
 	REQUIRE(twin.store->partitions_read == set<idx_t> {0, 1, 2});
 	REQUIRE(twin.store->waits_served == 6);

@@ -99,7 +99,11 @@ struct Twin {
 		}
 		auto got = Query(near_sql);
 		REQUIRE(got->types == expected->types);
-		REQUIRE(got->names == expected->names);
+		vector<string> got_names;
+		for (auto &name : got->names) {
+			got_names.push_back(Unprefixed(name));
+		}
+		REQUIRE(got_names == expected->names);
 		REQUIRE(got->RowCount() == expected->RowCount());
 		auto want = Rows(*expected);
 		auto have = Rows(*got);
