@@ -28,7 +28,6 @@ build: duckdb
 test: build
 	@"$(BUILD_DIR)/crossing_unittest" $(TEST_ARGS)
 	@"$(BUILD_DIR)/crossing_library_unittest" $(TEST_ARGS)
-	@"$(BUILD_DIR)/crossing_substrait_unittest" $(TEST_ARGS)
 
 clean:
 	@rm -rf "$(PROJ_DIR)build"

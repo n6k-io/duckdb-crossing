@@ -55,22 +55,17 @@ file(GLOB CROSSING_TEST_SOURCES CONFIGURE_DEPENDS
 crossing_test_target(crossing_unittest ${CROSSING_ENGINE_SOURCES}
                      ${CROSSING_TEST_SOURCES})
 
+crossing_substrait_sources(CROSSING_SUBSTRAIT_SOURCES)
+crossing_substrait_includes(CROSSING_SUBSTRAIT_INCLUDES)
 file(GLOB CROSSING_LIBRARY_TEST_SOURCES CONFIGURE_DEPENDS
      ${CMAKE_CURRENT_SOURCE_DIR}/test/library/test_*.cpp)
 crossing_test_target(
   crossing_library_unittest ${CROSSING_LIBRARY_SOURCES}
-  test/toy_source/toy_source.cpp ${CROSSING_LIBRARY_TEST_SOURCES})
-
-crossing_substrait_sources(CROSSING_SUBSTRAIT_SOURCES)
-crossing_substrait_includes(CROSSING_SUBSTRAIT_INCLUDES)
-file(GLOB CROSSING_SUBSTRAIT_TEST_SOURCES CONFIGURE_DEPENDS
-     ${CMAKE_CURRENT_SOURCE_DIR}/test/render/test_*.cpp)
-crossing_test_target(
-  crossing_substrait_unittest ${CROSSING_SUBSTRAIT_SOURCES}
-  ${CROSSING_ROOT}/floor.cpp ${CROSSING_SUBSTRAIT_TEST_SOURCES})
+  ${CROSSING_SUBSTRAIT_SOURCES} test/far_source/far_source.cpp
+  ${CROSSING_LIBRARY_TEST_SOURCES})
 target_include_directories(
-  crossing_substrait_unittest
+  crossing_library_unittest
   PRIVATE ${CROSSING_SUBSTRAIT_INCLUDES}
           ${DUCKDB_SOURCE_DIR}/third_party/yyjson/include)
-target_link_libraries(crossing_substrait_unittest
+target_link_libraries(crossing_library_unittest
                       ${DUCKDB_BUILD_DIR}/third_party/yyjson/libduckdb_yyjson.a)
