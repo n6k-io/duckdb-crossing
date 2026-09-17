@@ -30,6 +30,8 @@ TEST_CASE("a whole chain crosses at once", "[split]") {
 	auto split = Split(PlanFromDSL("proj{c0, c1} | filter{true} | proj{c0, c1} | rows"), *fragment);
 
 	REQUIRE(!split.remainder);
+	REQUIRE(split.boundary_types == TwoIntegers());
+	REQUIRE(fragment->seam_types == TwoIntegers());
 	REQUIRE_FRAGMENT(*fragment, "proj{c0, c1} | proj{c0, c1} | filter{true} | proj{c0, c1} | rows");
 }
 

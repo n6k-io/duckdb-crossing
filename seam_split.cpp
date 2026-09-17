@@ -248,6 +248,7 @@ SeamSplit SplitFeedIntoSeam(unique_ptr<LogicalOperator> feed, CrossingFragment &
 
 	if (whole) {
 		SpliceReadRegionsIntoPlace(*cursor);
+		split.boundary_types = fragment.seam_types;
 	} else {
 		auto &boundary = *cursor;
 		boundary->ResolveOperatorTypes();
