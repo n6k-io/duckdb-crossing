@@ -188,6 +188,10 @@ bool IsConstantOrNull(const unique_ptr<Expression> &expr) {
 	return !expr || TryConstantValue(*expr, ignored);
 }
 
+bool IsIntegralOrNull(const unique_ptr<Expression> &expr) {
+	return !expr || expr->return_type.IsIntegral();
+}
+
 string WindowObstacle(const BoundWindowExpression &window) {
 	if (window.filter_expr) {
 		return "a window FILTER";
@@ -206,6 +210,9 @@ string WindowObstacle(const BoundWindowExpression &window) {
 	}
 	if (!IsConstantOrNull(window.start_expr) || !IsConstantOrNull(window.end_expr)) {
 		return "a non-constant frame bound";
+	}
+	if (!IsIntegralOrNull(window.start_expr) || !IsIntegralOrNull(window.end_expr)) {
+		return "a non-integer frame bound";
 	}
 	if (!IsConstantOrNull(window.offset_expr) || !IsConstantOrNull(window.default_expr)) {
 		return "a non-constant lead/lag offset or default";
@@ -616,6 +623,9 @@ private:
 	}
 
 	yyjson_mut_val *Measure(const BoundAggregateExpression &agg, const vector<ColumnBinding> &scope) {
+		if (agg.order_bys && !agg.order_bys->orders.empty()) {
+			throw NotImplementedException("substrait: an aggregate ORDER BY");
+		}
 		auto *measure = yyjson_mut_obj(doc);
 		auto *fn = yyjson_mut_obj(doc);
 		yyjson_mut_obj_add_uint(doc, fn, "functionReference", FunctionAnchor(agg.function.name));
@@ -1072,6 +1082,13 @@ bool SubstraitCanRenderCall(const Expression &expr, string &reason) {
 		reason = "substrait cannot carry a lambda";
 		return false;
 	}
+	if (cls == ExpressionClass::BOUND_AGGREGATE) {
+		auto &order_bys = expr.Cast<BoundAggregateExpression>().order_bys;
+		if (order_bys && !order_bys->orders.empty()) {
+			reason = "substrait cannot carry an aggregate ORDER BY";
+			return false;
+		}
+	}
 	if (cls == ExpressionClass::BOUND_COMPARISON && !ComparisonName(expr.GetExpressionType())) {
 		reason = string("substrait cannot carry comparison ") + EnumUtil::ToChars(expr.GetExpressionType());
 		return false;
@@ -1094,7 +1111,6 @@ bool SubstraitCanRenderOperator(const LogicalOperator &op, string &reason) {
 	case LogicalOperatorType::LOGICAL_PROJECTION:
 	case LogicalOperatorType::LOGICAL_WINDOW:
 	case LogicalOperatorType::LOGICAL_UNNEST:
-	case LogicalOperatorType::LOGICAL_LIMIT:
 	case LogicalOperatorType::LOGICAL_ORDER_BY:
 	case LogicalOperatorType::LOGICAL_TOP_N:
 	case LogicalOperatorType::LOGICAL_DISTINCT:
@@ -1102,11 +1118,20 @@ bool SubstraitCanRenderOperator(const LogicalOperator &op, string &reason) {
 	case LogicalOperatorType::LOGICAL_PIVOT:
 	case LogicalOperatorType::LOGICAL_CROSS_PRODUCT:
 	case LogicalOperatorType::LOGICAL_POSITIONAL_JOIN:
-	case LogicalOperatorType::LOGICAL_ANY_JOIN:
 	case LogicalOperatorType::LOGICAL_UNION:
 	case LogicalOperatorType::LOGICAL_EXCEPT:
 	case LogicalOperatorType::LOGICAL_INTERSECT:
 		return true;
+	case LogicalOperatorType::LOGICAL_LIMIT: {
+		auto &limit = op.Cast<LogicalLimit>();
+		for (auto *node : {&limit.limit_val, &limit.offset_val}) {
+			if (node->Type() != LimitNodeType::UNSET && node->Type() != LimitNodeType::CONSTANT_VALUE) {
+				reason = "substrait cannot carry a non-constant limit";
+				return false;
+			}
+		}
+		return true;
+	}
 	case LogicalOperatorType::LOGICAL_AGGREGATE_AND_GROUP_BY:
 		if (op.Cast<LogicalAggregate>().grouping_sets.size() > 1) {
 			reason = "substrait cannot carry grouping sets";
@@ -1114,13 +1139,15 @@ bool SubstraitCanRenderOperator(const LogicalOperator &op, string &reason) {
 		}
 		return true;
 	case LogicalOperatorType::LOGICAL_COMPARISON_JOIN:
-	case LogicalOperatorType::LOGICAL_ASOF_JOIN: {
-		auto &join = op.Cast<LogicalComparisonJoin>();
+	case LogicalOperatorType::LOGICAL_ASOF_JOIN:
+	case LogicalOperatorType::LOGICAL_ANY_JOIN: {
+		auto &join = op.Cast<LogicalJoin>();
 		if (!JoinTypeName(join.join_type)) {
 			reason = string("substrait cannot carry a ") + EnumUtil::ToChars(join.join_type) + " join";
 			return false;
 		}
-		if (!join.duplicate_eliminated_columns.empty()) {
+		if (op.type != LogicalOperatorType::LOGICAL_ANY_JOIN &&
+		    !op.Cast<LogicalComparisonJoin>().duplicate_eliminated_columns.empty()) {
 			reason = "substrait cannot carry a duplicate eliminated join";
 			return false;
 		}

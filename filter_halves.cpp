@@ -135,7 +135,8 @@ void SinkOneFilter(unique_ptr<LogicalOperator> &node) {
 	vector<unique_ptr<Expression>> kept;
 	for (auto &expr : filter.expressions) {
 		bool moved = false;
-		for (idx_t side = 0; side < join.children.size() && !moved; side++) {
+		bool movable = !expr->IsVolatile() && expr->IsConsistent();
+		for (idx_t side = 0; movable && side < join.children.size() && !moved; side++) {
 			auto &branch = join.children[side];
 			if (!SourceOfFirstScanBelow(*branch) || !BindsOnlyTo(*expr, TableIndicesOf(*branch))) {
 				continue;

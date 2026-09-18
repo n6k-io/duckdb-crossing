@@ -179,7 +179,8 @@ CrossingReader FarReader(shared_ptr<const vector<vector<Value>>> rows, idx_t par
                          shared_ptr<FarStore> store) {
 	idx_t cursor = 0;
 	auto handle = make_shared_ptr<ReaderHandle>(store);
-	return [=](ClientContext &, DataChunk &chunk, CrossingWaker waker) mutable {
+	return [rows, partitions, partition, store, cursor, handle](ClientContext &, DataChunk &chunk,
+	                                                            CrossingWaker waker) mutable {
 		{
 			lock_guard<mutex> guard(store->lock);
 			if (store->wait_before_chunks && store->arrived.erase(partition) == 0) {

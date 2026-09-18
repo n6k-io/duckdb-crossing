@@ -16,7 +16,6 @@ CrossingVerdict VerdictOn(const Expression &expr, CrossingSource &source) {
 	case ExpressionClass::BOUND_CONSTANT:
 	case ExpressionClass::BOUND_COMPARISON:
 	case ExpressionClass::BOUND_CONJUNCTION:
-	case ExpressionClass::BOUND_OPERATOR:
 	case ExpressionClass::BOUND_CAST:
 	case ExpressionClass::BOUND_BETWEEN:
 	case ExpressionClass::BOUND_CASE:
@@ -27,6 +26,7 @@ CrossingVerdict VerdictOn(const Expression &expr, CrossingSource &source) {
 			return CrossingVerdict::No("crossing does not move a lambda");
 		}
 		DUCKDB_EXPLICIT_FALLTHROUGH;
+	case ExpressionClass::BOUND_OPERATOR:
 	case ExpressionClass::BOUND_AGGREGATE:
 	case ExpressionClass::BOUND_WINDOW: {
 		auto call = source.AcceptsCall(expr);
