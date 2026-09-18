@@ -3,7 +3,7 @@
 #include "duckdb.hpp"
 #include "duckdb/catalog/catalog.hpp"
 #include "duckdb/common/types/column/column_data_collection.hpp"
-#include "duckdb/common/unordered_set.hpp"
+#include "duckdb/common/types/value_map.hpp"
 #include "duckdb/execution/physical_operator.hpp"
 #include "duckdb/function/table_function.hpp"
 #include "duckdb/main/client_context_state.hpp"
@@ -200,7 +200,7 @@ void WidenKeyedWritesForReturning(LogicalOperator &plan);
 
 struct CrossingWriteState : public GlobalSinkState {
 	unique_ptr<ColumnDataCollection> rows;
-	unordered_set<hash_t> seen_keys;
+	value_set_t seen_keys;
 	unique_ptr<ColumnDataCollection> returned;
 	ColumnDataScanState returned_scan;
 	bool returned_scanning = false;

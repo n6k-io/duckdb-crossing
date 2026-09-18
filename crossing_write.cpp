@@ -8,7 +8,6 @@
 
 #include "duckdb/common/numeric_utils.hpp"
 #include "duckdb/common/string_util.hpp"
-#include "duckdb/common/types/hash.hpp"
 #include "duckdb/execution/expression_executor.hpp"
 #include "duckdb/execution/operator/persistent/physical_merge_into.hpp"
 #include "duckdb/execution/physical_plan_generator.hpp"
@@ -448,11 +447,11 @@ InsertionOrderPreservingMap<string> CrossingWholeWrite::ParamsToString() const {
 }
 
 void CrossingWriteState::SeeKey(DataChunk &chunk, const vector<idx_t> &key_positions, idx_t index) {
-	hash_t combined = 0;
+	child_list_t<Value> key;
 	for (idx_t k = 0; k < key_positions.size(); k++) {
-		combined = Hash(combined ^ chunk.GetValue(key_positions[k], index).Hash() ^ (0x9E3779B97F4A7C15ULL * (k + 1)));
+		key.emplace_back(to_string(k), chunk.GetValue(key_positions[k], index));
 	}
-	seen_keys.insert(combined);
+	seen_keys.insert(Value::STRUCT(std::move(key)));
 }
 
 const string &CrossingSeamEntriesKey() {
@@ -573,7 +572,9 @@ static unique_ptr<MergeIntoOperator> PlanCrossingMergeAction(ClientContext &cont
 		auto key_types = ColumnTypesByName(table, seam.key_columns);
 		for (idx_t k = 0; k < key_types.size(); k++) {
 			keyed.seam_row.push_back(RefAt(key_types[k], op.row_id_start + k));
-			keyed.key_positions.push_back(op.row_id_start + k);
+			if (!table.described.key_unique) {
+				keyed.key_positions.push_back(op.row_id_start + k);
+			}
 		}
 		vector<unique_ptr<Expression>> set_values;
 		for (idx_t i = 0; i < action.expressions.size(); i++) {
