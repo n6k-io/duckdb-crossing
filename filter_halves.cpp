@@ -3,6 +3,10 @@
 #include "internal/source.hpp"
 #include "internal/source_evaluation.hpp"
 
+#include "duckdb/common/set.hpp"
+#include "duckdb/planner/expression/bound_columnref_expression.hpp"
+#include "duckdb/planner/expression_iterator.hpp"
+#include "duckdb/planner/operator/logical_comparison_join.hpp"
 #include "duckdb/planner/operator/logical_filter.hpp"
 
 namespace duckdb {
@@ -90,7 +94,85 @@ bool RejoinOneFilter(LogicalOperator &op) {
 	return true;
 }
 
+bool IsInnerJoin(LogicalOperator &op) {
+	switch (op.type) {
+	case LogicalOperatorType::LOGICAL_CROSS_PRODUCT:
+		return true;
+	case LogicalOperatorType::LOGICAL_COMPARISON_JOIN:
+	case LogicalOperatorType::LOGICAL_ANY_JOIN:
+		return op.Cast<LogicalJoin>().join_type == JoinType::INNER;
+	default:
+		return false;
+	}
+}
+
+set<idx_t> TableIndicesOf(LogicalOperator &op) {
+	set<idx_t> out;
+	for (auto &binding : op.GetColumnBindings()) {
+		out.insert(binding.table_index);
+	}
+	return out;
+}
+
+bool BindsOnlyTo(const Expression &expr, const set<idx_t> &tables) {
+	bool within = true;
+	ExpressionIterator::EnumerateChildren(expr, [&](const Expression &child) {
+		within = within && BindsOnlyTo(child, tables);
+	});
+	if (expr.GetExpressionClass() == ExpressionClass::BOUND_COLUMN_REF) {
+		within = within && tables.count(expr.Cast<BoundColumnRefExpression>().binding.table_index) > 0;
+	}
+	return within;
+}
+
+void SinkOneFilter(unique_ptr<LogicalOperator> &node) {
+	auto &filter = node->Cast<LogicalFilter>();
+	if (filter.children.size() != 1 || !filter.projection_map.empty() || !IsInnerJoin(*filter.children[0])) {
+		return;
+	}
+	auto &join = *filter.children[0];
+	vector<vector<unique_ptr<Expression>>> sunk(join.children.size());
+	vector<unique_ptr<Expression>> kept;
+	for (auto &expr : filter.expressions) {
+		bool moved = false;
+		for (idx_t side = 0; side < join.children.size() && !moved; side++) {
+			auto &branch = join.children[side];
+			if (!SourceOfFirstScanBelow(*branch) || !BindsOnlyTo(*expr, TableIndicesOf(*branch))) {
+				continue;
+			}
+			sunk[side].push_back(std::move(expr));
+			moved = true;
+		}
+		if (!moved) {
+			kept.push_back(std::move(expr));
+		}
+	}
+	for (idx_t side = 0; side < join.children.size(); side++) {
+		if (sunk[side].empty()) {
+			continue;
+		}
+		auto below = make_uniq<LogicalFilter>();
+		below->expressions = std::move(sunk[side]);
+		below->children.push_back(std::move(join.children[side]));
+		below->ResolveOperatorTypes();
+		join.children[side] = std::move(below);
+	}
+	filter.expressions = std::move(kept);
+	if (filter.expressions.empty()) {
+		node = std::move(filter.children[0]);
+	}
+}
+
 } // namespace
+
+void SinkFiltersIntoJoinBranches(unique_ptr<LogicalOperator> &plan) {
+	for (auto &child : plan->children) {
+		SinkFiltersIntoJoinBranches(child);
+	}
+	if (plan->type == LogicalOperatorType::LOGICAL_FILTER) {
+		SinkOneFilter(plan);
+	}
+}
 
 void SplitFiltersAtEvaluableHalf(unique_ptr<LogicalOperator> &plan) {
 	for (auto &child : plan->children) {

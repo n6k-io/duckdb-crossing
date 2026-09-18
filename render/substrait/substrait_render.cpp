@@ -20,6 +20,7 @@
 #include "duckdb/planner/expression/bound_window_expression.hpp"
 #include "duckdb/planner/operator/logical_aggregate.hpp"
 #include "duckdb/planner/operator/logical_any_join.hpp"
+#include "duckdb/planner/operator/logical_column_data_get.hpp"
 #include "duckdb/planner/operator/logical_comparison_join.hpp"
 #include "duckdb/planner/operator/logical_cross_product.hpp"
 #include "duckdb/planner/operator/logical_distinct.hpp"
@@ -680,6 +681,31 @@ private:
 		return Wrap("read", read);
 	}
 
+	yyjson_mut_val *SeamRead(LogicalColumnDataGet &rows, vector<ColumnBinding> &out) {
+		auto *read = yyjson_mut_obj(doc);
+		auto *base = yyjson_mut_obj(doc);
+		auto *names = yyjson_mut_arr(doc);
+		auto *types = yyjson_mut_arr(doc);
+		auto *named = yyjson_mut_obj(doc);
+		auto *table_names = yyjson_mut_arr(doc);
+
+		yyjson_mut_arr_add_strcpy(doc, table_names, SUBSTRAIT_SEAM_TABLE);
+		for (idx_t i = 0; i < rows.chunk_types.size(); i++) {
+			yyjson_mut_arr_add_strcpy(doc, names, ("c" + std::to_string(i)).c_str());
+			yyjson_mut_arr_add_val(types, Type(rows.chunk_types[i]));
+		}
+		auto *struct_type = yyjson_mut_obj(doc);
+		yyjson_mut_obj_add_val(doc, struct_type, "types", types);
+		yyjson_mut_obj_add_str(doc, struct_type, "nullability", "NULLABILITY_REQUIRED");
+		yyjson_mut_obj_add_val(doc, base, "names", names);
+		yyjson_mut_obj_add_val(doc, base, "struct", struct_type);
+		yyjson_mut_obj_add_val(doc, read, "baseSchema", base);
+		yyjson_mut_obj_add_val(doc, named, "names", table_names);
+		yyjson_mut_obj_add_val(doc, read, "namedTable", named);
+		out = rows.GetColumnBindings();
+		return Wrap("read", read);
+	}
+
 	yyjson_mut_val *Fetch(yyjson_mut_val *input, idx_t offset, idx_t count, bool has_count) {
 		auto *fetch = yyjson_mut_obj(doc);
 		yyjson_mut_obj_add_val(doc, fetch, "input", input);
@@ -840,6 +866,8 @@ private:
 		switch (op.type) {
 		case LogicalOperatorType::LOGICAL_GET:
 			return Read(op.Cast<LogicalGet>(), out);
+		case LogicalOperatorType::LOGICAL_CHUNK_GET:
+			return SeamRead(op.Cast<LogicalColumnDataGet>(), out);
 		case LogicalOperatorType::LOGICAL_FILTER: {
 			auto &filter = op.Cast<LogicalFilter>();
 			if (filter.HasProjectionMap()) {
@@ -1039,6 +1067,11 @@ bool SubstraitCanRenderCall(const Expression &expr, string &reason) {
 			return false;
 		}
 	}
+	if (cls == ExpressionClass::BOUND_FUNCTION &&
+	    expr.Cast<BoundFunctionExpression>().function.HasBindLambdaCallback()) {
+		reason = "substrait cannot carry a lambda";
+		return false;
+	}
 	if (cls == ExpressionClass::BOUND_COMPARISON && !ComparisonName(expr.GetExpressionType())) {
 		reason = string("substrait cannot carry comparison ") + EnumUtil::ToChars(expr.GetExpressionType());
 		return false;
@@ -1056,6 +1089,7 @@ bool SubstraitCanRenderCall(const Expression &expr, string &reason) {
 bool SubstraitCanRenderOperator(const LogicalOperator &op, string &reason) {
 	switch (op.type) {
 	case LogicalOperatorType::LOGICAL_GET:
+	case LogicalOperatorType::LOGICAL_CHUNK_GET:
 	case LogicalOperatorType::LOGICAL_FILTER:
 	case LogicalOperatorType::LOGICAL_PROJECTION:
 	case LogicalOperatorType::LOGICAL_WINDOW:

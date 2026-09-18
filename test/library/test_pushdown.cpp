@@ -232,6 +232,22 @@ TEST_CASE("expressions the source knows cross inside filters and projections", "
 	REQUIRE(twin.LastRead().Has(Op::LOGICAL_UNNEST));
 }
 
+TEST_CASE("an operator the source refuses stays, with everything above it", "[pushdown]") {
+	auto transport = EACH_TRANSPORT();
+	INFO(TransportName(transport));
+	Twin twin(transport);
+	twin.store->refused_operators.push_back(Op::LOGICAL_AGGREGATE_AND_GROUP_BY);
+	twin.Seed();
+
+	twin.Same("SELECT tenant, sum(amt) FROM far.orders WHERE amt > 100 GROUP BY tenant ORDER BY tenant");
+
+	auto &call = twin.LastRead();
+	REQUIRE(!call.Has(Op::LOGICAL_AGGREGATE_AND_GROUP_BY));
+	REQUIRE(!call.Has(Op::LOGICAL_ORDER_BY));
+	REQUIRE(call.Has(Op::LOGICAL_FILTER));
+	REQUIRE(call.rows.size() == 4);
+}
+
 TEST_CASE("a volatile function never crosses", "[pushdown]") {
 	auto transport = EACH_TRANSPORT();
 	INFO(TransportName(transport));

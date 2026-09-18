@@ -83,7 +83,7 @@ struct Twin {
 	}
 
 	static string Unprefixed(string sql) {
-		return StringUtil::Replace(sql, "far.", "");
+		return StringUtil::Replace(StringUtil::Replace(sql, "far.", ""), "b.", "");
 	}
 
 	void Same(const string &near_sql) {

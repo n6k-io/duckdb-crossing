@@ -7,10 +7,36 @@ TEST_CASE("a partitioned reader is drained on every partition and every row arri
 	twin.store->read_partitions = 3;
 	twin.Seed();
 
-	twin.Same("SELECT id FROM far.orders ORDER BY id");
+	twin.Same("SELECT id FROM far.orders");
 
 	REQUIRE(twin.store->partitions_read == set<idx_t> {0, 1, 2});
+	REQUIRE(!twin.LastRead().ordered);
 	twin.Same("SELECT count(DISTINCT id), count(*) FROM far.orders");
+}
+
+TEST_CASE("an ordered read is asked of the source as one partition", "[protocol]") {
+	Twin twin(Transport::NATIVE);
+	twin.store->read_partitions = 3;
+	twin.Seed();
+
+	twin.Same("SELECT id FROM far.orders ORDER BY id");
+	REQUIRE(twin.LastRead().ordered);
+	REQUIRE(twin.store->partitions_read == set<idx_t> {0});
+
+	twin.Same("SELECT id FROM far.orders WHERE amt > 100 ORDER BY amt DESC LIMIT 2");
+	REQUIRE(twin.LastRead().ordered);
+}
+
+TEST_CASE("a source that partitions an ordered read is refused, not trusted", "[protocol]") {
+	Twin twin(Transport::NATIVE);
+	twin.store->read_partitions = 3;
+	twin.store->partition_ordered_reads = true;
+	twin.Seed();
+
+	auto error = twin.Error("SELECT id FROM far.orders ORDER BY id");
+
+	REQUIRE_THAT(error, Catch::Contains("is ordered but the source offered 3 partitions"));
+	twin.Same("SELECT id FROM far.orders");
 }
 
 TEST_CASE("a partitioned reader feeds a keyed write", "[protocol]") {
@@ -22,8 +48,12 @@ TEST_CASE("a partitioned reader feeds a keyed write", "[protocol]") {
 	auto result = twin.Query("UPDATE far.orders SET amt = amt + 1 WHERE amt > 100");
 
 	REQUIRE(result->GetValue(0, 0) == Value::BIGINT(4));
-	twin.Same("SELECT amt FROM far.orders ORDER BY id");
-	REQUIRE(twin.store->con.Query("SELECT amt FROM orders WHERE id = 2")->GetValue(0, 0) == Value::INTEGER(151));
+	REQUIRE(twin.store->partitions_read == set<idx_t> {0, 1});
+	for (auto &row : twin.LastWrite().rows) {
+		INFO(row[0].ToString() << " -> " << row[1].ToString());
+		REQUIRE(row[1] == Value::INTEGER(row[0].GetValue<int32_t>() * 100 - 49));
+	}
+	twin.Same("SELECT id, amt FROM far.orders ORDER BY id");
 }
 
 TEST_CASE("every reader opened is released when the statement is done", "[protocol]") {

@@ -28,6 +28,20 @@ void EmitRowIds(Vector &rowid_vec, DataChunk &source_chunk, CrossingReadGlobalSt
 	}
 }
 
+bool PlanIsOrdered(const LogicalOperator &op) {
+	switch (op.type) {
+	case LogicalOperatorType::LOGICAL_ORDER_BY:
+	case LogicalOperatorType::LOGICAL_TOP_N:
+		return true;
+	case LogicalOperatorType::LOGICAL_PROJECTION:
+	case LogicalOperatorType::LOGICAL_FILTER:
+	case LogicalOperatorType::LOGICAL_LIMIT:
+		return !op.children.empty() && PlanIsOrdered(*op.children[0]);
+	default:
+		return false;
+	}
+}
+
 void EmitChunk(CrossingReadGlobalState &state, DataChunk &source_chunk, DataChunk &output) {
 	output.SetCardinality(source_chunk.size());
 	for (idx_t idx = 0; idx < state.column_ids.size(); idx++) {
@@ -142,6 +156,7 @@ unique_ptr<GlobalSourceState> CrossingRead::GetGlobalSourceState(ClientContext &
 	}
 	state->query = make_uniq<CrossingQuery>(CrossingVerb::SELECT, *bind_data->fragment->plan);
 	state->query->types = emitted;
+	state->query->ordered = PlanIsOrdered(*bind_data->fragment->plan);
 	state->query->tables = CrossingTablesOf(*bind_data->fragment->plan);
 
 	auto &write_catalog = bind_data->table.get_mutable()->ParentCatalog();
@@ -153,6 +168,11 @@ unique_ptr<GlobalSourceState> CrossingRead::GetGlobalSourceState(ClientContext &
 	state->partitions = state->scan.partitions;
 	if (state->partitions == 0) {
 		throw InvalidInputException("crossing: the scan of '%s' offers no partitions", bind_data->source_table);
+	}
+	if (state->query->ordered && state->partitions > 1) {
+		throw InvalidInputException("crossing: the scan of '%s' is ordered but the source offered %llu partitions; "
+		                            "an ordered scan must come back as one",
+		                            bind_data->source_table, state->partitions);
 	}
 	return std::move(state);
 }

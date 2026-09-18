@@ -14,7 +14,7 @@ namespace {
 class EvaluableRule : public CrossingRule {
 public:
 	bool CanCross(LogicalOperator &op, CrossingSource &source) const override {
-		return CanEvaluateAll(op, source);
+		return source.AcceptsOperator(op).ok && CanEvaluateAll(op, source);
 	}
 };
 

@@ -187,7 +187,7 @@ TEST_CASE("a delete of nothing hands the source nothing and reports zero", "[wri
 	REQUIRE(Scalar(twin, "SELECT count(*) FROM orders") == Value::BIGINT(5));
 }
 
-TEST_CASE("the reported count is what the source changed, not what it was handed", "[writes]") {
+TEST_CASE("a key that identifies more than one source row fails the write and rolls it back", "[writes]") {
 	auto transport = EACH_TRANSPORT();
 	INFO(TransportName(transport));
 	Twin twin(transport);
@@ -197,11 +197,12 @@ TEST_CASE("the reported count is what the source changed, not what it was handed
 	twin.Far("INSERT INTO dup VALUES (1, 1), (1, 2), (2, 3)");
 	twin.Attach();
 
-	auto result = twin.Query("UPDATE far.dup SET v = 9 WHERE k = 1");
+	auto error = twin.Error("UPDATE far.dup SET v = 9 WHERE k = 1");
 
-	REQUIRE(result->GetValue(0, 0) == Value::BIGINT(2));
-	REQUIRE(twin.LastWrite().rows.size() == 1);
-	REQUIRE(Scalar(twin, "SELECT count(*) FROM dup WHERE v = 9") == Value::BIGINT(2));
+	REQUIRE_THAT(error, Catch::Contains("the declared key (k) is not unique on the source"));
+	REQUIRE(twin.LastWrite().rows.size() == 2);
+	REQUIRE(twin.store->transaction_ends.back() == "rollback");
+	REQUIRE(Scalar(twin, "SELECT count(*) FROM dup WHERE v = 9") == Value::BIGINT(0));
 }
 
 TEST_CASE("a merge lands its inserts and updates on the source", "[writes]") {

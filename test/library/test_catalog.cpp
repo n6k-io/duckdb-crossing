@@ -87,8 +87,10 @@ TEST_CASE("a description is taken once per table for the life of the attach", "[
 
 	twin.Query("SELECT id FROM far.orders");
 	twin.Far("ALTER TABLE orders ADD COLUMN extra INTEGER DEFAULT 1");
-	REQUIRE_THAT(twin.Error("SELECT * FROM far.orders LIMIT 1"),
-	             Catch::Contains("produces 7 columns, its description names 6"));
+	auto error = twin.Error("SELECT * FROM far.orders LIMIT 1");
+	REQUIRE_THAT(error, Catch::Contains("Catalog Error"));
+	REQUIRE_THAT(error, Catch::Contains("'orders' changed on the source"));
+	REQUIRE_THAT(error, !Catch::Contains("INTERNAL"));
 
 	AttachedAs(twin, "far").Refresh();
 

@@ -1,5 +1,6 @@
 #include "internal/source_evaluation.hpp"
 
+#include "duckdb/planner/expression/bound_function_expression.hpp"
 #include "duckdb/planner/expression_iterator.hpp"
 #include "duckdb/planner/logical_operator_visitor.hpp"
 
@@ -22,6 +23,10 @@ CrossingVerdict VerdictOn(const Expression &expr, CrossingSource &source) {
 	case ExpressionClass::BOUND_UNNEST:
 		break;
 	case ExpressionClass::BOUND_FUNCTION:
+		if (expr.Cast<BoundFunctionExpression>().function.HasBindLambdaCallback()) {
+			return CrossingVerdict::No("crossing does not move a lambda");
+		}
+		DUCKDB_EXPLICIT_FALLTHROUGH;
 	case ExpressionClass::BOUND_AGGREGATE:
 	case ExpressionClass::BOUND_WINDOW: {
 		auto call = source.AcceptsCall(expr);

@@ -32,6 +32,10 @@ CrossingVerdict CrossingSource::AcceptsType(const LogicalType &) {
 	return CrossingVerdict::No("this source holds only what it was described with");
 }
 
+CrossingVerdict CrossingSource::AcceptsOperator(const LogicalOperator &) {
+	return CrossingVerdict::Yes();
+}
+
 void CrossingSource::Detach(ClientContext &) {
 }
 

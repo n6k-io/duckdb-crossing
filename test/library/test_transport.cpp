@@ -53,6 +53,18 @@ TEST_CASE("a substrait write fed by a read of the same source renders as that re
 	REQUIRE(call.rows == vector<vector<Value>> {{Value::INTEGER(2), Value::INTEGER(0)}});
 }
 
+TEST_CASE("a substrait write carrying rows reads them from the seam table", "[transport]") {
+	Twin twin(Transport::SUBSTRAIT);
+	twin.Seed();
+
+	twin.Query("INSERT INTO far.orders VALUES (6, 'zeta', 600, 3, 6.5, NULL)");
+
+	auto &call = twin.LastWrite();
+	REQUIRE(call.wire.find("\"namedTable\":{\"names\":[\"seam\"]}") != string::npos);
+	REQUIRE(call.rows.size() == 1);
+	twin.Same("SELECT * FROM far.orders ORDER BY id");
+}
+
 TEST_CASE("what the source cannot render is never offered to it", "[transport]") {
 	auto transport = EACH_TRANSPORT();
 	INFO(TransportName(transport));

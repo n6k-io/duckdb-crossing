@@ -21,6 +21,7 @@ struct FarCall {
 	vector<CrossingTableUse> tables;
 	vector<LogicalOperatorType> operators;
 	vector<LogicalType> types;
+	bool ordered = false;
 	vector<string> key_columns;
 	vector<string> set_columns;
 	vector<vector<Value>> rows;
@@ -42,6 +43,7 @@ struct FarStore {
 
 	case_insensitive_set_t refused_functions;
 	vector<LogicalTypeId> refused_types;
+	vector<LogicalOperatorType> refused_operators;
 	case_insensitive_map_t<vector<string>> keys;
 	case_insensitive_map_t<bool> key_unique;
 	case_insensitive_map_t<vector<CrossingVerb>> verbs;
@@ -56,6 +58,7 @@ struct FarStore {
 	idx_t sessions_begun = 0;
 
 	idx_t read_partitions = 1;
+	bool partition_ordered_reads = false;
 	set<idx_t> partitions_read;
 	bool wait_before_chunks = false;
 	bool wake_before_returning = false;
@@ -85,6 +88,7 @@ public:
 	CrossingPlan Plan(const CrossingPlanRequest &request) override;
 	CrossingVerdict AcceptsCall(const Expression &expr) override;
 	CrossingVerdict AcceptsType(const LogicalType &type) override;
+	CrossingVerdict AcceptsOperator(const LogicalOperator &op) override;
 	unique_ptr<CrossingSession> Begin(ClientContext &context) override;
 	void Detach(ClientContext &context) override;
 

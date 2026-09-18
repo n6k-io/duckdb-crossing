@@ -3,6 +3,7 @@
 #include "internal/plan_wire.hpp"
 
 #include "duckdb/common/types/column/column_data_collection.hpp"
+#include "duckdb/main/appender.hpp"
 #include "duckdb/main/extension/extension_loader.hpp"
 #include "duckdb/main/materialized_query_result.hpp"
 #include "duckdb/main/relation.hpp"
@@ -56,6 +57,18 @@ vector<vector<Value>> RowsOf(const ColumnDataCollection &collection) {
 		}
 	}
 	return out;
+}
+
+optional_ptr<const ColumnDataCollection> FindSeamRows(const LogicalOperator &op) {
+	if (auto rows = SeamRowsOf(op)) {
+		return rows;
+	}
+	for (auto &child : op.children) {
+		if (auto rows = FindSeamRows(*child)) {
+			return rows;
+		}
+	}
+	return nullptr;
 }
 
 void CollectOperators(const LogicalOperator &op, vector<LogicalOperatorType> &out) {
@@ -366,6 +379,19 @@ CrossingVerdict FarSource::AcceptsType(const LogicalType &type) {
 	return CrossingVerdict::Yes();
 }
 
+CrossingVerdict FarSource::AcceptsOperator(const LogicalOperator &op) {
+	string reason;
+	if (!SubstraitCanRenderOperator(op, reason)) {
+		return CrossingVerdict::No(reason);
+	}
+	for (auto refused : store->refused_operators) {
+		if (op.type == refused) {
+			return CrossingVerdict::No("far refuses " + string(LogicalOperatorToString(op.type)));
+		}
+	}
+	return CrossingVerdict::Yes();
+}
+
 unique_ptr<CrossingSession> FarSource::Begin(ClientContext &) {
 	lock_guard<mutex> guard(store->lock);
 	store->sessions_begun++;
@@ -403,9 +429,10 @@ FarCall FarSession::Record(const CrossingQuery &query) {
 	FarCall call;
 	call.kind = query.kind;
 	call.plan_text = query.plan.ToString();
-	call.tables = CrossingTablesOf(query.plan);
+	call.tables = query.tables;
 	CollectOperators(query.plan, call.operators);
 	call.types = query.types;
+	call.ordered = query.ordered;
 	call.key_columns = query.key_columns;
 	call.set_columns = query.set_columns;
 	return call;
@@ -421,7 +448,24 @@ vector<vector<Value>> FarSession::EvaluateNative(const LogicalOperator &plan, Fa
 
 vector<vector<Value>> FarSession::EvaluateSubstrait(const LogicalOperator &plan, FarCall &call) {
 	call.wire = RenderSubstraitJson(plan);
-	auto rel = DecodeSubstraitJson(far, FAR_CATALOG, call.wire, "");
+	string seam_view;
+	if (auto rows = FindSeamRows(plan)) {
+		seam_view = "crossing_seam_rows";
+		string columns;
+		for (idx_t c = 0; c < rows->Types().size(); c++) {
+			columns += (c ? ", c" : "c") + to_string(c) + " " + rows->Types()[c].ToString();
+		}
+		auto created = far.Query("CREATE OR REPLACE TEMP TABLE " + seam_view + "(" + columns + ")");
+		if (created->HasError()) {
+			created->ThrowError();
+		}
+		Appender appender(far, "temp", "main", seam_view);
+		for (auto &chunk : rows->Chunks()) {
+			appender.AppendDataChunk(chunk);
+		}
+		appender.Close();
+	}
+	auto rel = DecodeSubstraitJson(far, FAR_CATALOG, call.wire, seam_view);
 	call.received_text = rel->ToString();
 	return RowsOf(*rel->Execute());
 }
@@ -442,7 +486,7 @@ CrossingScan FarSession::Read(ClientContext &, const CrossingQuery &query) {
 	call.rows = *rows;
 	lock_guard<mutex> guard(store->lock);
 	store->reads.push_back(std::move(call));
-	auto partitions = store->read_partitions;
+	auto partitions = query.ordered && !store->partition_ordered_reads ? 1 : store->read_partitions;
 	auto store_ref = store;
 	CrossingScan scan;
 	scan.partitions = partitions;
