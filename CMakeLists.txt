@@ -45,9 +45,16 @@ function(crossing_test_target target)
     PRIVATE ${DUCKDB_SOURCE_DIR}/src/include
             ${DUCKDB_SOURCE_DIR}/third_party/catch ${CMAKE_CURRENT_SOURCE_DIR}
             ${CROSSING_INCLUDES} ${CMAKE_CURRENT_SOURCE_DIR}/test)
-  target_link_libraries(
-    ${target} ${DUCKDB_LOADER_LIB} ${DUCKDB_CORE_FUNCTIONS_LIB}
-    ${DUCKDB_STATIC_LIB} Threads::Threads)
+  if(APPLE)
+    target_link_libraries(
+      ${target} ${DUCKDB_LOADER_LIB} ${DUCKDB_CORE_FUNCTIONS_LIB}
+      ${DUCKDB_STATIC_LIB} Threads::Threads)
+  else()
+    target_link_libraries(
+      ${target} -Wl,--start-group ${DUCKDB_LOADER_LIB}
+      ${DUCKDB_CORE_FUNCTIONS_LIB} ${DUCKDB_STATIC_LIB} -Wl,--end-group
+      Threads::Threads ${CMAKE_DL_LIBS})
+  endif()
 endfunction()
 
 file(GLOB CROSSING_TEST_SOURCES CONFIGURE_DEPENDS
