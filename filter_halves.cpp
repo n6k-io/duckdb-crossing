@@ -116,9 +116,8 @@ set<idx_t> TableIndicesOf(LogicalOperator &op) {
 
 bool BindsOnlyTo(const Expression &expr, const set<idx_t> &tables) {
 	bool within = true;
-	ExpressionIterator::EnumerateChildren(expr, [&](const Expression &child) {
-		within = within && BindsOnlyTo(child, tables);
-	});
+	ExpressionIterator::EnumerateChildren(
+	    expr, [&](const Expression &child) { within = within && BindsOnlyTo(child, tables); });
 	if (expr.GetExpressionClass() == ExpressionClass::BOUND_COLUMN_REF) {
 		within = within && tables.count(expr.Cast<BoundColumnRefExpression>().binding.table_index) > 0;
 	}

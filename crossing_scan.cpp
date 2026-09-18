@@ -74,8 +74,7 @@ unique_ptr<FunctionData> MakeCrossingScanBindData(CrossingTableCatalogEntry &ent
 	if (fragment->floor_bindings.size() != fragment->column_names.size()) {
 		throw CatalogException("crossing: '%s' changed on the source: its scan produces %llu columns, the "
 		                       "description taken at attach names %llu; refresh the attach",
-		                       bind_data->source_table, fragment->floor_bindings.size(),
-		                       fragment->column_names.size());
+		                       bind_data->source_table, fragment->floor_bindings.size(), fragment->column_names.size());
 	}
 	fragment->SealFloor(*floor);
 	fragment->floor = std::move(floor);

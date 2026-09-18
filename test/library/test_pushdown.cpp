@@ -314,7 +314,8 @@ TEST_CASE("set operations, distinct, subqueries and CTEs over one source cross",
 	twin.Same("WITH big AS (SELECT * FROM far.orders WHERE amt > 100) SELECT count(*) FROM big");
 	twin.Same("SELECT count(*) FROM far.orders o, far.customers c WHERE o.tenant = c.tenant");
 	twin.Same("SELECT DISTINCT ON (tenant) tenant, id FROM far.orders ORDER BY tenant, amt DESC");
-	twin.Same("SELECT o.id, c.tenant FROM far.orders o ASOF JOIN far.customers c ON o.tenant >= c.tenant ORDER BY o.id");
+	twin.Same(
+	    "SELECT o.id, c.tenant FROM far.orders o ASOF JOIN far.customers c ON o.tenant >= c.tenant ORDER BY o.id");
 	twin.Same("SELECT o.id, c.cname FROM (SELECT id FROM far.orders ORDER BY id) o POSITIONAL JOIN (SELECT cname FROM "
 	          "far.customers ORDER BY cname) c ORDER BY o.id");
 	twin.Same("PIVOT far.sales ON quarter USING sum(amount) GROUP BY region ORDER BY region");
