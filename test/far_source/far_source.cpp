@@ -273,7 +273,7 @@ vector<string> FarSource::Schemas() {
 	lock_guard<mutex> guard(store->lock);
 	auto result =
 	    store->con.Query("SELECT schema_name FROM duckdb_schemas() WHERE database_name = '" + string(FAR_CATALOG) +
-		                 "' AND schema_name NOT IN ('information_schema', 'pg_catalog') ORDER BY 1");
+	                     "' AND schema_name NOT IN ('information_schema', 'pg_catalog') ORDER BY 1");
 	vector<string> names;
 	for (auto &row : RowsOf(*result)) {
 		names.push_back(row[0].GetValue<string>());
