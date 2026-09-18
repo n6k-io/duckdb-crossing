@@ -99,6 +99,14 @@ TEST_CASE("a join with a branch on the target keeps the join outside", "[pass]")
 	REQUIRE_PLAN(plan, "join(crossing[proj{id, amt} | scan], local)");
 }
 
+TEST_CASE("a filter over a join sinks into the branch it belongs to and crosses there", "[pass]") {
+	auto plan = PlanFromDSL("filter{amt > 100} | join(crossing[proj{id, amt} | scan], local)");
+
+	MoveCrossableWorkIntoFragments(plan, TestIndices());
+
+	REQUIRE_PLAN(plan, "join(crossing[filter{amt > 100} | proj{id, amt} | scan], local)");
+}
+
 TEST_CASE("rows the target holds fold in beside a scan", "[pass]") {
 	auto plan = PlanFromDSL("join(crossing[proj{id, amt} | scan], rows)");
 

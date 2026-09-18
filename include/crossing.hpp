@@ -115,6 +115,7 @@ struct CrossingQuery {
 	const LogicalOperator &plan;
 	//! The row types: what a read produces, what a write is handed.
 	vector<LogicalType> types;
+	bool ordered = false;
 	vector<CrossingTableUse> tables;
 	//! What an update or a delete addresses rows by. An insert names none.
 	vector<string> key_columns;
@@ -273,6 +274,8 @@ public:
 	virtual CrossingVerdict AcceptsCall(const Expression &expr);
 
 	virtual CrossingVerdict AcceptsType(const LogicalType &type);
+
+	virtual CrossingVerdict AcceptsOperator(const LogicalOperator &op);
 
 	virtual unique_ptr<CrossingSession> Begin(ClientContext &context) = 0;
 

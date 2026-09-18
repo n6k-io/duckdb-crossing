@@ -31,6 +31,7 @@ class ToyDB : public CrossingSource {
 	// 2. compute
 	CrossingVerdict AcceptsCall(const Expression &expr) override;
 	CrossingVerdict AcceptsType(const LogicalType &type) override;
+	CrossingVerdict AcceptsOperator(const LogicalOperator &op) override;
 
 	// 3. run
 	unique_ptr<CrossingSession> Begin(ClientContext &context) override;
@@ -47,7 +48,7 @@ class ToySession : public CrossingSession {
 `Tables`, `Describe`, `Plan` and `Begin` must be implemented on the source, and
 `Read` on the session. `Schemas` has a base implementation returning `main`.
 `AcceptsCall` and `AcceptsType` say no by default, so a source that computes
-nothing leaves them alone. `Write` on the session refuses by default, so a
+nothing leaves them alone; `AcceptsOperator` says yes by default. `Write` on the session refuses by default, so a
 read-only source leaves it alone; `Commit` and `Rollback` do nothing by
 default, for a source with no transaction of its own.
 
@@ -239,8 +240,16 @@ moves. Say no and the operator carrying that type stays in DuckDB. Without it, a
 other question would have caught. It is not asked about the column types you
 declared in `Describe` — those you chose, so they are taken as given.
 
-You are not asked about `LIMIT`, `GROUP BY` or joins. Crossing decides those from
-the expressions they carry.
+`AcceptsOperator` is asked about each operator crossing would move, after its
+expressions passed. It says yes by default; a source that renders to a language
+without, say, grouping sets or a join type answers no there:
+
+```cpp
+CrossingVerdict ToyDB::AcceptsOperator(const LogicalOperator &op) {
+	string reason;
+	return SubstraitCanRenderOperator(op, reason) ? CrossingVerdict::Yes() : CrossingVerdict::No(reason);
+}
+```
 
 Saying yes to `upper` claims ToyDB's `upper` is DuckDB's `upper`. If it folds
 case differently, answers come back wrong rather than slow. Say no when unsure.
@@ -264,6 +273,10 @@ struct CrossingQuery {
 
 	//! The row types: what a read produces, what a write is handed.
 	vector<LogicalType> types;
+
+	//! The plan sorts its rows and the target keeps that order. Answer with one
+	//! partition; a scan offering more is refused.
+	bool ordered;
 
 	//! Which of your tables it touches. Each entry is a table name and the
 	//! columns of it this query reads.
@@ -329,7 +342,8 @@ thread takes a partition, calls `open` for it, and pulls that reader to
 exhaustion before taking another. A reader is only ever used by the thread that
 opened it, so it needs no locking of its own; `open` can be called from
 several threads at once. Together the partitions must produce every row exactly
-once; the order across them is not kept.
+once; the order across them is not kept, so a query with `ordered` set must be
+answered with one partition, and crossing refuses a scan that offers more.
 
 A reader that has nothing yet — a frame still on the wire — keeps the `waker` it
 was handed, answers `CrossingPull::Wait()`, and calls `waker.Wake()` from

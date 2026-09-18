@@ -67,6 +67,7 @@ void MoveCrossableWorkIntoFragments(unique_ptr<LogicalOperator> &plan, const Fre
 		return;
 	}
 	AlignEveryFragmentToItsScan(*plan, fresh);
+	SinkFiltersIntoJoinBranches(plan);
 	SplitFiltersAtEvaluableHalf(plan);
 	auto sources = LabelSubtrees(*plan);
 	FoldEveryLabelledSubtree(plan, sources);

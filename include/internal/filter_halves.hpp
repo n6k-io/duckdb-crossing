@@ -11,6 +11,8 @@ namespace duckdb {
 //! this split one unevaluable conjunct keeps the rest from crossing.
 void SplitFiltersAtEvaluableHalf(unique_ptr<LogicalOperator> &plan);
 
+void SinkFiltersIntoJoinBranches(unique_ptr<LogicalOperator> &plan);
+
 void SplitFiltersAgainst(unique_ptr<LogicalOperator> &plan, CrossingSource &source);
 
 //! The inverse of the split, for halves that ended up on the same side.

@@ -2,10 +2,15 @@
 
 #include "internal/crossing_write.hpp"
 #include "internal/seam_split.hpp"
+#include "internal/source_evaluation.hpp"
 
+#include "duckdb/common/types/column/column_data_collection.hpp"
+#include "duckdb/execution/expression_executor.hpp"
 #include "duckdb/parser/column_definition.hpp"
 #include "duckdb/parser/parsed_data/create_table_info.hpp"
+#include "duckdb/planner/operator/logical_column_data_get.hpp"
 #include "duckdb/planner/operator/logical_delete.hpp"
+#include "duckdb/planner/operator/logical_expression_get.hpp"
 #include "duckdb/planner/operator/logical_get.hpp"
 #include "duckdb/planner/operator/logical_insert.hpp"
 #include "duckdb/planner/operator/logical_update.hpp"
@@ -107,6 +112,47 @@ unique_ptr<LogicalOperator> SeamInsert(ClientContext &context, idx_t table_index
 	return std::move(insert);
 }
 
+bool IsConstantRows(const LogicalExpressionGet &get) {
+	for (auto &row : get.expressions) {
+		for (auto &expr : row) {
+			if (!expr->IsFoldable() || !IsColumnFreeExpression(*expr)) {
+				return false;
+			}
+		}
+	}
+	return true;
+}
+
+void MaterialiseConstantRows(ClientContext &context, unique_ptr<LogicalOperator> &node) {
+	for (auto &child : node->children) {
+		MaterialiseConstantRows(context, child);
+	}
+	if (node->type != LogicalOperatorType::LOGICAL_EXPRESSION_GET) {
+		return;
+	}
+	auto &get = node->Cast<LogicalExpressionGet>();
+	if (!IsConstantRows(get)) {
+		return;
+	}
+	auto collection = make_uniq<ColumnDataCollection>(Allocator::DefaultAllocator(), get.expr_types);
+	DataChunk chunk;
+	chunk.Initialize(Allocator::DefaultAllocator(), get.expr_types);
+	for (auto &row : get.expressions) {
+		if (chunk.size() == STANDARD_VECTOR_SIZE) {
+			collection->Append(chunk);
+			chunk.Reset();
+		}
+		for (idx_t c = 0; c < row.size(); c++) {
+			chunk.SetValue(c, chunk.size(), ExpressionExecutor::EvaluateScalar(context, *row[c]));
+		}
+		chunk.SetCardinality(chunk.size() + 1);
+	}
+	if (chunk.size() > 0) {
+		collection->Append(chunk);
+	}
+	node = make_uniq<LogicalColumnDataGet>(get.table_index, get.expr_types, std::move(collection));
+}
+
 void ShapeWrite(ClientContext &context, unique_ptr<LogicalOperator> &node, const FreshTableIndex &fresh) {
 	auto table = CrossingTableOfWrite(*node);
 	if (!table) {
@@ -126,6 +172,7 @@ void ShapeWrite(ClientContext &context, unique_ptr<LogicalOperator> &node, const
 	auto keys = table->KeyColumnIndexes();
 	auto returning = ReturnsRows(*node);
 	auto table_index = TableIndexOf(*node);
+	MaterialiseConstantRows(context, node->children[0]);
 	auto row = SeamRowOf(*node, keys, std::move(node->children[0]), fresh);
 
 	SeamStop stop;

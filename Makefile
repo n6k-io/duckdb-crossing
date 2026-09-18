@@ -5,14 +5,23 @@ BUILD_DIR := $(PROJ_DIR)build/crossing
 TEST_ARGS ?=
 JOBS ?= $(shell nproc 2>/dev/null || sysctl -n hw.ncpu 2>/dev/null || echo 2)
 
-duckdb: $(DUCKDB_BUILD_DIR)/src/libduckdb_static.a
+DUCKDB_LIBS := $(DUCKDB_BUILD_DIR)/src/libduckdb_static.a \
+	$(DUCKDB_BUILD_DIR)/extension/libduckdb_generated_extension_loader.a \
+	$(DUCKDB_BUILD_DIR)/extension/core_functions/libcore_functions_extension.a
 
-$(DUCKDB_BUILD_DIR)/src/libduckdb_static.a:
+DUCKDB_FIRST_LIB := $(firstword $(DUCKDB_LIBS))
+
+duckdb: $(DUCKDB_LIBS)
+
+$(DUCKDB_FIRST_LIB):
 	@cmake -S "$(DUCKDB_SOURCE_DIR)" -B "$(DUCKDB_BUILD_DIR)" \
 		-DCMAKE_BUILD_TYPE=Release \
 		-DBUILD_UNITTESTS=OFF \
-		-DBUILD_SHELL=OFF
-	@cmake --build "$(DUCKDB_BUILD_DIR)" -j$(JOBS) --target duckdb_static dummy_static_extension_loader
+		-DBUILD_SHELL=OFF \
+		-DSKIP_EXTENSIONS=parquet
+	@cmake --build "$(DUCKDB_BUILD_DIR)" -j$(JOBS) --target duckdb_static duckdb_generated_extension_loader core_functions_extension
+
+$(filter-out $(DUCKDB_FIRST_LIB),$(DUCKDB_LIBS)): $(DUCKDB_FIRST_LIB)
 
 build: duckdb
 	@cmake -S "$(PROJ_DIR)" -B "$(BUILD_DIR)" \

@@ -66,3 +66,33 @@ function(crossing_add_to_target target)
   target_sources(${target} PRIVATE ${sources})
   target_include_directories(${target} PRIVATE ${CROSSING_ROOT}/include)
 endfunction()
+
+set(CROSSING_SUBSTRAIT_ROOT ${CROSSING_ROOT}/render/substrait)
+
+function(crossing_substrait_render_sources out_var)
+  set(${out_var}
+      ${CROSSING_SUBSTRAIT_ROOT}/substrait_types.cpp
+      ${CROSSING_SUBSTRAIT_ROOT}/substrait_render.cpp
+      PARENT_SCOPE)
+endfunction()
+
+function(crossing_substrait_decode_sources out_var)
+  set(${out_var}
+      ${CROSSING_SUBSTRAIT_ROOT}/substrait_types.cpp
+      ${CROSSING_SUBSTRAIT_ROOT}/substrait_decode.cpp
+      PARENT_SCOPE)
+endfunction()
+
+function(crossing_substrait_sources out_var)
+  set(${out_var}
+      ${CROSSING_SUBSTRAIT_ROOT}/substrait_types.cpp
+      ${CROSSING_SUBSTRAIT_ROOT}/substrait_render.cpp
+      ${CROSSING_SUBSTRAIT_ROOT}/substrait_decode.cpp
+      PARENT_SCOPE)
+endfunction()
+
+function(crossing_substrait_includes out_var)
+  set(${out_var}
+      ${CROSSING_SUBSTRAIT_ROOT}/include ${CROSSING_SUBSTRAIT_ROOT} ${CROSSING_ROOT}/include
+      PARENT_SCOPE)
+endfunction()
