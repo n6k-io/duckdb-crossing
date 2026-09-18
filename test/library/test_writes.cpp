@@ -205,6 +205,37 @@ TEST_CASE("a key that identifies more than one source row fails the write and ro
 	REQUIRE(Scalar(twin, "SELECT count(*) FROM dup WHERE v = 9") == Value::BIGINT(0));
 }
 
+TEST_CASE("a key whose NULL and zero rows are distinct keys is counted as two", "[writes]") {
+	auto transport = EACH_TRANSPORT();
+	INFO(TransportName(transport));
+	Twin twin(transport);
+	twin.store->keys["dup"] = {"k"};
+	twin.store->key_unique["dup"] = false;
+	twin.Far("CREATE TABLE dup(k INTEGER, v INTEGER)");
+	twin.Far("INSERT INTO dup VALUES (0, 1), (NULL, 2)");
+	twin.Attach();
+
+	auto result = twin.Query("UPDATE far.dup SET v = 9");
+
+	REQUIRE(result->GetValue(0, 0) == Value::BIGINT(2));
+	REQUIRE(twin.LastWrite().rows.size() == 2);
+	REQUIRE(Scalar(twin, "SELECT count(*) FROM dup WHERE v = 9") == Value::BIGINT(2));
+}
+
+TEST_CASE("a merge on a key the source vouches for does not count what it sent", "[writes]") {
+	auto transport = EACH_TRANSPORT();
+	INFO(TransportName(transport));
+	Twin twin(transport);
+	twin.Seed();
+
+	auto result = twin.Query("MERGE INTO far.orders t USING (SELECT 2 AS id UNION ALL SELECT 2) s ON t.id = s.id "
+	                         "WHEN MATCHED THEN UPDATE SET amt = 0");
+
+	REQUIRE(result->GetValue(0, 0) == Value::BIGINT(2));
+	REQUIRE(twin.LastWrite().rows.size() == 2);
+	REQUIRE(Scalar(twin, "SELECT amt FROM orders WHERE id = 2") == Value::INTEGER(0));
+}
+
 TEST_CASE("a merge lands its inserts and updates on the source", "[writes]") {
 	auto transport = EACH_TRANSPORT();
 	INFO(TransportName(transport));
