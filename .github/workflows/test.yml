@@ -16,7 +16,9 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          submodules: recursive
+          submodules: false
+
+      - run: git submodule update --init --checkout duckdb
 
       - uses: hendrikmuhs/ccache-action@v1.2
         with:

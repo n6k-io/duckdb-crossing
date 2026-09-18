@@ -37,3 +37,15 @@ clean:
 	@rm -rf "$(PROJ_DIR)build"
 
 .PHONY: duckdb build test clean
+
+CLANG_FORMAT ?= clang-format
+FORMAT_FILES := $(wildcard $(PROJ_DIR)*.cpp $(PROJ_DIR)include/*.hpp $(PROJ_DIR)include/*/*.hpp) \
+	$(shell find $(PROJ_DIR)test -name '*.cpp' -o -name '*.hpp')
+
+format-check:
+	@$(CLANG_FORMAT) --dry-run --Werror $(FORMAT_FILES)
+
+format-fix:
+	@$(CLANG_FORMAT) -i $(FORMAT_FILES)
+
+.PHONY: format-check format-fix
