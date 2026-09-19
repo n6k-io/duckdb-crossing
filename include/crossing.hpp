@@ -306,6 +306,8 @@ public:
 	virtual CrossingScan Read(ClientContext &context, const CrossingQuery &query) = 0;
 	virtual CrossingWriter Write(ClientContext &context, const CrossingQuery &query);
 	virtual void Ddl(ClientContext &context, const CrossingDdl &ddl);
+	virtual vector<string> Tables(const string &schema) = 0;
+	virtual CrossingTable Describe(const string &schema, const string &name) = 0;
 	virtual void Commit() {
 	}
 	virtual void Rollback() {
@@ -475,6 +477,8 @@ template <class Sess>
 struct SessionContract : CheckRead<Sess, true>,
                          CheckWrite<Sess, false>,
                          CheckDdl<Sess, false>,
+                         CheckTables<Sess, false>,
+                         CheckDescribe<Sess, false>,
                          CheckCommit<Sess, false>,
                          CheckRollback<Sess, false> {
 	static_assert(!std::is_final<Sess>::value, "crossing: a session type must not be final");
@@ -495,6 +499,22 @@ void DdlOn(Sess &session, ClientContext &context, const CrossingDdl &ddl, std::t
 template <class Sess>
 void DdlOn(Sess &, ClientContext &, const CrossingDdl &, std::false_type) {
 	throw NotImplementedException("crossing: this source's session has no Ddl");
+}
+template <class Sess>
+vector<string> TablesOn(Sess &session, CrossingSource &, const string &schema, std::true_type) {
+	return session.Tables(schema);
+}
+template <class Sess>
+vector<string> TablesOn(Sess &, CrossingSource &source, const string &schema, std::false_type) {
+	return source.Tables(schema);
+}
+template <class Sess>
+CrossingTable DescribeOn(Sess &session, CrossingSource &, const string &schema, const string &name, std::true_type) {
+	return session.Describe(schema, name);
+}
+template <class Sess>
+CrossingTable DescribeOn(Sess &, CrossingSource &source, const string &schema, const string &name, std::false_type) {
+	return source.Describe(schema, name);
 }
 template <class Sess>
 void CommitOn(Sess &session, std::true_type) {
@@ -566,9 +586,25 @@ template <class S>
 struct Crossing;
 
 template <class Sess>
+void CheckDescribedVerbs(const string &name, const CrossingTable &table) {
+	for (auto verb : table.verbs) {
+		if (IsDdlVerb(verb)) {
+			if (!crossing_contract::HasDdl<Sess>::value) {
+				throw NotImplementedException("crossing: '%s' declares '%s' but the session has no Ddl", name,
+				                              CrossingVerbName(verb));
+			}
+		} else if (verb != CrossingVerb::SELECT && !crossing_contract::HasWrite<Sess>::value) {
+			throw NotImplementedException("crossing: '%s' declares '%s' but the session has no Write", name,
+			                              CrossingVerbName(verb));
+		}
+	}
+}
+
+template <class Sess>
 class CrossingSessionAdapter final : public CrossingSession, crossing_contract::SessionContract<Sess> {
 public:
-	explicit CrossingSessionAdapter(unique_ptr<Sess> session_p) : session(std::move(session_p)) {
+	CrossingSessionAdapter(CrossingSource &source_p, unique_ptr<Sess> session_p)
+	    : source(source_p), session(std::move(session_p)) {
 	}
 
 	CrossingScan Read(ClientContext &context, const CrossingQuery &query) override {
@@ -580,6 +616,15 @@ public:
 	void Ddl(ClientContext &context, const CrossingDdl &ddl) override {
 		crossing_contract::DdlOn(*session, context, ddl, crossing_contract::HasDdl<Sess> {});
 	}
+	vector<string> Tables(const string &schema) override {
+		return crossing_contract::TablesOn(*session, source, schema, crossing_contract::HasTables<Sess> {});
+	}
+	CrossingTable Describe(const string &schema, const string &name) override {
+		auto table =
+		    crossing_contract::DescribeOn(*session, source, schema, name, crossing_contract::HasDescribe<Sess> {});
+		CheckDescribedVerbs<Sess>(name, table);
+		return table;
+	}
 	void Commit() override {
 		crossing_contract::CommitOn(*session, crossing_contract::HasCommit<Sess> {});
 	}
@@ -588,6 +633,7 @@ public:
 	}
 
 private:
+	CrossingSource &source;
 	unique_ptr<Sess> session;
 };
 
@@ -611,17 +657,7 @@ public:
 	}
 	CrossingTable Describe(const string &schema, const string &name) override {
 		auto table = source->Describe(schema, name);
-		for (auto verb : table.verbs) {
-			if (IsDdlVerb(verb)) {
-				if (!crossing_contract::HasDdl<Session>::value) {
-					throw NotImplementedException("crossing: '%s' declares '%s' but the session has no Ddl", name,
-					                              CrossingVerbName(verb));
-				}
-			} else if (verb != CrossingVerb::SELECT && !crossing_contract::HasWrite<Session>::value) {
-				throw NotImplementedException("crossing: '%s' declares '%s' but the session has no Write", name,
-				                              CrossingVerbName(verb));
-			}
-		}
+		CheckDescribedVerbs<Session>(name, table);
 		return table;
 	}
 	CrossingSchema DescribeSchema(const string &schema) override {
@@ -652,7 +688,7 @@ public:
 		if (!session) {
 			return nullptr;
 		}
-		return make_uniq<CrossingSessionAdapter<Session>>(std::move(session));
+		return make_uniq<CrossingSessionAdapter<Session>>(*this, std::move(session));
 	}
 	void Detach(ClientContext &context) override {
 		crossing_contract::DetachOn(*source, context, crossing_contract::HasDetach<S> {});

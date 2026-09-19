@@ -32,6 +32,8 @@ struct ToySession {
 	CrossingScan Read(ClientContext &context, const CrossingQuery &query);
 	CrossingWriter Write(ClientContext &context, const CrossingQuery &query);
 	void Ddl(ClientContext &context, const CrossingDdl &ddl);
+	vector<string> Tables(const string &schema);
+	CrossingTable Describe(const string &schema, const string &name);
 	void Commit();
 	void Rollback();
 };
@@ -51,6 +53,7 @@ default when absent:
 | `Detach` | nothing |
 | `Session::Write` | no table may declare a write verb; one that does is refused at first use |
 | `Session::Ddl` | no table may declare `ALTER` or `DROP`, no schema `CREATE`; one that does is refused at first use |
+| `Session::Tables`, `Session::Describe` | the source's `Tables` and `Describe` |
 | `Session::Commit`, `Session::Rollback` | nothing |
 
 Members must be public. Neither type may be `final`. A member with the right name
@@ -105,9 +108,11 @@ void ToySession::Ddl(ClientContext &, const CrossingDdl &ddl) {
 arrive as DuckDB's parsed `CreateInfo`, `AlterInfo` or `DropInfo`, in the
 session of the statement's transaction. The verb is checked against
 `DescribeSchema` or `Describe` first; the source is never asked about a verb it
-did not declare. After the call the schema is forgotten and listed again, and
-again once the transaction commits or rolls back, so what the source now serves
-is what the catalog shows. Views, indexes, sequences and schemas themselves are
+did not declare. After the call the schema is listed and described again
+through `Session::Tables` and `Session::Describe` for the rest of that
+transaction, so the transaction sees its own uncommitted DDL and no other
+transaction's; once it commits or rolls back the schema is listed again through
+the source. Views, indexes, sequences and schemas themselves are
 never created through crossing.
 
 `CREATE TABLE ... AS` is a `CREATE` followed by an `INSERT` of the gathered
@@ -243,6 +248,7 @@ each other and themselves.
 | `Session::Write` | once per write operator; may repeat per session (`MERGE`) |
 | writer | one thread at a time until `DONE`; thread may change after `WAIT` |
 | `Session::Ddl` | once per DDL statement, on the binding thread; may repeat per session |
+| `Session::Tables`, `Session::Describe` | after `Ddl` in that session, once per schema or table until the next `Ddl` |
 | `Commit`, `Rollback` | once, after every reader and writer returned |
 | `Waker::Wake` | any thread, any time |
 

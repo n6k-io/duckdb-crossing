@@ -85,15 +85,20 @@ vector<string> CrossingAttach::Schemas() {
 
 template <class F>
 auto CrossingAttach::WithTables(const string &schema, optional_ptr<Transaction> transaction, F &&f) {
-	auto overlay = OverlayOf(transaction, schema);
-	if (overlay) {
-		if (!overlay->listed) {
-			for (auto &table : source->Tables(schema)) {
-				overlay->tables.insert(table);
+	auto slot = SlotOf(transaction);
+	if (slot) {
+		lock_guard<mutex> guard(slot->lock);
+		auto it = slot->overlays.find(schema);
+		if (it != slot->overlays.end()) {
+			auto &overlay = it->second;
+			if (!overlay.listed) {
+				for (auto &table : slot->session->Tables(schema)) {
+					overlay.tables.insert(table);
+				}
+				overlay.listed = true;
 			}
-			overlay->listed = true;
+			return f(optional_ptr<const case_insensitive_set_t>(&overlay.tables));
 		}
-		return f(optional_ptr<const case_insensitive_set_t>(&overlay->tables));
 	}
 	lock_guard<mutex> guard(schemas_lock);
 	return f(TablesOf(schema));
@@ -128,9 +133,8 @@ CrossingSchema CrossingAttach::DescribedSchema(const string &schema) {
 }
 
 bool CrossingAttach::ServesSchema(const string &schema) {
-	return WithTables(schema, nullptr, [](optional_ptr<const case_insensitive_set_t> tables) {
-		return tables && !tables->empty();
-	});
+	return WithTables(schema, nullptr,
+	                  [](optional_ptr<const case_insensitive_set_t> tables) { return tables && !tables->empty(); });
 }
 
 bool CrossingAttach::ServesTable(const string &schema, const string &table, optional_ptr<Transaction> transaction) {
@@ -182,6 +186,18 @@ CrossingAttach::SchemaState &CrossingAttach::StateOf(const string &schema, optio
 	return overlay ? *overlay->state : StateOf(schema);
 }
 
+CrossingTable CrossingAttach::DescribeAs(const string &schema, const string &name,
+                                         optional_ptr<Transaction> transaction) {
+	auto slot = SlotOf(transaction);
+	if (slot) {
+		lock_guard<mutex> guard(slot->lock);
+		if (slot->overlays.find(schema) != slot->overlays.end()) {
+			return slot->session->Describe(schema, name);
+		}
+	}
+	return source->Describe(schema, name);
+}
+
 optional_ptr<CrossingAttach::Slot> CrossingAttach::SlotOf(optional_ptr<Transaction> transaction) {
 	if (!transaction) {
 		return nullptr;
@@ -203,7 +219,7 @@ optional_ptr<CrossingAttach::Overlay> CrossingAttach::OverlayOf(optional_ptr<Tra
 }
 
 CatalogEntry &CrossingAttach::GetOrDescribe(SchemaState &state, const string &schema, SchemaCatalogEntry &owner,
-                                            const string &name) {
+                                            const string &name, optional_ptr<Transaction> transaction) {
 	auto it = state.cache.find(name);
 	if (it != state.cache.end()) {
 		if (&it->second->Cast<CrossingTableCatalogEntry>().schema == &owner) {
@@ -213,7 +229,7 @@ CatalogEntry &CrossingAttach::GetOrDescribe(SchemaState &state, const string &sc
 		state.cache.erase(it);
 	}
 
-	auto described = source->Describe(schema, name);
+	auto described = DescribeAs(schema, name, transaction);
 	auto &column_names = described.column_names;
 	auto &column_types = described.column_types;
 	if (column_names.empty()) {
@@ -243,7 +259,7 @@ optional_ptr<CatalogEntry> CrossingAttach::LookupTable(const string &schema, Sch
 	}
 	auto &state = StateOf(schema, transaction);
 	lock_guard<mutex> guard(state.lock);
-	return &GetOrDescribe(state, schema, owner, name);
+	return &GetOrDescribe(state, schema, owner, name, transaction);
 }
 
 void CrossingAttach::ScanTables(const string &schema, SchemaCatalogEntry &owner, case_insensitive_set_t &seen,
@@ -259,14 +275,13 @@ void CrossingAttach::ScanTables(const string &schema, SchemaCatalogEntry &owner,
 		if (seen.count(name)) {
 			continue;
 		}
-		callback(GetOrDescribe(state, schema, owner, name));
+		callback(GetOrDescribe(state, schema, owner, name, transaction));
 		seen.insert(name);
 	}
 }
 
 optional_ptr<const CrossingTable> CrossingAttach::Described(const string &schema, SchemaCatalogEntry &owner,
-                                                            const string &name,
-                                                            optional_ptr<Transaction> transaction) {
+                                                            const string &name, optional_ptr<Transaction> transaction) {
 	auto entry = LookupTable(schema, owner, name, transaction);
 	if (!entry) {
 		return nullptr;

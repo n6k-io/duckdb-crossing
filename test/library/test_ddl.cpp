@@ -153,6 +153,88 @@ TEST_CASE("create or replace needs drop on the served table", "[ddl]") {
 	REQUIRE(FarScalar(twin, "SELECT count(*) FROM orders") == Value::BIGINT(5));
 }
 
+TEST_CASE("a table dropped in this transaction is missing, not unsupported", "[ddl]") {
+	Twin twin(Transport::NATIVE);
+	twin.Seed();
+
+	SECTION("drop if exists is a no-op") {
+		twin.Query("BEGIN");
+		twin.Query("DROP TABLE far.orders");
+		twin.Query("DROP TABLE IF EXISTS far.orders");
+		REQUIRE(twin.store->ddls.size() == 1);
+		twin.Query("COMMIT");
+	}
+
+	SECTION("plain drop reports the missing entry") {
+		twin.Query("BEGIN");
+		twin.Query("DROP TABLE far.orders");
+		auto error = twin.Error("DROP TABLE far.orders");
+		REQUIRE_THAT(error, Catch::Contains("orders"));
+		REQUIRE_THAT(error, !Catch::Contains("not supported"));
+		twin.Query("ROLLBACK");
+	}
+
+	SECTION("alter if exists is a no-op") {
+		twin.Query("BEGIN");
+		twin.Query("DROP TABLE far.orders");
+		twin.Query("ALTER TABLE IF EXISTS far.orders ADD COLUMN extra INTEGER");
+		REQUIRE(twin.store->ddls.size() == 1);
+		twin.Query("ROLLBACK");
+	}
+
+	SECTION("plain alter reports the missing entry") {
+		twin.Query("BEGIN");
+		twin.Query("DROP TABLE far.orders");
+		auto error = twin.Error("ALTER TABLE far.orders ADD COLUMN extra INTEGER");
+		REQUIRE_THAT(error, Catch::Contains("orders"));
+		REQUIRE_THAT(error, !Catch::Contains("not supported"));
+		twin.Query("ROLLBACK");
+	}
+
+	SECTION("the old name after a rename") {
+		twin.Query("BEGIN");
+		twin.Query("ALTER TABLE far.orders RENAME TO o");
+		twin.Query("DROP TABLE IF EXISTS far.orders");
+		REQUIRE(twin.store->ddls.size() == 1);
+		auto error = twin.Error("DROP TABLE far.orders");
+		REQUIRE_THAT(error, Catch::Contains("orders"));
+		REQUIRE_THAT(error, !Catch::Contains("not supported"));
+		twin.Query("ROLLBACK");
+	}
+}
+
+TEST_CASE("concurrent ddl transactions do not see each other's pending schema", "[ddl]") {
+	Twin twin(Transport::NATIVE);
+	twin.Seed();
+	Connection other(twin.near);
+	auto other_query = [&](const string &sql) {
+		auto result = other.Query(sql);
+		if (result->HasError()) {
+			FAIL(sql + "\n" + result->GetError());
+		}
+		return result;
+	};
+
+	twin.Query("BEGIN");
+	other_query("BEGIN");
+	twin.Query("CREATE TABLE far.main.mine(x INTEGER)");
+	other_query("CREATE TABLE far.main.theirs(y INTEGER)");
+
+	twin.Query("DROP TABLE far.orders");
+
+	REQUIRE(other_query("SELECT count(*) FROM far.orders")->GetValue(0, 0) == Value::BIGINT(5));
+	REQUIRE(other_query("SELECT count(*) FROM duckdb_tables() WHERE database_name = 'far' AND table_name IN "
+	                    "('orders', 'theirs')")
+	            ->GetValue(0, 0) == Value::BIGINT(2));
+	REQUIRE(other_query("SELECT count(*) FROM duckdb_tables() WHERE database_name = 'far' AND table_name = 'mine'")
+	            ->GetValue(0, 0) == Value::BIGINT(0));
+	REQUIRE(twin.Query("SELECT count(*) FROM duckdb_tables() WHERE database_name = 'far' AND table_name = 'theirs'")
+	            ->GetValue(0, 0) == Value::BIGINT(0));
+
+	twin.Query("ROLLBACK");
+	other_query("ROLLBACK");
+}
+
 TEST_CASE("uncommitted ddl is invisible to other transactions", "[ddl]") {
 	Twin twin(Transport::NATIVE);
 	twin.Seed();

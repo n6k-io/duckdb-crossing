@@ -128,8 +128,9 @@ private:
 	void Retire(Slot &slot);
 	SchemaState &StateOf(const string &schema);
 	SchemaState &StateOf(const string &schema, optional_ptr<Transaction> transaction);
-	CatalogEntry &GetOrDescribe(SchemaState &state, const string &schema, SchemaCatalogEntry &owner,
-	                            const string &name);
+	CatalogEntry &GetOrDescribe(SchemaState &state, const string &schema, SchemaCatalogEntry &owner, const string &name,
+	                            optional_ptr<Transaction> transaction);
+	CrossingTable DescribeAs(const string &schema, const string &name, optional_ptr<Transaction> transaction);
 
 	AttachedDatabase &db;
 	unique_ptr<CrossingSource> source;
