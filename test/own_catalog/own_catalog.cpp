@@ -141,14 +141,14 @@ void OwnSchema::Scan(CatalogType type, const std::function<void(CatalogEntry &)>
 		return;
 	}
 	case_insensitive_set_t seen;
-	attach.ScanTables(name, *this, seen, callback);
+	attach.ScanTables(name, *this, seen, callback, nullptr);
 }
 
-optional_ptr<CatalogEntry> OwnSchema::LookupEntry(CatalogTransaction, const EntryLookupInfo &lookup_info) {
+optional_ptr<CatalogEntry> OwnSchema::LookupEntry(CatalogTransaction transaction, const EntryLookupInfo &lookup_info) {
 	if (lookup_info.GetCatalogType() != CatalogType::TABLE_ENTRY) {
 		return nullptr;
 	}
-	return attach.LookupTable(name, *this, lookup_info.GetEntryName());
+	return attach.LookupTable(name, *this, lookup_info.GetEntryName(), transaction.transaction);
 }
 
 void OwnSchema::DropEntry(ClientContext &, DropInfo &info) {

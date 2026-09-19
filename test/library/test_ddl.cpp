@@ -139,3 +139,68 @@ TEST_CASE("ddl rolls back and commits with the transaction", "[ddl]") {
 	twin.Query("COMMIT");
 	REQUIRE(FarTableCount(twin, "kept") == Value::BIGINT(1));
 }
+
+TEST_CASE("create or replace needs drop on the served table", "[ddl]") {
+	Twin twin(Transport::NATIVE);
+	twin.store->verbs["orders"] = {CrossingVerb::SELECT};
+	twin.Seed();
+
+	for (auto sql : {"CREATE OR REPLACE TABLE far.main.orders(x INTEGER)",
+	                 "CREATE OR REPLACE TABLE far.main.orders AS SELECT 1 AS x"}) {
+		REQUIRE_THAT(twin.Error(sql), Catch::Contains("'orders' does not have 'drop' permission"));
+	}
+	REQUIRE(twin.store->ddls.empty());
+	REQUIRE(FarScalar(twin, "SELECT count(*) FROM orders") == Value::BIGINT(5));
+}
+
+TEST_CASE("uncommitted ddl is invisible to other transactions", "[ddl]") {
+	Twin twin(Transport::NATIVE);
+	twin.Seed();
+	Connection other(twin.near);
+	auto other_scalar = [&](const string &sql) {
+		auto result = other.Query(sql);
+		if (result->HasError()) {
+			FAIL(sql + "\n" + result->GetError());
+		}
+		return result->GetValue(0, 0);
+	};
+	auto other_fails = [&](const string &sql) {
+		return other.Query(sql)->HasError();
+	};
+
+	SECTION("create") {
+		twin.Query("BEGIN");
+		twin.Query("CREATE TABLE far.main.pending(x INTEGER)");
+		REQUIRE(twin.Query("SELECT count(*) FROM far.pending")->GetValue(0, 0) == Value::BIGINT(0));
+
+		REQUIRE(other_scalar("SELECT count(*) FROM duckdb_tables() WHERE database_name = 'far' AND table_name = "
+		                     "'pending'") == Value::BIGINT(0));
+		REQUIRE(other_fails("SELECT * FROM far.pending"));
+
+		twin.Query("COMMIT");
+		REQUIRE(other_scalar("SELECT count(*) FROM far.pending") == Value::BIGINT(0));
+	}
+
+	SECTION("drop") {
+		twin.Query("BEGIN");
+		twin.Query("DROP TABLE far.orders");
+		REQUIRE(twin.Error("SELECT * FROM far.orders").find("orders") != string::npos);
+
+		REQUIRE(other_scalar("SELECT count(*) FROM far.orders") == Value::BIGINT(5));
+
+		twin.Query("ROLLBACK");
+		REQUIRE(other_scalar("SELECT count(*) FROM far.orders") == Value::BIGINT(5));
+		twin.Same("SELECT count(*) FROM far.orders");
+	}
+
+	SECTION("alter") {
+		twin.Query("BEGIN");
+		twin.Query("ALTER TABLE far.orders ADD COLUMN extra INTEGER DEFAULT 1");
+		REQUIRE(twin.Query("SELECT extra FROM far.orders LIMIT 1")->GetValue(0, 0) == Value::INTEGER(1));
+
+		REQUIRE(other_fails("SELECT extra FROM far.orders"));
+
+		twin.Query("COMMIT");
+		REQUIRE(other_scalar("SELECT extra FROM far.orders LIMIT 1") == Value::INTEGER(1));
+	}
+}

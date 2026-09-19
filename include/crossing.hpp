@@ -267,12 +267,13 @@ struct CrossingSeam {
 };
 
 //! What the source is asked to plan. SELECT wants a scan of the table emitting one column per
-//! column Describe declared, in that order. A write wants the statement with a seam node
+//! column of `described`, in that order. A write wants the statement with a seam node
 //! (MakeSeamNode) where the rows go.
 struct CrossingPlanRequest {
 	CrossingVerb verb;
 	string schema;
 	string table;
+	optional_ptr<const CrossingTable> described;
 	CrossingSeam seam;
 };
 
