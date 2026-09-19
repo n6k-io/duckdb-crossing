@@ -341,6 +341,7 @@ shared_ptr<CrossingFragment> PlanWriteFragment(CrossingTableCatalogEntry &table,
 	request.verb = verb;
 	request.schema = table.source_schema;
 	request.table = table.described.name;
+	request.described = &table.described;
 	request.seam = seam;
 	auto fragment = make_shared_ptr<CrossingFragment>();
 	fragment->seam_types = seam.types;
@@ -789,10 +790,11 @@ SinkFinalizeType CrossingCreateTableAs::Finalize(Pipeline &, Event &, ClientCont
 		ddl.schema = owner.name;
 		ddl.table = create.table;
 		ddl.create = info->base.get();
-		attach.Ddl(context, Transaction::Get(context, owner.ParentCatalog()), owner, ddl);
+		auto &transaction = Transaction::Get(context, owner.ParentCatalog());
+		attach.Ddl(context, transaction, owner, ddl);
 		state.created = true;
 
-		auto entry = attach.LookupTable(owner.name, owner, create.table);
+		auto entry = attach.LookupTable(owner.name, owner, create.table, &transaction);
 		if (!entry) {
 			throw InternalException("crossing: '%s' was created but the source does not serve it", create.table);
 		}
@@ -844,13 +846,15 @@ string CrossingCreateTableAs::GetName() const {
 	return "CROSSING_CREATE_TABLE_AS";
 }
 
-PhysicalOperator &CrossingAttach::PlanCreateTableAs(ClientContext &, PhysicalPlanGenerator &planner,
+PhysicalOperator &CrossingAttach::PlanCreateTableAs(ClientContext &context, PhysicalPlanGenerator &planner,
                                                     LogicalCreateTable &op, PhysicalOperator &plan) {
 	auto &schema = op.schema;
-	if (!DescribedSchema(schema.name).Allows(CrossingVerb::CREATE)) {
-		throw PermissionException("crossing: schema '%s' does not have '%s' permission", schema.name,
-		                          CrossingVerbName(CrossingVerb::CREATE));
-	}
+	CrossingDdl ddl;
+	ddl.verb = CrossingVerb::CREATE;
+	ddl.schema = schema.name;
+	ddl.table = op.info->Base().table;
+	ddl.create = op.info->base.get();
+	Authorize(schema, ddl, &Transaction::Get(context, schema.ParentCatalog()));
 	auto &result =
 	    planner.Make<CrossingCreateTableAs>(*this, schema, std::move(op.info), plan.types, op.estimated_cardinality);
 	result.children.push_back(plan);
