@@ -15,7 +15,7 @@ CrossingScan ReadOnlySource::Session::Read(ClientContext &, const CrossingQuery 
 }
 
 vector<string> ReadOnlySource::Tables(const string &) {
-	return {"t", "w"};
+	return {"t", "w", "a"};
 }
 
 CrossingTable ReadOnlySource::Describe(const string &, const string &name) {
@@ -25,6 +25,9 @@ CrossingTable ReadOnlySource::Describe(const string &, const string &name) {
 	table.verbs = {CrossingVerb::SELECT};
 	if (name == "w") {
 		table.verbs.push_back(CrossingVerb::INSERT);
+	}
+	if (name == "a") {
+		table.verbs.push_back(CrossingVerb::ALTER);
 	}
 	return table;
 }

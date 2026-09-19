@@ -34,6 +34,12 @@ struct FarCall {
 	bool Mentions(const string &text) const;
 };
 
+struct FarDdl {
+	CrossingVerb verb;
+	string schema;
+	string table;
+};
+
 struct FarStore {
 	explicit FarStore(Transport transport);
 
@@ -48,10 +54,13 @@ struct FarStore {
 	case_insensitive_map_t<vector<string>> keys;
 	case_insensitive_map_t<bool> key_unique;
 	case_insensitive_map_t<vector<CrossingVerb>> verbs;
+	case_insensitive_map_t<vector<CrossingVerb>> schema_verbs;
 	string declined;
 
 	vector<FarCall> reads;
 	vector<FarCall> writes;
+	vector<FarDdl> ddls;
+	case_insensitive_map_t<Connection *> shaping;
 	vector<string> attached_paths;
 	vector<string> detached_paths;
 	vector<string> transaction_ends;
@@ -86,10 +95,12 @@ public:
 
 	CrossingScan Read(ClientContext &context, const CrossingQuery &query);
 	CrossingWriter Write(ClientContext &context, const CrossingQuery &query);
+	void Ddl(ClientContext &context, const CrossingDdl &ddl);
 	void Commit();
 	void Rollback();
 
 private:
+	void ForgetShaping();
 	vector<vector<Value>> Evaluate(const LogicalOperator &plan, FarCall &call);
 	vector<vector<Value>> EvaluateNative(const LogicalOperator &plan, FarCall &call);
 	vector<vector<Value>> EvaluateSubstrait(const LogicalOperator &plan, FarCall &call);
@@ -110,6 +121,7 @@ public:
 	vector<string> Schemas();
 	vector<string> Tables(const string &schema);
 	CrossingTable Describe(const string &schema, const string &name);
+	CrossingSchema DescribeSchema(const string &schema);
 	CrossingPlan Plan(const CrossingPlanRequest &request);
 	CrossingVerdict AcceptsCall(const Expression &expr);
 	CrossingVerdict AcceptsType(const LogicalType &type);

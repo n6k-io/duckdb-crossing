@@ -5,8 +5,17 @@
 #include "duckdb/main/appender.hpp"
 #include "duckdb/main/extension/extension_loader.hpp"
 #include "duckdb/main/materialized_query_result.hpp"
+#include "duckdb/main/pending_query_result.hpp"
+#include "duckdb/main/query_parameters.hpp"
 #include "duckdb/main/relation.hpp"
+#include "duckdb/parser/parsed_data/alter_info.hpp"
+#include "duckdb/parser/parsed_data/alter_table_info.hpp"
 #include "duckdb/parser/parsed_data/attach_info.hpp"
+#include "duckdb/parser/parsed_data/create_info.hpp"
+#include "duckdb/parser/parsed_data/drop_info.hpp"
+#include "duckdb/parser/statement/alter_statement.hpp"
+#include "duckdb/parser/statement/create_statement.hpp"
+#include "duckdb/parser/statement/drop_statement.hpp"
 #include "duckdb/parser/tableref/basetableref.hpp"
 #include "duckdb/planner/binder.hpp"
 #include "duckdb/planner/bound_statement.hpp"
@@ -287,16 +296,32 @@ vector<string> FarSource::Tables(const string &schema) {
 	                                   string(FAR_CATALOG) + "' AND schema_name = ? ORDER BY 1");
 	vector<Value> args {Value(schema)};
 	auto result = prepared->Execute(args, false);
-	vector<string> names;
+	case_insensitive_set_t seen;
 	for (auto &row : RowsOf(*result)) {
-		names.push_back(row[0].GetValue<string>());
+		seen.insert(row[0].GetValue<string>());
 	}
+	for (auto &entry : store->shaping) {
+		auto dot = entry.first.find('.');
+		if (!StringUtil::CIEquals(entry.first.substr(0, dot), schema)) {
+			continue;
+		}
+		auto name = entry.first.substr(dot + 1);
+		if (entry.second->TableInfo(FAR_CATALOG, schema, name)) {
+			seen.insert(name);
+		} else {
+			seen.erase(name);
+		}
+	}
+	vector<string> names(seen.begin(), seen.end());
+	std::sort(names.begin(), names.end());
 	return names;
 }
 
 CrossingTable FarSource::Describe(const string &schema, const string &name) {
 	lock_guard<mutex> guard(store->lock);
-	auto description = store->con.TableInfo(FAR_CATALOG, schema, name);
+	auto shaping = store->shaping.find(schema + "." + name);
+	auto &con = shaping == store->shaping.end() ? store->con : *shaping->second;
+	auto description = con.TableInfo(FAR_CATALOG, schema, name);
 	if (!description) {
 		throw CatalogException("far: no table '%s.%s'", schema, name);
 	}
@@ -309,8 +334,8 @@ CrossingTable FarSource::Describe(const string &schema, const string &name) {
 	if (key != store->keys.end()) {
 		table.key = key->second;
 	} else {
-		auto prepared = store->con.Prepare("SELECT constraint_column_names FROM duckdb_constraints() WHERE schema_name "
-		                                   "= ? AND table_name = ? AND constraint_type = 'PRIMARY KEY'");
+		auto prepared = con.Prepare("SELECT constraint_column_names FROM duckdb_constraints() WHERE schema_name "
+		                            "= ? AND table_name = ? AND constraint_type = 'PRIMARY KEY'");
 		vector<Value> args {Value(schema), Value(name)};
 		auto rows = RowsOf(*prepared->Execute(args, false));
 		if (!rows.empty()) {
@@ -325,9 +350,19 @@ CrossingTable FarSource::Describe(const string &schema, const string &name) {
 	if (verbs != store->verbs.end()) {
 		table.verbs = verbs->second;
 	} else {
-		table.verbs = {CrossingVerb::SELECT, CrossingVerb::INSERT, CrossingVerb::UPDATE, CrossingVerb::DELETE_};
+		table.verbs = {CrossingVerb::SELECT,  CrossingVerb::INSERT, CrossingVerb::UPDATE,
+		               CrossingVerb::DELETE_, CrossingVerb::ALTER,  CrossingVerb::DROP};
 	}
 	return table;
+}
+
+CrossingSchema FarSource::DescribeSchema(const string &schema) {
+	lock_guard<mutex> guard(store->lock);
+	CrossingSchema described;
+	described.name = schema;
+	auto verbs = store->schema_verbs.find(schema);
+	described.verbs = verbs != store->schema_verbs.end() ? verbs->second : vector<CrossingVerb> {CrossingVerb::CREATE};
+	return described;
 }
 
 CrossingPlan FarSource::Plan(const CrossingPlanRequest &request) {
@@ -417,18 +452,75 @@ FarSession::~FarSession() {
 	if (far.context->transaction.HasActiveTransaction()) {
 		far.Rollback();
 	}
+	lock_guard<mutex> guard(store->lock);
+	ForgetShaping();
+}
+
+void FarSession::ForgetShaping() {
+	for (auto it = store->shaping.begin(); it != store->shaping.end();) {
+		it = it->second == &far ? store->shaping.erase(it) : std::next(it);
+	}
 }
 
 void FarSession::Commit() {
 	far.Commit();
 	lock_guard<mutex> guard(store->lock);
+	ForgetShaping();
 	store->transaction_ends.push_back("commit");
 }
 
 void FarSession::Rollback() {
 	far.Rollback();
 	lock_guard<mutex> guard(store->lock);
+	ForgetShaping();
 	store->transaction_ends.push_back("rollback");
+}
+
+void FarSession::Ddl(ClientContext &, const CrossingDdl &ddl) {
+	unique_ptr<SQLStatement> statement;
+	switch (ddl.verb) {
+	case CrossingVerb::CREATE: {
+		auto create = make_uniq<CreateStatement>();
+		create->info = ddl.create->Copy();
+		create->info->catalog = FAR_CATALOG;
+		statement = std::move(create);
+		break;
+	}
+	case CrossingVerb::ALTER: {
+		auto alter = make_uniq<AlterStatement>();
+		alter->info = ddl.alter->Copy();
+		alter->info->catalog = FAR_CATALOG;
+		statement = std::move(alter);
+		break;
+	}
+	case CrossingVerb::DROP: {
+		auto drop = make_uniq<DropStatement>();
+		drop->info = ddl.drop->Copy();
+		drop->info->catalog = FAR_CATALOG;
+		statement = std::move(drop);
+		break;
+	}
+	default:
+		throw InternalException("far: '%s' is not a DDL verb", CrossingVerbName(ddl.verb));
+	}
+	lock_guard<mutex> guard(far_lock);
+	auto pending = far.context->PendingQuery(std::move(statement), QueryParameters(false));
+	if (pending->HasError()) {
+		pending->ThrowError();
+	}
+	auto result = pending->Execute();
+	if (result->HasError()) {
+		result->ThrowError();
+	}
+	lock_guard<mutex> store_guard(store->lock);
+	store->ddls.push_back(FarDdl {ddl.verb, ddl.schema, ddl.table});
+	store->shaping[ddl.schema + "." + ddl.table] = &far;
+	if (ddl.verb == CrossingVerb::ALTER && ddl.alter->type == AlterType::ALTER_TABLE) {
+		auto &alter = ddl.alter->Cast<AlterTableInfo>();
+		if (alter.alter_table_type == AlterTableType::RENAME_TABLE) {
+			store->shaping[ddl.schema + "." + alter.Cast<RenameTableInfo>().new_table_name] = &far;
+		}
+	}
 }
 
 FarCall FarSession::Record(const CrossingQuery &query) {

@@ -252,4 +252,46 @@ public:
 	InsertionOrderPreservingMap<string> ParamsToString() const override;
 };
 
+struct CrossingCreateTableAsState : public GlobalSinkState {
+	unique_ptr<ColumnDataCollection> rows;
+	unique_ptr<CrossingBindData> bind_data;
+	unique_ptr<CrossingSeamFilledWrite> write;
+	idx_t affected_rows = 0;
+	bool created = false;
+};
+
+class CrossingCreateTableAs : public PhysicalOperator {
+public:
+	static constexpr const PhysicalOperatorType TYPE = PhysicalOperatorType::EXTENSION;
+
+	CrossingCreateTableAs(PhysicalPlan &physical_plan, CrossingAttach &attach, SchemaCatalogEntry &owner,
+	                      unique_ptr<BoundCreateTableInfo> info, vector<LogicalType> row_types,
+	                      idx_t estimated_cardinality);
+
+	CrossingAttach &attach;
+	SchemaCatalogEntry &owner;
+	unique_ptr<BoundCreateTableInfo> info;
+	vector<LogicalType> row_types;
+
+	unique_ptr<GlobalSinkState> GetGlobalSinkState(ClientContext &context) const override;
+	SinkResultType Sink(ExecutionContext &context, DataChunk &chunk, OperatorSinkInput &input) const override;
+	SinkFinalizeType Finalize(Pipeline &pipeline, Event &event, ClientContext &context,
+	                          OperatorSinkFinalizeInput &input) const override;
+	bool IsSink() const override {
+		return true;
+	}
+	bool ParallelSink() const override {
+		return false;
+	}
+
+	unique_ptr<GlobalSourceState> GetGlobalSourceState(ClientContext &context) const override;
+	SourceResultType GetDataInternal(ExecutionContext &context, DataChunk &chunk,
+	                                 OperatorSourceInput &input) const override;
+	bool IsSource() const override {
+		return true;
+	}
+
+	string GetName() const override;
+};
+
 } // namespace duckdb

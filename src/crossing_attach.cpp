@@ -3,6 +3,8 @@
 #include "internal/crossing_table_entry.hpp"
 #include "internal/crossing_write.hpp"
 
+#include "duckdb/catalog/catalog_entry/schema_catalog_entry.hpp"
+#include "duckdb/common/exception/catalog_exception.hpp"
 #include "duckdb/parser/parsed_data/create_table_info.hpp"
 #include "duckdb/transaction/transaction.hpp"
 
@@ -93,6 +95,23 @@ vector<string> CrossingAttach::Tables(const string &schema) {
 	}
 	std::sort(out.begin(), out.end());
 	return out;
+}
+
+CrossingSchema CrossingAttach::DescribedSchema(const string &schema) {
+	lock_guard<mutex> guard(schemas_lock);
+	auto &listing = ListedSchemas();
+	auto it = listing.find(schema);
+	if (it == listing.end()) {
+		CrossingSchema none;
+		none.name = schema;
+		return none;
+	}
+	auto &entry = it->second;
+	if (!entry.described) {
+		entry.schema = source->DescribeSchema(it->first);
+		entry.described = true;
+	}
+	return entry.schema;
 }
 
 bool CrossingAttach::ServesSchema(const string &schema) {
@@ -229,6 +248,32 @@ void CrossingAttach::ThrowIfSchemaServed(const string &schema) {
 	}
 }
 
+void CrossingAttach::Ddl(ClientContext &context, Transaction &transaction, SchemaCatalogEntry &owner,
+                         const CrossingDdl &ddl) {
+	if (ddl.verb == CrossingVerb::CREATE) {
+		if (!DescribedSchema(ddl.schema).Allows(ddl.verb)) {
+			throw PermissionException("crossing: schema '%s' does not have '%s' permission", ddl.schema,
+			                          CrossingVerbName(ddl.verb));
+		}
+	} else {
+		auto described = Described(ddl.schema, owner, ddl.table);
+		if (!described) {
+			throw CatalogException::MissingEntry(CatalogType::TABLE_ENTRY, ddl.table, string());
+		}
+		if (!described->Allows(ddl.verb)) {
+			throw PermissionException("crossing: '%s' does not have '%s' permission", ddl.table,
+			                          CrossingVerbName(ddl.verb));
+		}
+	}
+	Session(context, transaction).Ddl(context, ddl);
+	{
+		auto &slot = SlotOf(transaction);
+		lock_guard<mutex> guard(slot.lock);
+		slot.altered_schemas.push_back(ddl.schema);
+	}
+	Refresh(ddl.schema);
+}
+
 CrossingAttach::Slot &CrossingAttach::SlotOf(Transaction &transaction) {
 	lock_guard<mutex> guard(transactions_lock);
 	auto &slot = begun[&transaction];
@@ -262,20 +307,42 @@ unique_ptr<CrossingSession> CrossingAttach::Release(Transaction &transaction) {
 		begun.erase(it);
 	}
 	lock_guard<mutex> guard(slot->lock);
+	if (!slot->altered_schemas.empty()) {
+		lock_guard<mutex> settling_guard(transactions_lock);
+		settling[slot->session.get()] = std::move(slot->altered_schemas);
+	}
 	return std::move(slot->session);
+}
+
+void CrossingAttach::Settled(CrossingSession &released) {
+	vector<string> altered;
+	{
+		lock_guard<mutex> guard(transactions_lock);
+		auto it = settling.find(&released);
+		if (it == settling.end()) {
+			return;
+		}
+		altered = std::move(it->second);
+		settling.erase(it);
+	}
+	for (auto &schema : altered) {
+		Refresh(schema);
+	}
 }
 
 ErrorData CrossingAttach::Commit(unique_ptr<CrossingSession> released) {
 	if (!released) {
 		return ErrorData();
 	}
+	ErrorData error;
 	try {
 		released->Commit();
 	} catch (std::exception &ex) {
 		ErrorData failure(ex);
-		return ErrorData(failure.Type(), "crossing: commit on source failed: " + failure.RawMessage());
+		error = ErrorData(failure.Type(), "crossing: commit on source failed: " + failure.RawMessage());
 	}
-	return ErrorData();
+	Settled(*released);
+	return error;
 }
 
 void CrossingAttach::Rollback(unique_ptr<CrossingSession> released) {
@@ -286,6 +353,7 @@ void CrossingAttach::Rollback(unique_ptr<CrossingSession> released) {
 		released->Rollback();
 	} catch (...) {
 	}
+	Settled(*released);
 }
 
 ErrorData CrossingAttach::Commit(Transaction &transaction) {

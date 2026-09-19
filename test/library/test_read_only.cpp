@@ -37,3 +37,21 @@ TEST_CASE("a table declaring a write verb on a source whose session has no Write
 	REQUIRE(count->HasError());
 	REQUIRE_THAT(count->GetError(), Catch::Contains("'w' declares 'insert' but the session has no Write"));
 }
+
+TEST_CASE("a table declaring a ddl verb on a source whose session has no Ddl is refused on first use", "[read_only]") {
+	DuckDB db(nullptr);
+	Connection con(db);
+	ExtensionLoader loader(*db.instance, "rodb");
+	readonly::ReadOnlySource::Register(loader);
+
+	auto attached = con.Query("ATTACH 'nowhere' AS ro (TYPE rodb)");
+	REQUIRE(!attached->HasError());
+
+	auto count = con.Query("SELECT count(*) FROM ro.a");
+	REQUIRE(count->HasError());
+	REQUIRE_THAT(count->GetError(), Catch::Contains("'a' declares 'alter' but the session has no Ddl"));
+
+	auto create = con.Query("CREATE TABLE ro.main.n(id INTEGER)");
+	REQUIRE(create->HasError());
+	REQUIRE_THAT(create->GetError(), Catch::Contains("schema 'main' does not have 'create' permission"));
+}

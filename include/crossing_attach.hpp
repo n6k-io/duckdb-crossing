@@ -20,6 +20,9 @@ class SchemaCatalogEntry;
 class Transaction;
 class CrossingWriteCatalog;
 class CrossingAttach;
+class PhysicalOperator;
+class PhysicalPlanGenerator;
+class LogicalCreateTable;
 
 class CrossingAttachOwner {
 public:
@@ -46,6 +49,7 @@ public:
 	vector<string> Schemas();
 	//! Sorted.
 	vector<string> Tables(const string &schema);
+	CrossingSchema DescribedSchema(const string &schema);
 	bool ServesSchema(const string &schema);
 	bool ServesTable(const string &schema, const string &table);
 	//! Forgets what the source listed and described; the next lookup asks again. Entries already
@@ -65,13 +69,18 @@ public:
 	void ThrowIfServed(const string &schema, const string &table, const char *what);
 	void ThrowIfSchemaServed(const string &schema);
 
+	void Ddl(ClientContext &context, Transaction &transaction, SchemaCatalogEntry &owner, const CrossingDdl &ddl);
+	PhysicalOperator &PlanCreateTableAs(ClientContext &context, PhysicalPlanGenerator &planner, LogicalCreateTable &op,
+	                                    PhysicalOperator &plan);
+
 	//! The source's side of `transaction`, begun on first use.
 	CrossingSession &Session(ClientContext &context, Transaction &transaction);
 	//! Hands the source's side back; null when the transaction never touched the source. Call this
-	//! before a base transaction manager frees `transaction`.
+	//! before a base transaction manager frees `transaction`, and hand the result to Commit or
+	//! Rollback: a schema the transaction changed is forgotten once the source has resolved it.
 	unique_ptr<CrossingSession> Release(Transaction &transaction);
-	static ErrorData Commit(unique_ptr<CrossingSession> released);
-	static void Rollback(unique_ptr<CrossingSession> released);
+	ErrorData Commit(unique_ptr<CrossingSession> released);
+	void Rollback(unique_ptr<CrossingSession> released);
 	ErrorData Commit(Transaction &transaction);
 	void Rollback(Transaction &transaction);
 
@@ -86,14 +95,18 @@ private:
 	struct Slot {
 		mutex lock;
 		unique_ptr<CrossingSession> session;
+		vector<string> altered_schemas;
 	};
 	struct Listing {
 		bool listed = false;
 		case_insensitive_set_t tables;
+		bool described = false;
+		CrossingSchema schema;
 	};
 
 	Catalog &WriteCatalog();
 	Slot &SlotOf(Transaction &transaction);
+	void Settled(CrossingSession &released);
 
 	case_insensitive_map_t<Listing> &ListedSchemas();
 	optional_ptr<const case_insensitive_set_t> TablesOf(const string &schema);
@@ -111,6 +124,7 @@ private:
 	case_insensitive_map_t<unique_ptr<SchemaState>> schemas;
 	mutex transactions_lock;
 	unordered_map<Transaction *, unique_ptr<Slot>> begun;
+	unordered_map<CrossingSession *, vector<string>> settling;
 };
 
 } // namespace duckdb
