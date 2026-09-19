@@ -2,7 +2,7 @@
 
 // What a catalog needs from crossing to serve one attached source. Own one per ATTACH, from
 // whatever Catalog base you choose, and forward table lookups and transaction ends to it. The
-// catalog crossing ships (CrossingSource::Register) is one such owner; see IMPLEMENTING.md.
+// catalog crossing ships (Crossing<S>::Register) is one such owner; see IMPLEMENTING.md.
 
 #include "crossing.hpp"
 
@@ -16,10 +16,16 @@ namespace duckdb {
 class AttachedDatabase;
 class Catalog;
 class CatalogEntry;
-class DatabaseInstance;
 class SchemaCatalogEntry;
 class Transaction;
 class CrossingWriteCatalog;
+class CrossingAttach;
+
+class CrossingAttachOwner {
+public:
+	virtual ~CrossingAttachOwner() = default;
+	virtual CrossingAttach &Attach() = 0;
+};
 
 class CrossingAttach {
 public:
@@ -29,6 +35,11 @@ public:
 	CrossingAttach &operator=(const CrossingAttach &) = delete;
 
 	CrossingSource &Source();
+	template <class S>
+	S &Source() {
+		return Crossing<S>::Native(Source());
+	}
+	const CrossingIdentity &Identity() const;
 	AttachedDatabase &Database();
 
 	//! Sorted, in the source's spelling. The source is asked on first use.
@@ -66,16 +77,23 @@ public:
 
 	void Detach(ClientContext &context);
 
-	//! The catalog served entries name as their parent, so DuckDB's planner routes DML to crossing.
-	Catalog &WriteCatalog();
-	static CrossingAttach &Of(Catalog &write_catalog);
+	//! The attach behind a catalog crossing built, or behind the catalog served entries name as
+	//! their parent.
+	static CrossingAttach &Of(Catalog &catalog);
 
 private:
 	struct SchemaState;
+	struct Slot {
+		mutex lock;
+		unique_ptr<CrossingSession> session;
+	};
 	struct Listing {
 		bool listed = false;
 		case_insensitive_set_t tables;
 	};
+
+	Catalog &WriteCatalog();
+	Slot &SlotOf(Transaction &transaction);
 
 	case_insensitive_map_t<Listing> &ListedSchemas();
 	optional_ptr<const case_insensitive_set_t> TablesOf(const string &schema);
@@ -86,17 +104,13 @@ private:
 
 	AttachedDatabase &db;
 	unique_ptr<CrossingSource> source;
-	unique_ptr<CrossingWriteCatalog> phantom;
+	unique_ptr<CrossingWriteCatalog> write_catalog;
 	mutex schemas_lock;
 	bool schemas_listed = false;
 	case_insensitive_map_t<Listing> served;
 	case_insensitive_map_t<unique_ptr<SchemaState>> schemas;
 	mutex transactions_lock;
-	unordered_map<Transaction *, unique_ptr<CrossingSession>> begun;
+	unordered_map<Transaction *, unique_ptr<Slot>> begun;
 };
-
-//! Once per database instance. CrossingSource::Register calls it; a catalog registered another way
-//! must.
-void RegisterCrossingPass(DatabaseInstance &db);
 
 } // namespace duckdb

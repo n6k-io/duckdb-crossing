@@ -24,11 +24,11 @@ TEST_CASE("a fragment that already emits what the scan wants is left alone", "[n
 
 TEST_CASE("narrowing a folded fragment leaves what crossed untouched", "[narrow]") {
 	auto plan = PlanFromDSL("filter{amt > 100} | crossing[proj{id, amt} | scan]");
-	MoveCrossableWorkIntoFragments(plan, TestIndices());
+	FoldCrossableWorkIntoFragments(plan, TestIndices(), MemoryIdentity());
 	REQUIRE_PLAN(plan, "crossing[filter{amt > 100} | proj{id, amt} | scan]");
 
 	plan->Cast<LogicalGet>().SetColumnIds({ColumnIndex(1)});
-	NarrowFragmentsToTheirScans(plan);
+	NarrowScansToRequestedColumns(plan, MemoryIdentity());
 
 	REQUIRE_PLAN(plan, "crossing[proj{c1} | filter{amt > 100} | proj{id, amt} | scan]");
 }
@@ -40,7 +40,7 @@ TEST_CASE("the scan left behind emits what the narrowed fragment does", "[narrow
 
 	Narrow(scan);
 
-	auto fragment = CrossingReadFragmentOf(*scan);
+	auto fragment = CrossingReadFragmentOf(*scan, MemoryIdentity());
 	REQUIRE(fragment->output_types == vector<LogicalType> {LogicalType::INTEGER});
 	REQUIRE(scan->Cast<LogicalGet>().returned_types == fragment->output_types);
 	REQUIRE_NOTHROW(fragment->VerifyInvariants());
@@ -60,10 +60,10 @@ TEST_CASE("narrowing twice stacks only what the second one needs", "[narrow]") {
 	auto plan = Build(Scan());
 	Align(plan);
 	plan->Cast<LogicalGet>().SetColumnIds({ColumnIndex(0), ColumnIndex(1)});
-	NarrowFragmentsToTheirScans(plan);
+	NarrowScansToRequestedColumns(plan, MemoryIdentity());
 
 	plan->Cast<LogicalGet>().SetColumnIds({ColumnIndex(1)});
-	NarrowFragmentsToTheirScans(plan);
+	NarrowScansToRequestedColumns(plan, MemoryIdentity());
 
 	REQUIRE_PLAN(plan, "crossing[proj{amt} | proj{id, amt} | scan]");
 }

@@ -13,10 +13,6 @@ public:
 	CrossingTableCatalogEntry(Catalog &catalog, SchemaCatalogEntry &schema, CreateTableInfo &info,
 	                          CrossingSource &source, string source_schema, CrossingTable described);
 
-	CrossingSource &Source() {
-		return source;
-	}
-
 	CrossingSource &source;
 	string source_schema;
 	CrossingTable described;
@@ -27,7 +23,6 @@ public:
 	//! The key column a virtual id stands for, or invalid for any other id.
 	optional_idx KeyColumnOfAlias(column_t virtual_id) const;
 
-public:
 	unique_ptr<BaseStatistics> GetStatistics(ClientContext &context, column_t column_id) override;
 	TableFunction GetScanFunction(ClientContext &context, unique_ptr<FunctionData> &bind_data) override;
 	TableStorageInfo GetStorageInfo(ClientContext &context) override;
@@ -39,7 +34,11 @@ public:
 	vector<column_t> GetRowIdColumns() const override;
 };
 
+optional_ptr<CrossingTableCatalogEntry> CrossingTableOf(TableCatalogEntry &table, const CrossingIdentity &identity);
+
+TableStorageInfo UniqueConstraintStorageInfo(TableCatalogEntry &table);
+
 //! Turns every key alias in a crossing scan's column ids into the key column it stands for.
-void ResolveKeyAliases(LogicalOperator &plan);
+void ResolveKeyAliases(LogicalOperator &plan, const CrossingIdentity &identity);
 
 } // namespace duckdb

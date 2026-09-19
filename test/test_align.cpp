@@ -44,7 +44,7 @@ TEST_CASE("the fragment takes the scan's table index", "[align]") {
 
 	Align(scan);
 
-	auto fragment = CrossingReadFragmentOf(*scan);
+	auto fragment = CrossingReadFragmentOf(*scan, MemoryIdentity());
 	REQUIRE(fragment->table_index == 41);
 	REQUIRE(fragment->crossing_projection->table_index == 41);
 }

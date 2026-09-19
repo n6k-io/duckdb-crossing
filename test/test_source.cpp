@@ -6,7 +6,7 @@ using namespace duckdb;
 TEST_CASE("a crossing scan hands back its fragment", "[source]") {
 	auto scan = MemorySourceScan();
 
-	auto fragment = CrossingReadFragmentOf(*scan);
+	auto fragment = CrossingReadFragmentOf(*scan, MemoryIdentity());
 
 	REQUIRE(fragment);
 	REQUIRE(fragment->plan);
@@ -16,8 +16,8 @@ TEST_CASE("a crossing scan hands back its fragment", "[source]") {
 TEST_CASE("an operator that is not a crossing scan hands back nothing", "[source]") {
 	auto scan = make_uniq<LogicalDummyScan>(MEMORY_FLOOR_INDEX);
 
-	REQUIRE(!CrossingReadFragmentOf(*scan));
-	REQUIRE(!CrossingSourceOf(*scan));
+	REQUIRE(!CrossingReadFragmentOf(*scan, MemoryIdentity()));
+	REQUIRE(!CrossingSourceOf(*scan, MemoryIdentity()));
 }
 
 TEST_CASE("a GET with no bind data is not a crossing scan", "[source]") {
@@ -25,13 +25,13 @@ TEST_CASE("a GET with no bind data is not a crossing scan", "[source]") {
 	auto get = make_uniq<LogicalGet>(MEMORY_GET_INDEX, function, nullptr, vector<LogicalType> {LogicalType::INTEGER},
 	                                 vector<string> {"id"});
 
-	REQUIRE(!CrossingReadFragmentOf(*get));
+	REQUIRE(!CrossingReadFragmentOf(*get, MemoryIdentity()));
 }
 
 TEST_CASE("a source answers only for the functions it was given", "[source]") {
 	auto scan = MemorySourceScan({"shift"});
 
-	auto source = CrossingSourceOf(*scan);
+	auto source = CrossingSourceOf(*scan, MemoryIdentity());
 
 	REQUIRE(source);
 	REQUIRE(source->AcceptsCall(*Call("shift")).ok);
@@ -49,12 +49,12 @@ TEST_CASE("two scans of one source share it", "[source]") {
 	auto first = MemorySourceScan();
 	auto second = MemorySourceScan();
 
-	REQUIRE(CrossingSourceOf(*first).get() == CrossingSourceOf(*second).get());
+	REQUIRE(CrossingSourceOf(*first, MemoryIdentity()).get() == CrossingSourceOf(*second, MemoryIdentity()).get());
 }
 
 TEST_CASE("two scans of different sources do not share one", "[source]") {
 	auto first = MemorySourceScan();
 	auto second = MemorySourceScan({}, "elsewhere");
 
-	REQUIRE(CrossingSourceOf(*first).get() != CrossingSourceOf(*second).get());
+	REQUIRE(CrossingSourceOf(*first, MemoryIdentity()).get() != CrossingSourceOf(*second, MemoryIdentity()).get());
 }

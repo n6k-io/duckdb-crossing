@@ -2,7 +2,7 @@
 
 #include "duckdb/planner/logical_operator.hpp"
 
-#include "internal/labelling.hpp"
+#include "crossing.hpp"
 
 namespace duckdb {
 
@@ -10,12 +10,13 @@ namespace duckdb {
 //! it, and hands back that scan to stand in the subtree's place.
 //!
 //! The caller decides the subtree is crossable -- see LabelSubtrees. This only moves it.
-unique_ptr<LogicalOperator> FoldSubtreeIntoItsFragment(unique_ptr<LogicalOperator> subtree);
+unique_ptr<LogicalOperator> FoldSubtreeIntoItsFragment(unique_ptr<LogicalOperator> subtree,
+                                                       const CrossingIdentity &identity);
 
 void AdoptSeamIndex(LogicalOperator &feed, idx_t seam_index);
 
-bool SubtreeHoldsFrozenScan(LogicalOperator &node);
+bool SubtreeHoldsFrozenScan(LogicalOperator &node, const CrossingIdentity &identity);
 
-void SpliceReadRegionsIntoPlace(unique_ptr<LogicalOperator> &subtree);
+void UnfoldScansIntoPlace(unique_ptr<LogicalOperator> &subtree, const CrossingIdentity &identity);
 
 } // namespace duckdb

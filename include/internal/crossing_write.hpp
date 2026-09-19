@@ -9,26 +9,29 @@
 #include "duckdb/main/client_context_state.hpp"
 #include "duckdb/planner/operator/logical_delete.hpp"
 #include "duckdb/planner/operator/logical_extension_operator.hpp"
+#include "duckdb/planner/operator/logical_get.hpp"
 #include "duckdb/planner/operator/logical_insert.hpp"
+#include "duckdb/planner/operator/logical_merge_into.hpp"
 #include "duckdb/planner/operator/logical_update.hpp"
 
 #include "crossing.hpp"
+#include "crossing_attach.hpp"
+#include "internal/crossing_read.hpp"
 #include "internal/crossing_table_entry.hpp"
 #include "internal/fragment.hpp"
-#include "internal/source.hpp"
 
 namespace duckdb {
 
-class CrossingAttach;
-
 //! Never registered with the database: it exists so served entries have a Catalog whose Plan*
 //! reach crossing, and it answers to the attach's AttachedDatabase for transactions.
-class CrossingWriteCatalog : public Catalog {
+class CrossingWriteCatalog : public Catalog, public CrossingAttachOwner {
 public:
 	CrossingWriteCatalog(AttachedDatabase &db, CrossingAttach &attach);
 	~CrossingWriteCatalog() override;
 
-	CrossingAttach &attach;
+	CrossingAttach &Attach() override {
+		return attach;
+	}
 
 	void Initialize(bool load_builtin) override;
 	string GetCatalogType() override;
@@ -55,27 +58,50 @@ public:
 
 private:
 	void DropSchema(ClientContext &context, DropInfo &info) override;
+
+	CrossingAttach &attach;
 };
 
-CrossingSeam SeamOf(CrossingTableCatalogEntry &table, CrossingVerb verb, vector<string> set_columns);
+vector<LogicalType> ColumnTypesByName(TableCatalogEntry &table, const vector<string> &wanted);
+
+vector<LogicalType> TableRowTypes(TableCatalogEntry &table);
+
+vector<string> TableColumnNames(TableCatalogEntry &table);
+
+vector<string> SetColumnNames(TableCatalogEntry &table, const vector<PhysicalIndex> &columns);
+
+unique_ptr<Expression> RefAt(const LogicalType &type, idx_t position);
+
+optional_ptr<LogicalGet> FindGetWithIndex(LogicalOperator &op, idx_t table_index);
+
+vector<unique_ptr<Expression>> RowImageFrom(LogicalGet &get, TableCatalogEntry &table);
+
+bool MergeDeletes(LogicalMergeInto &merge);
+
+vector<unique_ptr<Expression>> ImageFromSetValues(TableCatalogEntry &table, const CrossingSeam &seam,
+                                                  const vector<unique_ptr<Expression>> &set_values);
+
+CrossingTableUse WrittenTable(const string &source_schema, const CrossingTable &described, const CrossingSeam &seam);
+
+CrossingSeam SeamOf(TableCatalogEntry &table, const CrossingTable &described, CrossingVerb verb,
+                    vector<string> set_columns);
 
 void RequireVerb(CrossingTableCatalogEntry &table, CrossingVerb verb);
 
-void RequireKey(CrossingTableCatalogEntry &table, const char *what);
+void RequireKey(TableCatalogEntry &table, const CrossingTable &described, const char *what);
 
 shared_ptr<CrossingFragment> PlanWriteFragment(CrossingTableCatalogEntry &table, CrossingVerb verb,
                                                const CrossingSeam &seam);
 
+unique_ptr<CrossingBindData> MakeWriteBindData(CrossingTableCatalogEntry &table, CrossingVerb verb, CrossingSeam seam,
+                                               shared_ptr<CrossingFragment> fragment);
+
 class CrossingSeamEntry : public TableCatalogEntry {
 public:
 	CrossingSeamEntry(Catalog &catalog, SchemaCatalogEntry &schema, CreateTableInfo &info,
-	                  CrossingTableCatalogEntry &target, CrossingVerb verb, CrossingSeam seam,
-	                  shared_ptr<CrossingFragment> fragment, string obstacle);
+	                  unique_ptr<CrossingBindData> write, string obstacle);
 
-	CrossingTableCatalogEntry &target;
-	CrossingVerb verb;
-	CrossingSeam seam;
-	shared_ptr<CrossingFragment> fragment;
+	unique_ptr<CrossingBindData> write;
 	string obstacle;
 	vector<idx_t> key_positions;
 
@@ -88,11 +114,11 @@ const string &CrossingSeamEntriesKey();
 
 class CrossingSeamEntries : public ClientContextState {
 public:
-	void Hold(shared_ptr<CrossingSeamEntry> entry) {
+	void Hold(shared_ptr<TableCatalogEntry> entry) {
 		live.push_back(std::move(entry));
 	}
 
-	shared_ptr<CrossingSeamEntry> Share(CrossingSeamEntry &entry) {
+	shared_ptr<TableCatalogEntry> Share(TableCatalogEntry &entry) {
 		for (auto &held : live) {
 			if (held.get() == &entry) {
 				return held;
@@ -110,37 +136,17 @@ public:
 	}
 
 private:
-	vector<shared_ptr<CrossingSeamEntry>> live;
-};
-
-static constexpr const char *CROSSING_WRITE_FUNCTION = "crossing_table_write";
-
-struct CrossingWriteBindData : public TableFunctionData, public CrossingWriteCarrier {
-	optional_ptr<CrossingTableCatalogEntry> table;
-	CrossingVerb verb = CrossingVerb::INSERT;
-	CrossingSeam seam;
-	shared_ptr<CrossingFragment> fragment;
-
-	optional_ptr<CrossingFragment> GetWriteFragment() override {
-		return fragment.get();
-	}
-	CrossingSource &Source() override {
-		return table->Source();
-	}
-	bool SupportStatementCache() const override {
-		return false;
-	}
+	vector<shared_ptr<TableCatalogEntry>> live;
 };
 
 TableFunction CrossingWriteFunction();
 
 class CrossingSeamFilledWrite {
 public:
-	CrossingSeamFilledWrite(CrossingTableCatalogEntry &table, CrossingVerb verb, const CrossingSeam &seam,
-	                        shared_ptr<CrossingFragment> fragment, unique_ptr<ColumnDataCollection> rows);
+	CrossingSeamFilledWrite(const CrossingBindData &write, unique_ptr<ColumnDataCollection> rows);
 	~CrossingSeamFilledWrite();
 
-	CrossingWriteResult Ask(ClientContext &context, CrossingWaker waker);
+	CrossingWriteResult Pull(ClientContext &context, CrossingWaker waker);
 
 private:
 	CrossingTableCatalogEntry &table;
@@ -152,12 +158,12 @@ private:
 	CrossingWriter writer;
 };
 
-class LogicalCrossingWholeWrite : public LogicalExtensionOperator {
+class LogicalCrossingFence : public LogicalExtensionOperator {
 public:
-	LogicalCrossingWholeWrite(idx_t table_index, unique_ptr<CrossingWriteBindData> bind_data);
+	LogicalCrossingFence(idx_t table_index, unique_ptr<CrossingBindData> bind_data);
 
 	idx_t table_index;
-	unique_ptr<CrossingWriteBindData> bind_data;
+	unique_ptr<CrossingBindData> bind_data;
 
 	PhysicalOperator &CreatePlan(ClientContext &context, PhysicalPlanGenerator &planner) override;
 	vector<ColumnBinding> GetColumnBindings() override;
@@ -174,14 +180,13 @@ protected:
 	void ResolveTypes() override;
 };
 
-class CrossingWholeWrite : public PhysicalOperator {
+class CrossingFence : public PhysicalOperator {
 public:
 	static constexpr const PhysicalOperatorType TYPE = PhysicalOperatorType::EXTENSION;
 
-	CrossingWholeWrite(PhysicalPlan &physical_plan, unique_ptr<CrossingWriteBindData> bind_data,
-	                   idx_t estimated_cardinality);
+	CrossingFence(PhysicalPlan &physical_plan, unique_ptr<CrossingBindData> bind_data, idx_t estimated_cardinality);
 
-	unique_ptr<CrossingWriteBindData> bind_data;
+	unique_ptr<CrossingBindData> bind_data;
 
 	unique_ptr<GlobalSourceState> GetGlobalSourceState(ClientContext &context) const override;
 	SourceResultType GetDataInternal(ExecutionContext &context, DataChunk &chunk,
@@ -194,9 +199,7 @@ public:
 	InsertionOrderPreservingMap<string> ParamsToString() const override;
 };
 
-InsertionOrderPreservingMap<string> CrossingWriteParams(const CrossingWriteBindData &bind_data);
-
-void WidenKeyedWritesForReturning(LogicalOperator &plan);
+void AddRowImageForReturning(LogicalOperator &plan, const CrossingIdentity &identity);
 
 struct CrossingWriteState : public GlobalSinkState {
 	unique_ptr<ColumnDataCollection> rows;
@@ -205,8 +208,8 @@ struct CrossingWriteState : public GlobalSinkState {
 	ColumnDataScanState returned_scan;
 	bool returned_scanning = false;
 	idx_t affected_rows = 0;
-	unique_ptr<CrossingSeamFilledWrite> write;
 	idx_t keys_sent = 0;
+	unique_ptr<CrossingSeamFilledWrite> write;
 
 	void SeeKey(DataChunk &chunk, const vector<idx_t> &key_positions, idx_t index);
 };
@@ -215,14 +218,11 @@ class CrossingWrite : public PhysicalOperator {
 public:
 	static constexpr const PhysicalOperatorType TYPE = PhysicalOperatorType::EXTENSION;
 
-	CrossingWrite(PhysicalPlan &physical_plan, CrossingTableCatalogEntry &table, CrossingVerb verb, CrossingSeam seam,
-	              shared_ptr<CrossingFragment> fragment, vector<LogicalType> types, idx_t estimated_cardinality);
+	CrossingWrite(PhysicalPlan &physical_plan, unique_ptr<CrossingBindData> bind_data, vector<LogicalType> types,
+	              idx_t estimated_cardinality);
 
-	CrossingTableCatalogEntry &table;
-	CrossingVerb verb;
-	CrossingSeam seam;
-	shared_ptr<CrossingFragment> fragment;
-	shared_ptr<CrossingSeamEntry> entry;
+	unique_ptr<CrossingBindData> bind_data;
+	shared_ptr<TableCatalogEntry> entry;
 	bool return_chunk = false;
 	string obstacle;
 
@@ -248,6 +248,7 @@ public:
 		return true;
 	}
 
+	string GetName() const override;
 	InsertionOrderPreservingMap<string> ParamsToString() const override;
 };
 

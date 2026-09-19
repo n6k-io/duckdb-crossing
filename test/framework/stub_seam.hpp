@@ -60,7 +60,7 @@ inline shared_ptr<CrossingFragment> FragmentOverSeam(vector<LogicalType> seam_ty
 	return fragment;
 }
 
-inline CrossingSource &StubSource() {
+inline MemorySource &StubSource() {
 	return MemorySourceFor("memory", {});
 }
 

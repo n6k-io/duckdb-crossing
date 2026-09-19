@@ -3,7 +3,7 @@
 #include "duckdb/planner/expression.hpp"
 #include "duckdb/planner/logical_operator.hpp"
 
-#include "internal/source.hpp"
+#include "crossing.hpp"
 
 namespace duckdb {
 
@@ -11,6 +11,8 @@ namespace duckdb {
 CrossingVerdict VerdictOn(const Expression &expr, CrossingSource &source);
 
 bool CanEvaluate(const Expression &expr, CrossingSource &source);
+
+CrossingVerdict VerdictOnAll(LogicalOperator &op, CrossingSource &source);
 
 bool CanEvaluateAll(LogicalOperator &op, CrossingSource &source);
 

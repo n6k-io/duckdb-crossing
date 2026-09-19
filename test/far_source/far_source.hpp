@@ -19,6 +19,7 @@ struct FarCall {
 	CrossingVerb kind;
 	string plan_text;
 	vector<CrossingTableUse> tables;
+	CrossingTableUse written;
 	vector<LogicalOperatorType> operators;
 	vector<LogicalType> types;
 	bool ordered = false;
@@ -78,36 +79,15 @@ struct FarStore {
 	const FarCall &LastWrite();
 };
 
-class FarSource : public CrossingSource {
-public:
-	FarSource(shared_ptr<FarStore> store, string path);
-
-	vector<string> Schemas() override;
-	vector<string> Tables(const string &schema) override;
-	CrossingTable Describe(const string &schema, const string &name) override;
-	CrossingPlan Plan(const CrossingPlanRequest &request) override;
-	CrossingVerdict AcceptsCall(const Expression &expr) override;
-	CrossingVerdict AcceptsType(const LogicalType &type) override;
-	CrossingVerdict AcceptsOperator(const LogicalOperator &op) override;
-	unique_ptr<CrossingSession> Begin(ClientContext &context) override;
-	void Detach(ClientContext &context) override;
-
-	static void Register(ExtensionLoader &loader, shared_ptr<FarStore> store);
-
-private:
-	shared_ptr<FarStore> store;
-	string path;
-};
-
-class FarSession : public CrossingSession {
+class FarSession {
 public:
 	explicit FarSession(shared_ptr<FarStore> store);
-	~FarSession() override;
+	~FarSession();
 
-	CrossingScan Read(ClientContext &context, const CrossingQuery &query) override;
-	CrossingWriter Write(ClientContext &context, const CrossingQuery &query) override;
-	void Commit() override;
-	void Rollback() override;
+	CrossingScan Read(ClientContext &context, const CrossingQuery &query);
+	CrossingWriter Write(ClientContext &context, const CrossingQuery &query);
+	void Commit();
+	void Rollback();
 
 private:
 	vector<vector<Value>> Evaluate(const LogicalOperator &plan, FarCall &call);
@@ -117,7 +97,42 @@ private:
 	FarCall Record(const CrossingQuery &query);
 
 	shared_ptr<FarStore> store;
+	mutex far_lock;
 	Connection far;
 };
 
+class FarSource {
+public:
+	using Session = FarSession;
+
+	FarSource(shared_ptr<FarStore> store, string path);
+
+	vector<string> Schemas();
+	vector<string> Tables(const string &schema);
+	CrossingTable Describe(const string &schema, const string &name);
+	CrossingPlan Plan(const CrossingPlanRequest &request);
+	CrossingVerdict AcceptsCall(const Expression &expr);
+	CrossingVerdict AcceptsType(const LogicalType &type);
+	CrossingVerdict AcceptsOperator(const LogicalOperator &op);
+	unique_ptr<FarSession> Begin(ClientContext &context);
+	void Detach(ClientContext &context);
+
+	static void Register(ExtensionLoader &loader, shared_ptr<FarStore> store);
+
+private:
+	shared_ptr<FarStore> store;
+	string path;
+};
+
 } // namespace duckdb
+
+namespace other {
+
+class OtherSource : public duckdb::FarSource {
+public:
+	using FarSource::FarSource;
+
+	static void Register(duckdb::ExtensionLoader &loader, duckdb::shared_ptr<duckdb::FarStore> store);
+};
+
+} // namespace other

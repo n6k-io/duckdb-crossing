@@ -1,5 +1,5 @@
 #include "internal/pass.hpp"
-#include "internal/seam_split.hpp"
+#include "internal/fill.hpp"
 #include "framework/bound_plan.hpp"
 #include "framework/plan_dsl.hpp"
 #include "framework/stub_seam.hpp"
@@ -10,7 +10,7 @@ namespace {
 
 struct ShapedWrite {
 	shared_ptr<CrossingFragment> fragment;
-	SeamSplit split;
+	SeamFill split;
 };
 
 ShapedWrite ShapeBoundWrite(unique_ptr<LogicalOperator> &plan, vector<LogicalType> seam_types,
@@ -18,8 +18,8 @@ ShapedWrite ShapeBoundWrite(unique_ptr<LogicalOperator> &plan, vector<LogicalTyp
 	ShapedWrite shaped;
 	shaped.fragment = FragmentOverSeam(std::move(seam_types));
 	auto fresh = TestIndices();
-	auto row = SeamRowOf(*plan, key_columns, std::move(plan->children[0]), fresh);
-	shaped.split = SplitFeedIntoSeam(std::move(row.plan), *shaped.fragment, StubSource(), SeamStop(), fresh);
+	auto row = FeedOf(*plan, key_columns, std::move(plan->children[0]), fresh);
+	shaped.split = FillSeamFromFeed(std::move(row.plan), *shaped.fragment, StubSource(), SeamObstacle(), fresh);
 	return shaped;
 }
 
@@ -34,7 +34,7 @@ TEST_CASE("SELECT amt FROM memory_source() WHERE amt > 100", "[bound]") {
 	// folded to its column's type yet -- which is what a rule sees when the pass runs where it runs.
 	REQUIRE_PLAN(plan, "proj{amt} | filter{amt > CAST(100 AS INTEGER)} | crossing[proj{id, amt} | scan]");
 
-	MoveCrossableWorkIntoFragments(plan, TestIndices());
+	FoldCrossableWorkIntoFragments(plan, TestIndices(), MemoryIdentity());
 
 	// The fragment was built with both columns and narrowed to the one the scan asks for.
 	REQUIRE_PLAN(plan, "crossing[proj{amt} | filter{amt > CAST(100 AS INTEGER)} | proj{amt} | scan]");
@@ -47,7 +47,7 @@ TEST_CASE("SELECT count(*) FROM memory_source()", "[bound]") {
 
 	REQUIRE_PLAN(plan, "proj{count_star()} | agg{count_star()} | crossing[proj{id, amt} | scan]");
 
-	MoveCrossableWorkIntoFragments(plan, TestIndices());
+	FoldCrossableWorkIntoFragments(plan, TestIndices(), MemoryIdentity());
 
 	REQUIRE_PLAN(plan, "crossing[proj{count_star()} | agg{count_star()} | proj{id} | scan]");
 }
@@ -57,7 +57,7 @@ TEST_CASE("SELECT count(*) FROM memory_source(), by a source that does not know 
 
 	auto plan = env.Bind("SELECT count(*) FROM memory_source()");
 
-	MoveCrossableWorkIntoFragments(plan, TestIndices());
+	FoldCrossableWorkIntoFragments(plan, TestIndices(), MemoryIdentity());
 
 	REQUIRE_PLAN(plan, "proj{count_star()} | agg{count_star()} | crossing[proj{id} | scan]");
 }
@@ -67,7 +67,7 @@ TEST_CASE("SELECT id, count(amt) FROM memory_source() GROUP BY id", "[bound]") {
 
 	auto plan = env.Bind("SELECT id, count(amt) FROM memory_source() GROUP BY id");
 
-	MoveCrossableWorkIntoFragments(plan, TestIndices());
+	FoldCrossableWorkIntoFragments(plan, TestIndices(), MemoryIdentity());
 
 	REQUIRE_PLAN(plan, "crossing[proj{id, count(amt)} | agg{count(amt) by id} | proj{id, amt} | scan]");
 }
@@ -77,7 +77,7 @@ TEST_CASE("SELECT amt FROM memory_source() WHERE amt > 100 AND amt + 1 > 2", "[b
 
 	auto plan = env.Bind("SELECT amt FROM memory_source() WHERE amt > 100 AND amt + 1 > 2");
 
-	MoveCrossableWorkIntoFragments(plan, TestIndices());
+	FoldCrossableWorkIntoFragments(plan, TestIndices(), MemoryIdentity());
 
 	// `+` binds as a function call, and this source answers for no function, so that conjunct stays
 	// while the one beside it crosses. The split, on a plan the planner produced.
@@ -115,7 +115,7 @@ TEST_CASE("INSERT INTO t SELECT id, amt FROM memory_source()", "[bound][split]")
 	auto plan = env.Bind("INSERT INTO t SELECT id, amt FROM memory_source()");
 	REQUIRE_PLAN(plan, "insert | proj{id, amt} | crossing[proj{id, amt} | scan]");
 
-	MoveCrossableWorkIntoFragments(plan, TestIndices());
+	FoldCrossableWorkIntoFragments(plan, TestIndices(), MemoryIdentity());
 	REQUIRE_PLAN(plan, "insert | crossing[proj{id, amt} | proj{id, amt} | scan]");
 
 	auto shaped = ShapeBoundWrite(plan, {LogicalType::INTEGER, LogicalType::INTEGER});
@@ -161,7 +161,7 @@ TEST_CASE("SELECT a.amt FROM memory_source() a, memory_source() b WHERE a.id = b
 	REQUIRE_PLAN(plan, "proj{amt} | filter{id = id} | "
 	                   "cross(crossing[proj{id, amt} | scan], crossing[proj{id, amt} | scan])");
 
-	MoveCrossableWorkIntoFragments(plan, TestIndices());
+	FoldCrossableWorkIntoFragments(plan, TestIndices(), MemoryIdentity());
 
 	// One region. The right-hand scan is only read for its id, so alignment narrowed it to that.
 	REQUIRE_PLAN(plan, "crossing[proj{amt} | filter{id = id} | "

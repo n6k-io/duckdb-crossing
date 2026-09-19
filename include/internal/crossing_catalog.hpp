@@ -1,6 +1,6 @@
 #pragma once
 
-// The catalog CrossingSource::Register attaches: the source's tables and nothing else. No native
+// The catalog Crossing<S>::Register attaches: the source's tables and nothing else. No native
 // storage, no DDL. A catalog that needs more owns a CrossingAttach from its own base instead.
 
 #include "duckdb.hpp"
@@ -15,12 +15,12 @@ namespace duckdb {
 
 class CrossingSchemaEntry;
 
-class CrossingCatalog : public Catalog {
+class CrossingCatalog : public Catalog, public CrossingAttachOwner {
 public:
 	CrossingCatalog(AttachedDatabase &db, string catalog_type, unique_ptr<CrossingSource> source);
 	~CrossingCatalog() override;
 
-	CrossingAttach &Attach() {
+	CrossingAttach &Attach() override {
 		return attach;
 	}
 

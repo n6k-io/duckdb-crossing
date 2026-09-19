@@ -192,11 +192,11 @@ inline unique_ptr<LogicalOperator> Local() {
 }
 
 inline void Align(unique_ptr<LogicalOperator> &scan) {
-	AlignFragmentToScan(scan->Cast<LogicalGet>(), *CrossingReadFragmentOf(*scan));
+	NarrowFragmentToScan(scan->Cast<LogicalGet>(), *CrossingReadFragmentOf(*scan, MemoryIdentity()));
 }
 
 inline void Narrow(unique_ptr<LogicalOperator> &scan) {
-	NarrowFragmentAndScanToRequestedColumns(scan->Cast<LogicalGet>(), *CrossingReadFragmentOf(*scan));
+	NarrowFragmentAndScanToRequestedColumns(scan->Cast<LogicalGet>(), *CrossingReadFragmentOf(*scan, MemoryIdentity()));
 }
 
 inline void BuilderPushOne(vector<unique_ptr<Expression>> &into, unique_ptr<Expression> expr) {
