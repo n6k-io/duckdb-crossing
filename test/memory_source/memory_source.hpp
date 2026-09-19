@@ -1,7 +1,7 @@
 #pragma once
 
 #include "catch.hpp"
-#include "internal/source.hpp"
+#include "internal/carrier.hpp"
 
 #include "duckdb/function/table_function.hpp"
 #include "duckdb/planner/expression/bound_aggregate_expression.hpp"
@@ -19,6 +19,16 @@ namespace duckdb {
 constexpr idx_t MEMORY_FLOOR_INDEX = 0;
 constexpr idx_t MEMORY_CROSSING_INDEX = 1;
 constexpr idx_t MEMORY_GET_INDEX = 2;
+
+inline const CrossingIdentity &MemoryIdentity() {
+	static const CrossingIdentity identity;
+	return identity;
+}
+
+inline const CrossingIdentity &OtherIdentity() {
+	static const CrossingIdentity identity;
+	return identity;
+}
 
 inline string FunctionNameOf(const Expression &expr) {
 	switch (expr.GetExpressionClass()) {
@@ -56,17 +66,25 @@ inline unique_ptr<Expression> Call(const string &name, FunctionStability stabili
 
 class MemorySource : public CrossingSource {
 public:
-	explicit MemorySource(case_insensitive_set_t known_p = case_insensitive_set_t()) : known(std::move(known_p)) {
+	explicit MemorySource(case_insensitive_set_t known_p = case_insensitive_set_t(),
+	                      const CrossingIdentity &identity_p = MemoryIdentity())
+	    : known(std::move(known_p)), identity(identity_p) {
 	}
 
-	vector<string> Tables(const string &schema) override {
-		return {};
+	const CrossingIdentity &Identity() const override {
+		return identity;
 	}
-	CrossingTable Describe(const string &schema, const string &name) override {
-		throw InternalException("memory source: nothing to describe");
+	vector<string> Tables(const string &) override {
+		throw InternalException("memory: the engine never lists tables");
 	}
-	CrossingPlan Plan(const CrossingPlanRequest &request) override {
-		throw InternalException("memory source: nothing to plan");
+	CrossingTable Describe(const string &, const string &) override {
+		throw InternalException("memory: the engine never describes tables");
+	}
+	CrossingPlan Plan(const CrossingPlanRequest &) override {
+		throw InternalException("memory: the engine never plans");
+	}
+	unique_ptr<CrossingSession> Begin(ClientContext &) override {
+		throw InternalException("memory: the engine never begins");
 	}
 	CrossingVerdict AcceptsCall(const Expression &expr) override {
 		auto name = FunctionNameOf(expr);
@@ -75,35 +93,40 @@ public:
 		}
 		return CrossingVerdict::No("the memory source has no " + name);
 	}
-	CrossingVerdict AcceptsType(const LogicalType &type) override {
+	CrossingVerdict AcceptsType(const LogicalType &) override {
 		return CrossingVerdict::Yes();
-	}
-	unique_ptr<CrossingSession> Begin(ClientContext &) override {
-		throw InternalException("memory source: nothing to begin");
 	}
 
 private:
 	case_insensitive_set_t known;
+	const CrossingIdentity &identity;
 };
 
-inline MemorySource &MemorySourceFor(const string &id, const case_insensitive_set_t &known) {
+inline MemorySource &MemorySourceFor(const string &id, const case_insensitive_set_t &known,
+                                     const CrossingIdentity &identity = MemoryIdentity()) {
 	static std::map<string, unique_ptr<MemorySource>> sources;
-	string key = id;
+	string key = id + "@" + std::to_string(reinterpret_cast<uintptr_t>(&identity));
 	for (auto &name : known) {
 		key += "|" + name;
 	}
 	auto &slot = sources[key];
 	if (!slot) {
-		slot = make_uniq<MemorySource>(known);
+		slot = make_uniq<MemorySource>(known, identity);
 	}
 	return *slot;
 }
 
-struct MemorySourceBindData : public TableFunctionData, public CrossingReadCarrier {
+struct MemorySourceBindData : public TableFunctionData, public CrossingCarrier {
 	shared_ptr<CrossingFragment> fragment;
-	optional_ptr<CrossingSource> source;
+	optional_ptr<MemorySource> source;
 
-	optional_ptr<CrossingFragment> GetReadFragment() override {
+	const CrossingIdentity &Identity() const override {
+		return source->Identity();
+	}
+	CrossingVerb Verb() const override {
+		return CrossingVerb::SELECT;
+	}
+	optional_ptr<CrossingFragment> Fragment() override {
 		return fragment.get();
 	}
 	CrossingSource &Source() override {
@@ -125,13 +148,14 @@ inline shared_ptr<CrossingFragment> MemoryFragment() {
 }
 
 inline unique_ptr<LogicalOperator> MemorySourceScan(case_insensitive_set_t known = case_insensitive_set_t(),
-                                                    const string &id = "memory") {
+                                                    const string &id = "memory",
+                                                    const CrossingIdentity &identity = MemoryIdentity()) {
 	auto fragment = MemoryFragment();
 	fragment->RebuildPlanForColumns({0, 1});
 
 	auto bind_data = make_uniq<MemorySourceBindData>();
 	bind_data->fragment = fragment;
-	bind_data->source = &MemorySourceFor(id, known);
+	bind_data->source = &MemorySourceFor(id, known, identity);
 
 	auto types = fragment->column_types;
 	auto names = fragment->column_names;
@@ -140,6 +164,10 @@ inline unique_ptr<LogicalOperator> MemorySourceScan(case_insensitive_set_t known
 	    make_uniq<LogicalGet>(MEMORY_GET_INDEX, function, std::move(bind_data), std::move(types), std::move(names));
 	get->SetColumnIds({ColumnIndex(0), ColumnIndex(1)});
 	return std::move(get);
+}
+
+inline unique_ptr<LogicalOperator> OtherCrossingScan() {
+	return MemorySourceScan({}, "other", OtherIdentity());
 }
 
 } // namespace duckdb

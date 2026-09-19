@@ -1,5 +1,5 @@
+#include "crossing_attach.hpp"
 #include "framework/twin.hpp"
-#include "internal/crossing_catalog.hpp"
 
 #include "duckdb/common/file_system.hpp"
 #include "duckdb/main/attached_database.hpp"
@@ -13,7 +13,7 @@ CrossingAttach &AttachedAs(Twin &twin, const string &alias) {
 	twin.con.BeginTransaction();
 	auto &attached = *twin.near.instance->GetDatabaseManager().GetDatabase(*twin.con.context, alias);
 	twin.con.Commit();
-	return attached.GetCatalog().Cast<CrossingCatalog>().Attach();
+	return CrossingAttach::Of(attached.GetCatalog());
 }
 
 } // namespace

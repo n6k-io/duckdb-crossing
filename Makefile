@@ -1,6 +1,7 @@
 PROJ_DIR := $(dir $(abspath $(lastword $(MAKEFILE_LIST))))
-DUCKDB_SOURCE_DIR := $(PROJ_DIR)duckdb
-DUCKDB_BUILD_DIR := $(PROJ_DIR)build/duckdb
+-include $(PROJ_DIR)local.mk
+DUCKDB_SOURCE_DIR ?= $(PROJ_DIR)duckdb
+DUCKDB_BUILD_DIR ?= $(PROJ_DIR)build/duckdb
 BUILD_DIR := $(PROJ_DIR)build/crossing
 TEST_ARGS ?=
 JOBS ?= $(shell nproc 2>/dev/null || sysctl -n hw.ncpu 2>/dev/null || echo 2)
@@ -32,20 +33,24 @@ build: duckdb
 test: build
 	@"$(BUILD_DIR)/crossing_unittest" $(TEST_ARGS)
 	@"$(BUILD_DIR)/crossing_library_unittest" $(TEST_ARGS)
+	@ctest --test-dir "$(BUILD_DIR)" -R contract_ -j$(JOBS) --output-on-failure
 
 clean:
 	@rm -rf "$(PROJ_DIR)build"
 
 .PHONY: duckdb build test clean
 
-CLANG_FORMAT ?= clang-format
-FORMAT_FILES := $(wildcard $(PROJ_DIR)*.cpp $(PROJ_DIR)include/*.hpp $(PROJ_DIR)include/*/*.hpp) \
-	$(shell find $(PROJ_DIR)test -name '*.cpp' -o -name '*.hpp')
+CLANG_FORMAT ?= $(PROJ_DIR).venv/bin/clang-format
 
-format-check:
+$(CLANG_FORMAT): $(PROJ_DIR)pyproject.toml
+	@uv sync --project "$(PROJ_DIR)"
+FORMAT_FILES := $(wildcard $(PROJ_DIR)include/*.hpp $(PROJ_DIR)include/*/*.hpp $(PROJ_DIR)include/*/*.ipp) \
+	$(shell find $(PROJ_DIR)src $(PROJ_DIR)test -name '*.cpp' -o -name '*.hpp')
+
+format-check: $(CLANG_FORMAT)
 	@$(CLANG_FORMAT) --dry-run --Werror $(FORMAT_FILES)
 
-format-fix:
+format-fix: $(CLANG_FORMAT)
 	@$(CLANG_FORMAT) -i $(FORMAT_FILES)
 
 .PHONY: format-check format-fix

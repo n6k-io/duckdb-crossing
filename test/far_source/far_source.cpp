@@ -1,6 +1,5 @@
 #include "far_source/far_source.hpp"
 #include "crossing_substrait.hpp"
-#include "internal/plan_wire.hpp"
 
 #include "duckdb/common/types/column/column_data_collection.hpp"
 #include "duckdb/main/appender.hpp"
@@ -189,7 +188,7 @@ CrossingReader FarReader(shared_ptr<const vector<vector<Value>>> rows, idx_t par
 					raw->waits_served++;
 					raw->arrived.insert(partition);
 				});
-				return CrossingPull::Wait();
+				return CrossingReadResult::Wait();
 			}
 		}
 		idx_t count = 0;
@@ -204,11 +203,11 @@ CrossingReader FarReader(shared_ptr<const vector<vector<Value>>> rows, idx_t par
 		}
 		chunk.SetCardinality(count);
 		if (count == 0) {
-			return CrossingPull::Done();
+			return CrossingReadResult::Done();
 		}
 		lock_guard<mutex> guard(store->lock);
 		store->partitions_read.insert(partition);
-		return CrossingPull::Rows();
+		return CrossingReadResult::Rows();
 	};
 }
 
@@ -332,8 +331,11 @@ CrossingTable FarSource::Describe(const string &schema, const string &name) {
 }
 
 CrossingPlan FarSource::Plan(const CrossingPlanRequest &request) {
-	if (!store->declined.empty()) {
-		return CrossingPlan::Declined(store->declined);
+	{
+		lock_guard<mutex> guard(store->lock);
+		if (!store->declined.empty()) {
+			return CrossingPlan::Declined(store->declined);
+		}
 	}
 	if (request.verb == CrossingVerb::SELECT) {
 		auto described = Describe(request.schema, request.table);
@@ -365,6 +367,7 @@ CrossingVerdict FarSource::AcceptsCall(const Expression &expr) {
 	default:
 		return CrossingVerdict::Yes();
 	}
+	lock_guard<mutex> guard(store->lock);
 	if (store->refused_functions.find(name) != store->refused_functions.end()) {
 		return CrossingVerdict::No("far refuses " + name);
 	}
@@ -372,6 +375,7 @@ CrossingVerdict FarSource::AcceptsCall(const Expression &expr) {
 }
 
 CrossingVerdict FarSource::AcceptsType(const LogicalType &type) {
+	lock_guard<mutex> guard(store->lock);
 	for (auto refused : store->refused_types) {
 		if (type.id() == refused) {
 			return CrossingVerdict::No("far refuses " + type.ToString());
@@ -385,6 +389,7 @@ CrossingVerdict FarSource::AcceptsOperator(const LogicalOperator &op) {
 	if (!SubstraitCanRenderOperator(op, reason)) {
 		return CrossingVerdict::No(reason);
 	}
+	lock_guard<mutex> guard(store->lock);
 	for (auto refused : store->refused_operators) {
 		if (op.type == refused) {
 			return CrossingVerdict::No("far refuses " + string(LogicalOperatorToString(op.type)));
@@ -393,14 +398,14 @@ CrossingVerdict FarSource::AcceptsOperator(const LogicalOperator &op) {
 	return CrossingVerdict::Yes();
 }
 
-unique_ptr<CrossingSession> FarSource::Begin(ClientContext &) {
+unique_ptr<FarSession> FarSource::Begin(ClientContext &) {
 	lock_guard<mutex> guard(store->lock);
 	store->sessions_begun++;
 	return make_uniq<FarSession>(store);
 }
 
 void FarSource::Register(ExtensionLoader &loader, shared_ptr<FarStore> store) {
-	CrossingSource::Register(
+	Crossing<FarSource>::Register(
 	    loader, "fardb", [store](ClientContext &, AttachInfo &info) { return make_uniq<FarSource>(store, info.path); });
 }
 
@@ -431,6 +436,7 @@ FarCall FarSession::Record(const CrossingQuery &query) {
 	call.kind = query.kind;
 	call.plan_text = query.plan.ToString();
 	call.tables = query.tables;
+	call.written = query.written;
 	CollectOperators(query.plan, call.operators);
 	call.types = query.types;
 	call.ordered = query.ordered;
@@ -475,6 +481,7 @@ vector<vector<Value>> FarSession::Evaluate(const LogicalOperator &plan, FarCall 
 	if (auto rows = SeamRowsOf(plan)) {
 		return RowsOf(*rows);
 	}
+	lock_guard<mutex> guard(far_lock);
 	if (store->transport == Transport::NATIVE) {
 		return EvaluateNative(plan, call);
 	}
@@ -518,15 +525,16 @@ CrossingWriter FarSession::Write(ClientContext &, const CrossingQuery &query) {
 			lock_guard<mutex> guard(store->lock);
 			store->writes.push_back(std::move(call));
 		}
+		lock_guard<mutex> guard(far_lock);
 		return CrossingWriteResult::Done(Apply(query, rows));
 	};
 }
 
 idx_t FarSession::Apply(const CrossingQuery &query, const vector<vector<Value>> &rows) {
-	if (query.tables.size() != 1) {
-		throw InternalException("far: a write names %llu tables", query.tables.size());
+	if (query.written.table.empty()) {
+		throw InternalException("far: a write names no table");
 	}
-	auto &use = query.tables[0];
+	auto &use = query.written;
 	string target = Quoted(use.schema) + "." + Quoted(use.table);
 	string sql;
 	switch (query.kind) {
@@ -592,3 +600,14 @@ idx_t FarSession::Apply(const CrossingQuery &query, const vector<vector<Value>> 
 }
 
 } // namespace duckdb
+
+namespace other {
+
+void OtherSource::Register(duckdb::ExtensionLoader &loader, duckdb::shared_ptr<duckdb::FarStore> store) {
+	duckdb::Crossing<OtherSource>::Register(loader, "otherdb",
+	                                        [store](duckdb::ClientContext &, duckdb::AttachInfo &info) {
+		                                        return duckdb::make_uniq<OtherSource>(store, info.path);
+	                                        });
+}
+
+} // namespace other

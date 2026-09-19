@@ -1,0 +1,27 @@
+version = 1
+revision = 3
+requires-python = ">=3.9"
+
+[[package]]
+name = "clang-format"
+version = "11.0.1"
+source = { registry = "https://pypi.org/simple" }
+sdist = { url = "https://files.pythonhosted.org/packages/f8/a4/bb2e874b573eeb040ec904e8e42d6f5c9a1f12e2020af1b07348c77de510/clang-format-11.0.1.tar.gz", hash = "sha256:7e62439218c38126f9234bc0fdfa85cb2ef5798219190acc911962f0b0a0abfc", size = 7984, upload-time = "2021-09-27T19:51:34.787Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/96/0b/d7a1f4cbabab240a1efd3fd4b6ca394f957c8e140f2e7325063be42da48a/clang_format-11.0.1-py2.py3-none-macosx_10_9_universal2.whl", hash = "sha256:cc3165c67df81ec1daa99d7e922f5bdd02d9e65c12242b3367967b145e5df463", size = 889140, upload-time = "2021-09-27T19:51:18.586Z" },
+    { url = "https://files.pythonhosted.org/packages/bb/44/c4cee654285b087cfd0933526742d4f1400f8ef2ae30c4cc27125134ef01/clang_format-11.0.1-py2.py3-none-manylinux_2_12_i686.manylinux2010_i686.whl", hash = "sha256:a6f08bf948857205b3c6d8efe885658a46533797c4a822c03ba4004bc18e830f", size = 1116050, upload-time = "2021-09-27T19:51:24.247Z" },
+    { url = "https://files.pythonhosted.org/packages/1f/3e/8d4b80c18fe32c9225cdd19a6d8770713ab0f852f163abebbc26b2c132c8/clang_format-11.0.1-py2.py3-none-manylinux_2_12_x86_64.manylinux2010_x86_64.whl", hash = "sha256:47ea0da184a602b06bef2cfd4590137b08aa67f3e8eab7b33a6dc48e1a28fe40", size = 1007359, upload-time = "2021-09-27T19:51:25.206Z" },
+    { url = "https://files.pythonhosted.org/packages/49/28/cc3effc16f6d8b1321141e228b3b05525110830d8f97cc6966e356264d4c/clang_format-11.0.1-py2.py3-none-win32.whl", hash = "sha256:462bee159286fc75a972660ac2d17337717c1593639a1f12a9d9751624877c0f", size = 1996165, upload-time = "2021-09-27T19:51:26.078Z" },
+    { url = "https://files.pythonhosted.org/packages/e0/e1/db42d5ce564cbde759ce73ab27d9e1e53ab64f28a620a5eb0f1e31d7729a/clang_format-11.0.1-py2.py3-none-win_amd64.whl", hash = "sha256:7de5848f098ec6a9935222ade8b097a842a7375897de5cbe3c073c7627d47024", size = 1996168, upload-time = "2021-09-27T19:51:27.098Z" },
+]
+
+[[package]]
+name = "crossing-tools"
+version = "0"
+source = { virtual = "." }
+dependencies = [
+    { name = "clang-format" },
+]
+
+[package.metadata]
+requires-dist = [{ name = "clang-format", specifier = "==11.0.1" }]

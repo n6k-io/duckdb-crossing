@@ -152,4 +152,65 @@ private:
 	}
 };
 
+struct Pair {
+	shared_ptr<FarStore> far;
+	shared_ptr<FarStore> other;
+	DuckDB near;
+	Connection con;
+
+	Pair(Transport transport, bool other_first)
+	    : far(make_shared_ptr<FarStore>(transport)), other(make_shared_ptr<FarStore>(transport)), near(nullptr),
+	      con(near) {
+		ExtensionLoader far_loader(*near.instance, "fardb");
+		ExtensionLoader other_loader(*near.instance, "otherdb");
+		if (other_first) {
+			other::OtherSource::Register(other_loader, other);
+			FarSource::Register(far_loader, far);
+		} else {
+			FarSource::Register(far_loader, far);
+			other::OtherSource::Register(other_loader, other);
+		}
+	}
+
+	~Pair() {
+		far->JoinArrivals();
+		other->JoinArrivals();
+	}
+
+	void Seed() {
+		Store(*far, "CREATE TABLE t(id INTEGER PRIMARY KEY, v INTEGER)");
+		Store(*far, "INSERT INTO t VALUES (1, 10), (2, 20)");
+		Store(*other, "CREATE TABLE t(id INTEGER PRIMARY KEY, v INTEGER)");
+		Store(*other, "INSERT INTO t VALUES (1, 100), (2, 200), (3, 300)");
+		Query("ATTACH 'far.example.com' AS far (TYPE fardb)");
+		Query("ATTACH 'other.example.com' AS other (TYPE otherdb)");
+	}
+
+	unique_ptr<MaterializedQueryResult> Query(const string &sql) {
+		auto result = con.Query(sql);
+		far->JoinArrivals();
+		other->JoinArrivals();
+		if (result->HasError()) {
+			FAIL(sql + "\n" + result->GetError());
+		}
+		return result;
+	}
+
+	static Value Scalar(FarStore &store, const string &sql) {
+		auto result = store.con.Query(sql);
+		if (result->HasError()) {
+			FAIL(result->GetError());
+		}
+		return result->GetValue(0, 0);
+	}
+
+private:
+	static void Store(FarStore &store, const string &sql) {
+		auto result = store.con.Query(sql);
+		if (result->HasError()) {
+			FAIL(result->GetError());
+		}
+	}
+};
+
 } // namespace duckdb

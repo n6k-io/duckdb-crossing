@@ -117,13 +117,19 @@ inline string DSLBraces(LogicalOperator &op) {
 	return text.empty() ? "" : "{" + text + "}";
 }
 
-inline string DSLRender(LogicalOperator &op, bool in_fragment) {
-	if (auto fragment = CrossingReadFragmentOf(op)) {
-		string inside = fragment->plan ? DSLRender(*fragment->plan, true) : string();
-		return "crossing[" + inside + "]";
+inline optional_ptr<CrossingFragment> DSLFragmentOf(LogicalOperator &op) {
+	if (auto fragment = CrossingReadFragmentOf(op, MemoryIdentity())) {
+		return fragment;
 	}
-	if (auto write = CrossingWriteFragmentOf(op)) {
-		string inside = write->plan ? DSLRender(*write->plan, true) : string();
+	if (auto fragment = CrossingReadFragmentOf(op, OtherIdentity())) {
+		return fragment;
+	}
+	return CrossingWriteFragmentOf(op, MemoryIdentity());
+}
+
+inline string DSLRender(LogicalOperator &op, bool in_fragment) {
+	if (auto fragment = DSLFragmentOf(op)) {
+		string inside = fragment->plan ? DSLRender(*fragment->plan, true) : string();
 		return "crossing[" + inside + "]";
 	}
 

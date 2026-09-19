@@ -16,8 +16,6 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      # Same pin as extension-ci-tools' code-quality workflow, so this repo and
-      # duckdb-virtual-catalog agree on what "formatted" means.
-      - run: pip3 install 'clang_format==11.0.1'
+      - uses: astral-sh/setup-uv@v5
 
       - run: make format-check

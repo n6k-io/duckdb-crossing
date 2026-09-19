@@ -11,7 +11,7 @@ namespace duckdb {
 //!
 //! A scan may name columns the source does not have -- a virtual column, or one past the end of the
 //! table. Those are dropped rather than refused: they are the target's business.
-void AlignFragmentToScan(LogicalGet &get, CrossingFragment &fragment);
+void NarrowFragmentToScan(LogicalGet &get, CrossingFragment &fragment);
 
 void NarrowFragmentAndScanToRequestedColumns(LogicalGet &get, CrossingFragment &fragment);
 

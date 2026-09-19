@@ -1,5 +1,6 @@
 #pragma once
 
+#include "duckdb/common/unordered_map.hpp"
 #include "duckdb/planner/logical_operator.hpp"
 
 #include "crossing.hpp"
@@ -17,7 +18,7 @@ struct SubtreeLabel {
 
 using SubtreeLabels = unordered_map<LogicalOperator *, SubtreeLabel>;
 
-SubtreeLabels LabelSubtrees(LogicalOperator &plan);
+SubtreeLabels LabelSubtrees(LogicalOperator &plan, const CrossingIdentity &identity);
 
 SubtreeLabels LabelSubtreesUnder(LogicalOperator &feed, CrossingSource &source);
 

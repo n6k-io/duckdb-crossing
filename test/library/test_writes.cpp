@@ -32,8 +32,8 @@ TEST_CASE("an insert of literal rows hands the source exactly those rows", "[wri
 	REQUIRE(call.rows.size() == 2);
 	REQUIRE(call.set_columns == vector<string> {"id", "name", "amt", "tenant", "score", "ts"});
 	REQUIRE(call.key_columns.empty());
-	REQUIRE(call.tables.size() == 1);
-	REQUIRE(call.tables[0].table == "orders");
+	REQUIRE(call.tables.empty());
+	REQUIRE(call.written.table == "orders");
 	REQUIRE(twin.store->reads.empty());
 	REQUIRE(Scalar(twin, "SELECT count(*) FROM orders") == Value::BIGINT(7));
 	twin.Same("SELECT * FROM far.orders ORDER BY id");

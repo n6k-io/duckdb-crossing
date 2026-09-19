@@ -26,7 +26,7 @@ private:
 	explicit CrossingParking(const InterruptState &resume_p) : resume(resume_p) {
 	}
 
-	void Fire();
+	void Wake();
 
 	mutex lock;
 	bool parked = false;

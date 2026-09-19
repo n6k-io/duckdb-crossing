@@ -5,11 +5,18 @@
 #include "duckdb/planner/logical_operator.hpp"
 
 #include "crossing.hpp"
-#include "internal/source.hpp"
 
 namespace duckdb {
 
-void CrossingMoveWorkPass(OptimizerExtensionInput &input, unique_ptr<LogicalOperator> &plan);
+struct CrossingPassInfo : public OptimizerExtensionInfo {
+	explicit CrossingPassInfo(const CrossingIdentity &identity_p) : identity(identity_p) {
+	}
+
+	const CrossingIdentity &identity;
+};
+
+void CrossingFoldPass(OptimizerExtensionInput &input, unique_ptr<LogicalOperator> &plan);
+
 void CrossingNarrowPass(OptimizerExtensionInput &input, unique_ptr<LogicalOperator> &plan);
 
 } // namespace duckdb

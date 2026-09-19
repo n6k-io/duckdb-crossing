@@ -15,15 +15,18 @@ namespace {
 
 bool CanCross(LogicalOperator &op) {
 	MemorySource source;
-	auto rule = CrossingRules::Get().RuleFor(op.type);
-	return rule && rule->CanCross(op, source);
+	return NodeCanCross(op, source);
+}
+
+bool HasRule(LogicalOperatorType type) {
+	return RuleKindFor(type) != RuleKind::NONE;
 }
 
 } // namespace
 
 TEST_CASE("an operator with no rule does not cross", "[rules]") {
-	REQUIRE(!CrossingRules::Get().RuleFor(LogicalOperatorType::LOGICAL_DUMMY_SCAN));
-	REQUIRE(!CrossingRules::Get().RuleFor(LogicalOperatorType::LOGICAL_GET));
+	REQUIRE(!HasRule(LogicalOperatorType::LOGICAL_DUMMY_SCAN));
+	REQUIRE(!HasRule(LogicalOperatorType::LOGICAL_GET));
 }
 
 TEST_CASE("a filter crosses when the source can compute its predicates", "[rules]") {
@@ -62,10 +65,10 @@ TEST_CASE("a join crosses, and the labelling decides whether its branches agree"
 }
 
 TEST_CASE("an aggregate crosses now that the scan above it is rebuilt", "[rules]") {
-	REQUIRE(CrossingRules::Get().RuleFor(LogicalOperatorType::LOGICAL_AGGREGATE_AND_GROUP_BY));
-	REQUIRE(CrossingRules::Get().RuleFor(LogicalOperatorType::LOGICAL_WINDOW));
-	REQUIRE(CrossingRules::Get().RuleFor(LogicalOperatorType::LOGICAL_UNNEST));
-	REQUIRE(CrossingRules::Get().RuleFor(LogicalOperatorType::LOGICAL_PIVOT));
+	REQUIRE(HasRule(LogicalOperatorType::LOGICAL_AGGREGATE_AND_GROUP_BY));
+	REQUIRE(HasRule(LogicalOperatorType::LOGICAL_WINDOW));
+	REQUIRE(HasRule(LogicalOperatorType::LOGICAL_UNNEST));
+	REQUIRE(HasRule(LogicalOperatorType::LOGICAL_PIVOT));
 }
 
 TEST_CASE("an order by crosses when the source can compute its keys", "[rules]") {
@@ -85,7 +88,6 @@ TEST_CASE("an order by whose keys the source cannot compute does not cross", "[r
 }
 
 TEST_CASE("what belongs to the target never crosses", "[rules]") {
-	MemorySource source;
 	auto never = {LogicalOperatorType::LOGICAL_INSERT,       LogicalOperatorType::LOGICAL_UPDATE,
 	              LogicalOperatorType::LOGICAL_DELETE,       LogicalOperatorType::LOGICAL_COPY_TO_FILE,
 	              LogicalOperatorType::LOGICAL_CREATE_TABLE, LogicalOperatorType::LOGICAL_ATTACH,
@@ -93,10 +95,7 @@ TEST_CASE("what belongs to the target never crosses", "[rules]") {
 	              LogicalOperatorType::LOGICAL_EXPLAIN,      LogicalOperatorType::LOGICAL_EXTENSION_OPERATOR};
 
 	for (auto type : never) {
-		auto rule = CrossingRules::Get().RuleFor(type);
-		REQUIRE(rule);
-		LogicalProjection op(40, vector<unique_ptr<Expression>>());
-		REQUIRE(!rule->CanCross(op, source));
+		REQUIRE(RuleKindFor(type) == RuleKind::NEVER);
 	}
 }
 
@@ -104,5 +103,5 @@ TEST_CASE("rows the target holds are the leaves a write may cross to", "[rules]"
 	REQUIRE(IsMaterialisedRows(LogicalOperatorType::LOGICAL_CHUNK_GET));
 	REQUIRE(IsMaterialisedRows(LogicalOperatorType::LOGICAL_EXPRESSION_GET));
 	REQUIRE(!IsMaterialisedRows(LogicalOperatorType::LOGICAL_DUMMY_SCAN));
-	REQUIRE(!CrossingRules::Get().RuleFor(LogicalOperatorType::LOGICAL_CHUNK_GET));
+	REQUIRE(!HasRule(LogicalOperatorType::LOGICAL_CHUNK_GET));
 }

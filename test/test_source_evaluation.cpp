@@ -114,6 +114,26 @@ TEST_CASE("a volatile function stays even when the source knows it", "[evaluatio
 	REQUIRE(!CanEvaluate(*Call("random", FunctionStability::VOLATILE), source));
 }
 
+namespace {
+
+class RefusesEveryType : public MemorySource {
+public:
+	CrossingVerdict AcceptsType(const LogicalType &type) override {
+		return CrossingVerdict::No("nothing holds a " + type.ToString());
+	}
+};
+
+} // namespace
+
+TEST_CASE("a declared column is never asked about its type", "[evaluation]") {
+	RefusesEveryType source;
+
+	REQUIRE(CanEvaluate(*BoundAmt(), source));
+	REQUIRE(!CanEvaluate(*Int(1), source));
+	REQUIRE(!CanEvaluate(*make_uniq<BoundComparisonExpression>(ExpressionType::COMPARE_EQUAL, BoundAmt(), BoundAmt()),
+	                     source));
+}
+
 TEST_CASE("an expression stays if any part of it stays", "[evaluation]") {
 	MemorySource source;
 	auto comparison = make_uniq<BoundComparisonExpression>(ExpressionType::COMPARE_EQUAL, Call("target_only"), Int(1));
