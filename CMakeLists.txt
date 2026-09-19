@@ -126,3 +126,5 @@ crossing_contract_fail(fail_session_commit_returns
                        "ReturnCheck<false, void, int>")
 crossing_contract_fail(fail_session_write_signature
                        "`Write` exists but is not callable")
+crossing_contract_fail(fail_session_ddl_signature
+                       "`Ddl` exists but is not callable")

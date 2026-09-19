@@ -49,14 +49,19 @@ class ClientContext;
 class ColumnDataCollection;
 class DatabaseInstance;
 struct AttachInfo;
+struct CreateInfo;
+struct AlterInfo;
+struct DropInfo;
 
 //! DELETE_ trails an underscore: DELETE is a macro in some Windows SDK headers.
-enum class CrossingVerb : uint8_t { SELECT = 0, INSERT = 1, UPDATE = 2, DELETE_ = 3 };
+enum class CrossingVerb : uint8_t { SELECT = 0, INSERT = 1, UPDATE = 2, DELETE_ = 3, CREATE = 4, ALTER = 5, DROP = 6 };
 
 //! Lowercase wire spelling, as reported by the permissions function.
 const char *CrossingVerbName(CrossingVerb verb);
 
 const vector<CrossingVerb> &CrossingVerbs();
+
+bool IsDdlVerb(CrossingVerb verb);
 
 struct CrossingVerdict {
 	bool ok = true;
@@ -100,6 +105,29 @@ struct CrossingTable {
 		}
 		return false;
 	}
+};
+
+struct CrossingSchema {
+	string name;
+	vector<CrossingVerb> verbs;
+
+	bool Allows(CrossingVerb verb) const {
+		for (auto allowed : verbs) {
+			if (allowed == verb) {
+				return true;
+			}
+		}
+		return false;
+	}
+};
+
+struct CrossingDdl {
+	CrossingVerb verb;
+	string schema;
+	string table;
+	optional_ptr<const CreateInfo> create;
+	optional_ptr<const AlterInfo> alter;
+	optional_ptr<const DropInfo> drop;
 };
 
 struct CrossingTableUse {
@@ -276,6 +304,7 @@ public:
 
 	virtual CrossingScan Read(ClientContext &context, const CrossingQuery &query) = 0;
 	virtual CrossingWriter Write(ClientContext &context, const CrossingQuery &query);
+	virtual void Ddl(ClientContext &context, const CrossingDdl &ddl);
 	virtual void Commit() {
 	}
 	virtual void Rollback() {
@@ -293,6 +322,11 @@ public:
 	}
 	virtual vector<string> Tables(const string &schema) = 0;
 	virtual CrossingTable Describe(const string &schema, const string &name) = 0;
+	virtual CrossingSchema DescribeSchema(const string &schema) {
+		CrossingSchema result;
+		result.name = schema;
+		return result;
+	}
 	virtual CrossingPlan Plan(const CrossingPlanRequest &request) = 0;
 
 	virtual CrossingVerdict AcceptsCall(const Expression &expr) {
@@ -399,6 +433,7 @@ CROSSING_MEMBER(Schemas, "vector<string> Schemas()", vector<string>);
 CROSSING_MEMBER(Tables, "vector<string> Tables(const string &schema)", vector<string>, const string &);
 CROSSING_MEMBER(Describe, "CrossingTable Describe(const string &schema, const string &name)", CrossingTable,
                 const string &, const string &);
+CROSSING_MEMBER(DescribeSchema, "CrossingSchema DescribeSchema(const string &schema)", CrossingSchema, const string &);
 CROSSING_MEMBER(Plan, "CrossingPlan Plan(const CrossingPlanRequest &request)", CrossingPlan,
                 const CrossingPlanRequest &);
 CROSSING_MEMBER(AcceptsCall, "CrossingVerdict AcceptsCall(const Expression &expr)", CrossingVerdict,
@@ -413,6 +448,8 @@ CROSSING_MEMBER(Read, "CrossingScan Read(ClientContext &context, const CrossingQ
                 ClientContext &, const CrossingQuery &);
 CROSSING_MEMBER(Write, "CrossingWriter Write(ClientContext &context, const CrossingQuery &query)", CrossingWriter,
                 ClientContext &, const CrossingQuery &);
+CROSSING_MEMBER(Ddl, "void Ddl(ClientContext &context, const CrossingDdl &ddl)", void, ClientContext &,
+                const CrossingDdl &);
 CROSSING_MEMBER(Commit, "void Commit()", void);
 CROSSING_MEMBER(Rollback, "void Rollback()", void);
 
@@ -424,6 +461,7 @@ struct SourceContract : CheckTables<S, true>,
                         CheckPlan<S, true>,
                         CheckBegin<S, true>,
                         CheckSchemas<S, false>,
+                        CheckDescribeSchema<S, false>,
                         CheckAcceptsCall<S, false>,
                         CheckAcceptsType<S, false>,
                         CheckAcceptsOperator<S, false>,
@@ -435,6 +473,7 @@ struct SourceContract : CheckTables<S, true>,
 template <class Sess>
 struct SessionContract : CheckRead<Sess, true>,
                          CheckWrite<Sess, false>,
+                         CheckDdl<Sess, false>,
                          CheckCommit<Sess, false>,
                          CheckRollback<Sess, false> {
 	static_assert(!std::is_final<Sess>::value, "crossing: a session type must not be final");
@@ -447,6 +486,14 @@ CrossingWriter WriteOn(Sess &session, ClientContext &context, const CrossingQuer
 template <class Sess>
 CrossingWriter WriteOn(Sess &, ClientContext &, const CrossingQuery &, std::false_type) {
 	throw NotImplementedException("crossing: this source's session has no Write");
+}
+template <class Sess>
+void DdlOn(Sess &session, ClientContext &context, const CrossingDdl &ddl, std::true_type) {
+	session.Ddl(context, ddl);
+}
+template <class Sess>
+void DdlOn(Sess &, ClientContext &, const CrossingDdl &, std::false_type) {
+	throw NotImplementedException("crossing: this source's session has no Ddl");
 }
 template <class Sess>
 void CommitOn(Sess &session, std::true_type) {
@@ -469,6 +516,16 @@ vector<string> SchemasOn(S &source, std::true_type) {
 template <class S>
 vector<string> SchemasOn(S &, std::false_type) {
 	return {"main"};
+}
+template <class S>
+CrossingSchema DescribeSchemaOn(S &source, const string &schema, std::true_type) {
+	return source.DescribeSchema(schema);
+}
+template <class S>
+CrossingSchema DescribeSchemaOn(S &, const string &schema, std::false_type) {
+	CrossingSchema result;
+	result.name = schema;
+	return result;
 }
 template <class S>
 CrossingVerdict AcceptsCallOn(S &source, const Expression &expr, std::true_type) {
@@ -519,6 +576,9 @@ public:
 	CrossingWriter Write(ClientContext &context, const CrossingQuery &query) override {
 		return crossing_contract::WriteOn(*session, context, query, crossing_contract::HasWrite<Sess> {});
 	}
+	void Ddl(ClientContext &context, const CrossingDdl &ddl) override {
+		crossing_contract::DdlOn(*session, context, ddl, crossing_contract::HasDdl<Sess> {});
+	}
 	void Commit() override {
 		crossing_contract::CommitOn(*session, crossing_contract::HasCommit<Sess> {});
 	}
@@ -550,15 +610,29 @@ public:
 	}
 	CrossingTable Describe(const string &schema, const string &name) override {
 		auto table = source->Describe(schema, name);
-		if (!crossing_contract::HasWrite<Session>::value) {
-			for (auto verb : table.verbs) {
-				if (verb != CrossingVerb::SELECT) {
-					throw NotImplementedException("crossing: '%s' declares '%s' but the session has no Write", name,
+		for (auto verb : table.verbs) {
+			if (IsDdlVerb(verb)) {
+				if (!crossing_contract::HasDdl<Session>::value) {
+					throw NotImplementedException("crossing: '%s' declares '%s' but the session has no Ddl", name,
 					                              CrossingVerbName(verb));
 				}
+			} else if (verb != CrossingVerb::SELECT && !crossing_contract::HasWrite<Session>::value) {
+				throw NotImplementedException("crossing: '%s' declares '%s' but the session has no Write", name,
+				                              CrossingVerbName(verb));
 			}
 		}
 		return table;
+	}
+	CrossingSchema DescribeSchema(const string &schema) override {
+		auto described =
+		    crossing_contract::DescribeSchemaOn(*source, schema, crossing_contract::HasDescribeSchema<S> {});
+		if (!crossing_contract::HasDdl<Session>::value) {
+			for (auto verb : described.verbs) {
+				throw NotImplementedException("crossing: schema '%s' declares '%s' but the session has no Ddl", schema,
+				                              CrossingVerbName(verb));
+			}
+		}
+		return described;
 	}
 	CrossingPlan Plan(const CrossingPlanRequest &request) override {
 		return source->Plan(request);

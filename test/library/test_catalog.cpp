@@ -107,27 +107,31 @@ TEST_CASE("schema and table names resolve regardless of case", "[catalog]") {
 	twin.Same("SELECT ID, Amt FROM far.orders ORDER BY id");
 }
 
-TEST_CASE("nothing can be created in a served schema", "[catalog]") {
+TEST_CASE("nothing can be created in a served schema that does not declare create", "[catalog]") {
 	Twin twin(Transport::NATIVE);
+	twin.store->schema_verbs["main"] = {};
 	twin.Seed();
 
 	REQUIRE_THAT(twin.Error("CREATE TABLE far.main.scratch (x INTEGER)"),
-	             Catch::Contains("served by a source; CREATE is not supported"));
+	             Catch::Contains("schema 'main' does not have 'create' permission"));
 	REQUIRE_THAT(twin.Error("CREATE SCHEMA far.other"), Catch::Contains("schemas are served by the source"));
 	REQUIRE_THAT(twin.Error("CREATE VIEW far.main.v AS SELECT 1"), Catch::Contains("served by a source"));
 	REQUIRE(twin.Query("SELECT count(*) FROM duckdb_tables() WHERE database_name = 'far'")->GetValue(0, 0) ==
 	        Value::BIGINT(5));
+	REQUIRE(twin.store->ddls.empty());
 }
 
-TEST_CASE("served tables cannot be dropped or altered", "[catalog]") {
+TEST_CASE("served tables that do not declare drop or alter cannot be dropped or altered", "[catalog]") {
 	Twin twin(Transport::NATIVE);
+	twin.store->verbs["orders"] = {CrossingVerb::SELECT};
 	twin.Seed();
 
-	REQUIRE_THAT(twin.Error("DROP TABLE far.orders"), Catch::Contains("'orders' is served by a source; DROP"));
+	REQUIRE_THAT(twin.Error("DROP TABLE far.orders"), Catch::Contains("'orders' does not have 'drop' permission"));
 	REQUIRE_THAT(twin.Error("ALTER TABLE far.orders RENAME TO o"),
-	             Catch::Contains("'orders' is served by a source; ALTER"));
+	             Catch::Contains("'orders' does not have 'alter' permission"));
 	REQUIRE_THAT(twin.Error("DROP SCHEMA far.main"), Catch::Contains("DETACH the catalog"));
 	twin.Same("SELECT count(*) FROM far.orders");
+	REQUIRE(twin.store->ddls.empty());
 }
 
 TEST_CASE("a detached source is told, and is gone", "[catalog]") {

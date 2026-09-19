@@ -9,6 +9,8 @@ struct FullSession {
 	CrossingWriter Write(ClientContext &, const CrossingQuery &) {
 		return {};
 	}
+	void Ddl(ClientContext &, const CrossingDdl &) {
+	}
 	void Commit() {
 	}
 	void Rollback() {
@@ -25,6 +27,9 @@ struct FullSource {
 		return none;
 	}
 	CrossingTable Describe(const string &, const string &) {
+		return {};
+	}
+	CrossingSchema DescribeSchema(const string &) {
 		return {};
 	}
 	CrossingPlan Plan(const CrossingPlanRequest &) {

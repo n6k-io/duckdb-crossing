@@ -11,8 +11,11 @@
 #include "duckdb/execution/physical_plan_generator.hpp"
 #include "duckdb/planner/expression/bound_columnref_expression.hpp"
 #include "duckdb/planner/expression/bound_reference_expression.hpp"
+#include "duckdb/parser/parsed_data/create_table_info.hpp"
 #include "duckdb/planner/operator/logical_column_data_get.hpp"
+#include "duckdb/planner/operator/logical_create_table.hpp"
 #include "duckdb/planner/operator/logical_projection.hpp"
+#include "duckdb/planner/parsed_data/bound_create_table_info.hpp"
 #include "duckdb/storage/database_size.hpp"
 #include "duckdb/transaction/transaction.hpp"
 
@@ -755,6 +758,102 @@ InsertionOrderPreservingMap<string> CrossingWrite::ParamsToString() const {
 	if (!obstacle.empty()) {
 		result["Not whole because"] = obstacle;
 	}
+	return result;
+}
+
+CrossingCreateTableAs::CrossingCreateTableAs(PhysicalPlan &physical_plan, CrossingAttach &attach_p,
+                                             SchemaCatalogEntry &owner_p, unique_ptr<BoundCreateTableInfo> info_p,
+                                             vector<LogicalType> row_types_p, idx_t estimated_cardinality)
+    : PhysicalOperator(physical_plan, PhysicalOperatorType::EXTENSION, {LogicalType::BIGINT}, estimated_cardinality),
+      attach(attach_p), owner(owner_p), info(std::move(info_p)), row_types(std::move(row_types_p)) {
+}
+
+unique_ptr<GlobalSinkState> CrossingCreateTableAs::GetGlobalSinkState(ClientContext &) const {
+	auto state = make_uniq<CrossingCreateTableAsState>();
+	state->rows = make_uniq<ColumnDataCollection>(Allocator::DefaultAllocator(), row_types);
+	return std::move(state);
+}
+
+SinkResultType CrossingCreateTableAs::Sink(ExecutionContext &, DataChunk &chunk, OperatorSinkInput &input) const {
+	input.global_state.Cast<CrossingCreateTableAsState>().rows->Append(chunk);
+	return SinkResultType::NEED_MORE_INPUT;
+}
+
+SinkFinalizeType CrossingCreateTableAs::Finalize(Pipeline &, Event &, ClientContext &context,
+                                                 OperatorSinkFinalizeInput &input) const {
+	auto &state = input.global_state.Cast<CrossingCreateTableAsState>();
+	if (!state.created) {
+		auto &create = info->Base();
+		CrossingDdl ddl;
+		ddl.verb = CrossingVerb::CREATE;
+		ddl.schema = owner.name;
+		ddl.table = create.table;
+		ddl.create = info->base.get();
+		attach.Ddl(context, Transaction::Get(context, owner.ParentCatalog()), owner, ddl);
+		state.created = true;
+
+		auto entry = attach.LookupTable(owner.name, owner, create.table);
+		if (!entry) {
+			throw InternalException("crossing: '%s' was created but the source does not serve it", create.table);
+		}
+		auto &table = entry->Cast<CrossingTableCatalogEntry>();
+		RequireVerb(table, CrossingVerb::INSERT);
+		auto seam = SeamOf(table, table.described, CrossingVerb::INSERT, {});
+		if (seam.types != row_types) {
+			throw BinderException("crossing: the source describes '%s' with columns other than the ones it was "
+			                      "created with",
+			                      create.table);
+		}
+		auto fragment = PlanWriteFragment(table, CrossingVerb::INSERT, seam);
+		state.bind_data = MakeWriteBindData(table, CrossingVerb::INSERT, std::move(seam), std::move(fragment));
+		state.write = make_uniq<CrossingSeamFilledWrite>(*state.bind_data, std::move(state.rows));
+	}
+	while (true) {
+		auto parking = CrossingParking::Of(input.interrupt_state);
+		auto result = state.write->Pull(context, parking->Waker());
+		if (result.outcome == CrossingWriteResult::Outcome::DONE) {
+			state.affected_rows = result.affected_rows;
+			break;
+		}
+		if (parking->Park()) {
+			return SinkFinalizeType::BLOCKED;
+		}
+	}
+	state.write.reset();
+	return SinkFinalizeType::READY;
+}
+
+unique_ptr<GlobalSourceState> CrossingCreateTableAs::GetGlobalSourceState(ClientContext &) const {
+	return make_uniq<CrossingWriteSourceState>();
+}
+
+SourceResultType CrossingCreateTableAs::GetDataInternal(ExecutionContext &, DataChunk &chunk,
+                                                        OperatorSourceInput &input) const {
+	auto &source_state = input.global_state.Cast<CrossingWriteSourceState>();
+	if (source_state.done) {
+		return SourceResultType::FINISHED;
+	}
+	source_state.done = true;
+	chunk.SetCardinality(1);
+	chunk.SetValue(0, 0,
+	               Value::BIGINT(NumericCast<int64_t>(sink_state->Cast<CrossingCreateTableAsState>().affected_rows)));
+	return SourceResultType::HAVE_MORE_OUTPUT;
+}
+
+string CrossingCreateTableAs::GetName() const {
+	return "CROSSING_CREATE_TABLE_AS";
+}
+
+PhysicalOperator &CrossingAttach::PlanCreateTableAs(ClientContext &, PhysicalPlanGenerator &planner,
+                                                    LogicalCreateTable &op, PhysicalOperator &plan) {
+	auto &schema = op.schema;
+	if (!DescribedSchema(schema.name).Allows(CrossingVerb::CREATE)) {
+		throw PermissionException("crossing: schema '%s' does not have '%s' permission", schema.name,
+		                          CrossingVerbName(CrossingVerb::CREATE));
+	}
+	auto &result =
+	    planner.Make<CrossingCreateTableAs>(*this, schema, std::move(op.info), plan.types, op.estimated_cardinality);
+	result.children.push_back(plan);
 	return result;
 }
 

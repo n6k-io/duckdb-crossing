@@ -17,6 +17,7 @@ struct ToyDB {
 	vector<string> Schemas();
 	vector<string> Tables(const string &schema);
 	CrossingTable Describe(const string &schema, const string &name);
+	CrossingSchema DescribeSchema(const string &schema);
 	CrossingPlan Plan(const CrossingPlanRequest &request);
 
 	CrossingVerdict AcceptsCall(const Expression &expr);
@@ -30,6 +31,7 @@ struct ToyDB {
 struct ToySession {
 	CrossingScan Read(ClientContext &context, const CrossingQuery &query);
 	CrossingWriter Write(ClientContext &context, const CrossingQuery &query);
+	void Ddl(ClientContext &context, const CrossingDdl &ddl);
 	void Commit();
 	void Rollback();
 };
@@ -42,11 +44,13 @@ default when absent:
 | member | absent |
 |---|---|
 | `Schemas` | one schema, `main` |
+| `DescribeSchema` | no schema allows `CREATE` |
 | `AcceptsCall` | no function, operator, aggregate or window crosses |
 | `AcceptsType` | no expression crosses |
 | `AcceptsOperator` | every operator accepted |
 | `Detach` | nothing |
 | `Session::Write` | no table may declare a write verb; one that does is refused at first use |
+| `Session::Ddl` | no table may declare `ALTER` or `DROP`, no schema `CREATE`; one that does is refused at first use |
 | `Session::Commit`, `Session::Rollback` | nothing |
 
 Members must be public. Neither type may be `final`. A member with the right name
@@ -77,8 +81,39 @@ CrossingTable ToyDB::Describe(const string &schema, const string &name) {
   or `DELETE_`. `key_unique = true` vouches uniqueness; only then may a keyed
   write run wholly on the source.
 - `verbs` — a verb absent here is refused before the statement runs. The only
-  source of what a table allows. `DELETE_` has a trailing underscore.
+  source of what a table allows. `DELETE_` has a trailing underscore. `ALTER`
+  and `DROP` go through `Session::Ddl`.
 - `constraints` — constraints the source enforces.
+
+`DescribeSchema(schema)` returns a `CrossingSchema` the same way; `CREATE`
+lives there, since the table does not exist yet. Asked once per schema and
+kept until the schema is refreshed.
+
+## Ddl
+
+```cpp
+void ToySession::Ddl(ClientContext &, const CrossingDdl &ddl) {
+	switch (ddl.verb) {
+	case CrossingVerb::CREATE:  ToyCreate(conn, *ddl.create); break;
+	case CrossingVerb::ALTER:   ToyAlter(conn, *ddl.alter); break;
+	default:                    ToyDrop(conn, *ddl.drop); break;
+	}
+}
+```
+
+`CREATE TABLE`, `ALTER TABLE` and `DROP TABLE` on a served schema or table
+arrive as DuckDB's parsed `CreateInfo`, `AlterInfo` or `DropInfo`, in the
+session of the statement's transaction. The verb is checked against
+`DescribeSchema` or `Describe` first; the source is never asked about a verb it
+did not declare. After the call the schema is forgotten and listed again, and
+again once the transaction commits or rolls back, so what the source now serves
+is what the catalog shows. Views, indexes, sequences and schemas themselves are
+never created through crossing.
+
+`CREATE TABLE ... AS` is a `CREATE` followed by an `INSERT` of the gathered
+rows into the new table, so it needs `CREATE` on the schema and `INSERT` on
+the table the source then describes. The rows are always gathered on the
+target.
 
 ## Plan
 
@@ -207,6 +242,7 @@ each other and themselves.
 | reader | one thread at a time; thread may change after `WAIT`; partitions run concurrently |
 | `Session::Write` | once per write operator; may repeat per session (`MERGE`) |
 | writer | one thread at a time until `DONE`; thread may change after `WAIT` |
+| `Session::Ddl` | once per DDL statement, on the binding thread; may repeat per session |
 | `Commit`, `Rollback` | once, after every reader and writer returned |
 | `Waker::Wake` | any thread, any time |
 
@@ -224,7 +260,8 @@ void ToyExtension::Load(ExtensionLoader &loader) {
 passed through; the path is never opened as a file. The factory runs once per
 `ATTACH`. Registering installs the storage extension, transaction manager and,
 once per instance, the optimizer pass. The catalog holds the source's tables
-only; DDL in it is refused.
+only; `CREATE TABLE`, `ALTER TABLE` and `DROP TABLE` go to the source when the
+verb is declared, and everything else is refused.
 
 ### Identity
 
@@ -251,10 +288,15 @@ class MyCatalog : public DuckCatalog, public CrossingAttachOwner {
 
 - `LookupTable(schema, owner, name)`, `ScanTables`, `Described` — entries and
   descriptions, cached; `Refresh()` / `Refresh(schema)` forget them.
-- `ServesTable`, `ThrowIfServed`, `ThrowIfSchemaServed` — for `DROP`/`ALTER`.
-- `Session(context, transaction)`; `Release(transaction)` then static
+- `Ddl(context, transaction, owner, ddl)` — checks the verb, runs it in the
+  transaction's session, forgets the schema. `DescribedSchema(schema)` is what
+  the schema declares. `PlanCreateTableAs(...)` is what a catalog's own
+  `PlanCreateTableAs` forwards to.
+- `ServesTable`, `ThrowIfServed`, `ThrowIfSchemaServed` — for a catalog that
+  refuses `DROP`/`ALTER` instead.
+- `Session(context, transaction)`; `Release(transaction)` then
   `Commit`/`Rollback` on the result, before a base manager frees the
-  `Transaction`; or instance `Commit(transaction)`/`Rollback(transaction)`.
+  `Transaction`; or `Commit(transaction)`/`Rollback(transaction)`.
 - `OnDetach` calls `attach.Detach(context)`.
 - `attach.Source<ToyDB>()` returns the native source.
 - Call `Crossing<ToyDB>::RegisterPass(db)` once, or nothing crosses.

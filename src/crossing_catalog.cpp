@@ -3,8 +3,11 @@
 #include "duckdb/catalog/entry_lookup_info.hpp"
 #include "duckdb/parser/parsed_data/alter_info.hpp"
 #include "duckdb/parser/parsed_data/create_schema_info.hpp"
+#include "duckdb/parser/parsed_data/create_table_info.hpp"
 #include "duckdb/parser/parsed_data/drop_info.hpp"
+#include "duckdb/planner/parsed_data/bound_create_table_info.hpp"
 #include "duckdb/storage/database_size.hpp"
+#include "duckdb/transaction/transaction.hpp"
 
 namespace duckdb {
 
@@ -92,9 +95,9 @@ void CrossingCatalog::ScanSchemas(ClientContext &, std::function<void(SchemaCata
 	}
 }
 
-PhysicalOperator &CrossingCatalog::PlanCreateTableAs(ClientContext &, PhysicalPlanGenerator &, LogicalCreateTable &,
-                                                     PhysicalOperator &) {
-	throw SchemasAreServed();
+PhysicalOperator &CrossingCatalog::PlanCreateTableAs(ClientContext &context, PhysicalPlanGenerator &planner,
+                                                     LogicalCreateTable &op, PhysicalOperator &plan) {
+	return attach.PlanCreateTableAs(context, planner, op, plan);
 }
 
 PhysicalOperator &CrossingCatalog::PlanInsert(ClientContext &, PhysicalPlanGenerator &, LogicalInsert &,
@@ -147,7 +150,16 @@ optional_ptr<CatalogEntry> CrossingSchemaEntry::LookupEntry(CatalogTransaction, 
 	return attach.LookupTable(name, *this, lookup_info.GetEntryName());
 }
 
-void CrossingSchemaEntry::DropEntry(ClientContext &, DropInfo &info) {
+void CrossingSchemaEntry::DropEntry(ClientContext &context, DropInfo &info) {
+	if (info.type == CatalogType::TABLE_ENTRY && attach.ServesTable(name, info.name)) {
+		CrossingDdl ddl;
+		ddl.verb = CrossingVerb::DROP;
+		ddl.schema = name;
+		ddl.table = info.name;
+		ddl.drop = &info;
+		attach.Ddl(context, Transaction::Get(context, catalog), *this, ddl);
+		return;
+	}
 	attach.ThrowIfServed(name, info.name, "DROP");
 	if (info.if_not_found == OnEntryNotFound::RETURN_NULL) {
 		return;
@@ -155,7 +167,16 @@ void CrossingSchemaEntry::DropEntry(ClientContext &, DropInfo &info) {
 	throw CatalogException::MissingEntry(info.type, info.name, string());
 }
 
-void CrossingSchemaEntry::Alter(CatalogTransaction, AlterInfo &info) {
+void CrossingSchemaEntry::Alter(CatalogTransaction transaction, AlterInfo &info) {
+	if (info.GetCatalogType() == CatalogType::TABLE_ENTRY && attach.ServesTable(name, info.name)) {
+		CrossingDdl ddl;
+		ddl.verb = CrossingVerb::ALTER;
+		ddl.schema = name;
+		ddl.table = info.name;
+		ddl.alter = &info;
+		attach.Ddl(transaction.GetContext(), *transaction.transaction, *this, ddl);
+		return;
+	}
 	attach.ThrowIfServed(name, info.name, "ALTER");
 	if (info.if_not_found == OnEntryNotFound::RETURN_NULL) {
 		return;
@@ -172,8 +193,15 @@ optional_ptr<CatalogEntry> CrossingSchemaEntry::CreateFunction(CatalogTransactio
 	throw CreateNotSupported(name);
 }
 
-optional_ptr<CatalogEntry> CrossingSchemaEntry::CreateTable(CatalogTransaction, BoundCreateTableInfo &) {
-	throw CreateNotSupported(name);
+optional_ptr<CatalogEntry> CrossingSchemaEntry::CreateTable(CatalogTransaction transaction,
+                                                            BoundCreateTableInfo &info) {
+	CrossingDdl ddl;
+	ddl.verb = CrossingVerb::CREATE;
+	ddl.schema = name;
+	ddl.table = info.Base().table;
+	ddl.create = info.base.get();
+	attach.Ddl(transaction.GetContext(), *transaction.transaction, *this, ddl);
+	return attach.LookupTable(name, *this, ddl.table);
 }
 
 optional_ptr<CatalogEntry> CrossingSchemaEntry::CreateView(CatalogTransaction, CreateViewInfo &) {

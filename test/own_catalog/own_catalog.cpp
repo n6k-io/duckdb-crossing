@@ -214,14 +214,14 @@ Transaction &OwnTransactionManager::StartTransaction(ClientContext &context) {
 }
 
 ErrorData OwnTransactionManager::CommitTransaction(ClientContext &, Transaction &transaction) {
-	auto error = CrossingAttach::Commit(attach.Release(transaction));
+	auto error = attach.Commit(attach.Release(transaction));
 	lock_guard<mutex> guard(lock);
 	live.erase(&transaction);
 	return error;
 }
 
 void OwnTransactionManager::RollbackTransaction(Transaction &transaction) {
-	CrossingAttach::Rollback(attach.Release(transaction));
+	attach.Rollback(attach.Release(transaction));
 	lock_guard<mutex> guard(lock);
 	live.erase(&transaction);
 }
