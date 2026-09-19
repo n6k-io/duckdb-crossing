@@ -328,7 +328,7 @@ using void_t = typename Void<Ts...>::type;
 template <class...>
 struct Args {};
 
-struct NotCallable;
+struct NotCallable {};
 struct Nothing {};
 
 template <class S, class = void>
