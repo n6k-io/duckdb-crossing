@@ -105,7 +105,8 @@ void ReplaceFloors(Binder &binder, unique_ptr<LogicalOperator> &op) {
 	}
 	auto &get = bound.plan->Cast<LogicalGet>();
 	if (get.names != floor_get.names || get.returned_types != floor_get.returned_types) {
-		throw InternalException("far: the floor of '%s.%s' does not match the table", floor->schema, floor->table);
+		throw CatalogException("far: '%s.%s' changed on the source: the floor does not match the table",
+		                       floor->schema, floor->table);
 	}
 	get.table_index = floor_get.table_index;
 	vector<ColumnIndex> ids = floor_get.GetColumnIds();
@@ -373,7 +374,7 @@ CrossingPlan FarSource::Plan(const CrossingPlanRequest &request) {
 		}
 	}
 	if (request.verb == CrossingVerb::SELECT) {
-		auto described = Describe(request.schema, request.table);
+		auto &described = *request.described;
 		return CrossingPlan::Of(
 		    MakeFloorNode(0, request.schema, request.table, described.column_names, described.column_types));
 	}

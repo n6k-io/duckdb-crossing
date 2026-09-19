@@ -63,6 +63,8 @@ public:
 
 	void Scan(ClientContext &context, CatalogType type, const std::function<void(CatalogEntry &)> &callback) override;
 	void Scan(CatalogType type, const std::function<void(CatalogEntry &)> &callback) override;
+	void Scan(CatalogType type, const std::function<void(CatalogEntry &)> &callback,
+	          optional_ptr<Transaction> transaction);
 	optional_ptr<CatalogEntry> LookupEntry(CatalogTransaction transaction, const EntryLookupInfo &lookup_info) override;
 	void DropEntry(ClientContext &context, DropInfo &info) override;
 	void Alter(CatalogTransaction transaction, AlterInfo &info) override;

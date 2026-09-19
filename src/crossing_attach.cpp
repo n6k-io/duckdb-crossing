@@ -83,18 +83,31 @@ vector<string> CrossingAttach::Schemas() {
 	return out;
 }
 
-vector<string> CrossingAttach::Tables(const string &schema) {
+template <class F>
+auto CrossingAttach::WithTables(const string &schema, optional_ptr<Transaction> transaction, F &&f) {
+	auto overlay = OverlayOf(transaction, schema);
+	if (overlay) {
+		if (!overlay->listed) {
+			for (auto &table : source->Tables(schema)) {
+				overlay->tables.insert(table);
+			}
+			overlay->listed = true;
+		}
+		return f(optional_ptr<const case_insensitive_set_t>(&overlay->tables));
+	}
 	lock_guard<mutex> guard(schemas_lock);
-	vector<string> out;
-	auto tables = TablesOf(schema);
-	if (!tables) {
+	return f(TablesOf(schema));
+}
+
+vector<string> CrossingAttach::Tables(const string &schema, optional_ptr<Transaction> transaction) {
+	return WithTables(schema, transaction, [](optional_ptr<const case_insensitive_set_t> tables) {
+		vector<string> out;
+		if (tables) {
+			out.assign(tables->begin(), tables->end());
+			std::sort(out.begin(), out.end());
+		}
 		return out;
-	}
-	for (auto &table : *tables) {
-		out.push_back(table);
-	}
-	std::sort(out.begin(), out.end());
-	return out;
+	});
 }
 
 CrossingSchema CrossingAttach::DescribedSchema(const string &schema) {
@@ -115,15 +128,15 @@ CrossingSchema CrossingAttach::DescribedSchema(const string &schema) {
 }
 
 bool CrossingAttach::ServesSchema(const string &schema) {
-	lock_guard<mutex> guard(schemas_lock);
-	auto tables = TablesOf(schema);
-	return tables && !tables->empty();
+	return WithTables(schema, nullptr, [](optional_ptr<const case_insensitive_set_t> tables) {
+		return tables && !tables->empty();
+	});
 }
 
-bool CrossingAttach::ServesTable(const string &schema, const string &table) {
-	lock_guard<mutex> guard(schemas_lock);
-	auto tables = TablesOf(schema);
-	return tables && tables->find(table) != tables->end();
+bool CrossingAttach::ServesTable(const string &schema, const string &table, optional_ptr<Transaction> transaction) {
+	return WithTables(schema, transaction, [&](optional_ptr<const case_insensitive_set_t> tables) {
+		return tables && tables->find(table) != tables->end();
+	});
 }
 
 void CrossingAttach::RetireCache(SchemaState &state) {
@@ -164,6 +177,31 @@ CrossingAttach::SchemaState &CrossingAttach::StateOf(const string &schema) {
 	return *slot;
 }
 
+CrossingAttach::SchemaState &CrossingAttach::StateOf(const string &schema, optional_ptr<Transaction> transaction) {
+	auto overlay = OverlayOf(transaction, schema);
+	return overlay ? *overlay->state : StateOf(schema);
+}
+
+optional_ptr<CrossingAttach::Slot> CrossingAttach::SlotOf(optional_ptr<Transaction> transaction) {
+	if (!transaction) {
+		return nullptr;
+	}
+	lock_guard<mutex> guard(transactions_lock);
+	auto it = begun.find(transaction.get());
+	return it == begun.end() ? nullptr : it->second.get();
+}
+
+optional_ptr<CrossingAttach::Overlay> CrossingAttach::OverlayOf(optional_ptr<Transaction> transaction,
+                                                                const string &schema) {
+	auto slot = SlotOf(transaction);
+	if (!slot) {
+		return nullptr;
+	}
+	lock_guard<mutex> guard(slot->lock);
+	auto it = slot->overlays.find(schema);
+	return it == slot->overlays.end() ? nullptr : &it->second;
+}
+
 CatalogEntry &CrossingAttach::GetOrDescribe(SchemaState &state, const string &schema, SchemaCatalogEntry &owner,
                                             const string &name) {
 	auto it = state.cache.find(name);
@@ -199,22 +237,23 @@ CatalogEntry &CrossingAttach::GetOrDescribe(SchemaState &state, const string &sc
 }
 
 optional_ptr<CatalogEntry> CrossingAttach::LookupTable(const string &schema, SchemaCatalogEntry &owner,
-                                                       const string &name) {
-	if (!ServesTable(schema, name)) {
+                                                       const string &name, optional_ptr<Transaction> transaction) {
+	if (!ServesTable(schema, name, transaction)) {
 		return nullptr;
 	}
-	auto &state = StateOf(schema);
+	auto &state = StateOf(schema, transaction);
 	lock_guard<mutex> guard(state.lock);
 	return &GetOrDescribe(state, schema, owner, name);
 }
 
 void CrossingAttach::ScanTables(const string &schema, SchemaCatalogEntry &owner, case_insensitive_set_t &seen,
-                                const std::function<void(CatalogEntry &)> &callback) {
-	auto names = Tables(schema);
+                                const std::function<void(CatalogEntry &)> &callback,
+                                optional_ptr<Transaction> transaction) {
+	auto names = Tables(schema, transaction);
 	if (names.empty()) {
 		return;
 	}
-	auto &state = StateOf(schema);
+	auto &state = StateOf(schema, transaction);
 	lock_guard<mutex> guard(state.lock);
 	for (auto &name : names) {
 		if (seen.count(name)) {
@@ -226,8 +265,9 @@ void CrossingAttach::ScanTables(const string &schema, SchemaCatalogEntry &owner,
 }
 
 optional_ptr<const CrossingTable> CrossingAttach::Described(const string &schema, SchemaCatalogEntry &owner,
-                                                            const string &name) {
-	auto entry = LookupTable(schema, owner, name);
+                                                            const string &name,
+                                                            optional_ptr<Transaction> transaction) {
+	auto entry = LookupTable(schema, owner, name, transaction);
 	if (!entry) {
 		return nullptr;
 	}
@@ -235,7 +275,7 @@ optional_ptr<const CrossingTable> CrossingAttach::Described(const string &schema
 }
 
 void CrossingAttach::ThrowIfServed(const string &schema, const string &table, const char *what) {
-	if (ServesTable(schema, table)) {
+	if (ServesTable(schema, table, nullptr)) {
 		throw BinderException("crossing: '%s' is served by a source; %s is not supported", table, what);
 	}
 }
@@ -248,30 +288,55 @@ void CrossingAttach::ThrowIfSchemaServed(const string &schema) {
 	}
 }
 
-void CrossingAttach::Ddl(ClientContext &context, Transaction &transaction, SchemaCatalogEntry &owner,
-                         const CrossingDdl &ddl) {
+void CrossingAttach::Authorize(SchemaCatalogEntry &owner, const CrossingDdl &ddl,
+                               optional_ptr<Transaction> transaction) {
 	if (ddl.verb == CrossingVerb::CREATE) {
 		if (!DescribedSchema(ddl.schema).Allows(ddl.verb)) {
 			throw PermissionException("crossing: schema '%s' does not have '%s' permission", ddl.schema,
 			                          CrossingVerbName(ddl.verb));
 		}
-	} else {
-		auto described = Described(ddl.schema, owner, ddl.table);
-		if (!described) {
-			throw CatalogException::MissingEntry(CatalogType::TABLE_ENTRY, ddl.table, string());
+		if (ddl.create && ddl.create->on_conflict == OnCreateConflict::REPLACE_ON_CONFLICT) {
+			auto replaced = Described(ddl.schema, owner, ddl.table, transaction);
+			if (replaced && !replaced->Allows(CrossingVerb::DROP)) {
+				throw PermissionException("crossing: '%s' does not have '%s' permission", ddl.table,
+				                          CrossingVerbName(CrossingVerb::DROP));
+			}
 		}
-		if (!described->Allows(ddl.verb)) {
-			throw PermissionException("crossing: '%s' does not have '%s' permission", ddl.table,
-			                          CrossingVerbName(ddl.verb));
-		}
+		return;
 	}
+	auto described = Described(ddl.schema, owner, ddl.table, transaction);
+	if (!described) {
+		throw CatalogException::MissingEntry(CatalogType::TABLE_ENTRY, ddl.table, string());
+	}
+	if (!described->Allows(ddl.verb)) {
+		throw PermissionException("crossing: '%s' does not have '%s' permission", ddl.table,
+		                          CrossingVerbName(ddl.verb));
+	}
+}
+
+void CrossingAttach::Pin(const string &schema, SchemaCatalogEntry &owner, const string &table) {
+	LookupTable(schema, owner, table, nullptr);
+}
+
+void CrossingAttach::Ddl(ClientContext &context, Transaction &transaction, SchemaCatalogEntry &owner,
+                         const CrossingDdl &ddl) {
+	Authorize(owner, ddl, &transaction);
+	Pin(ddl.schema, owner, ddl.table);
 	Session(context, transaction).Ddl(context, ddl);
-	{
-		auto &slot = SlotOf(transaction);
-		lock_guard<mutex> guard(slot.lock);
-		slot.altered_schemas.push_back(ddl.schema);
+	auto &slot = SlotOf(transaction);
+	lock_guard<mutex> guard(slot.lock);
+	auto &altered = slot.altered_schemas;
+	if (std::find(altered.begin(), altered.end(), ddl.schema) == altered.end()) {
+		altered.push_back(ddl.schema);
 	}
-	Refresh(ddl.schema);
+	auto &overlay = slot.overlays[ddl.schema];
+	overlay.listed = false;
+	overlay.tables.clear();
+	if (overlay.state) {
+		RetireCache(*overlay.state);
+	} else {
+		overlay.state = make_uniq<SchemaState>();
+	}
 }
 
 CrossingAttach::Slot &CrossingAttach::SlotOf(Transaction &transaction) {
@@ -311,7 +376,23 @@ unique_ptr<CrossingSession> CrossingAttach::Release(Transaction &transaction) {
 		lock_guard<mutex> settling_guard(transactions_lock);
 		settling[slot->session.get()] = std::move(slot->altered_schemas);
 	}
+	Retire(*slot);
 	return std::move(slot->session);
+}
+
+void CrossingAttach::Retire(Slot &slot) {
+	for (auto &overlay : slot.overlays) {
+		auto &state = StateOf(overlay.first);
+		auto &mine = *overlay.second.state;
+		lock_guard<mutex> state_guard(state.lock);
+		for (auto &cached : mine.cache) {
+			state.retired.push_back(std::move(cached.second));
+		}
+		for (auto &retired : mine.retired) {
+			state.retired.push_back(std::move(retired));
+		}
+	}
+	slot.overlays.clear();
 }
 
 void CrossingAttach::Settled(CrossingSession &released) {

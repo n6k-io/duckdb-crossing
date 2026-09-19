@@ -131,33 +131,41 @@ CrossingSchemaEntry::CrossingSchemaEntry(CrossingCatalog &catalog, CreateSchemaI
     : SchemaCatalogEntry(catalog, info), attach(catalog.Attach()) {
 }
 
-void CrossingSchemaEntry::Scan(ClientContext &, CatalogType type, const std::function<void(CatalogEntry &)> &callback) {
-	Scan(type, callback);
+void CrossingSchemaEntry::Scan(ClientContext &context, CatalogType type,
+                               const std::function<void(CatalogEntry &)> &callback) {
+	Scan(type, callback, &Transaction::Get(context, catalog));
 }
 
 void CrossingSchemaEntry::Scan(CatalogType type, const std::function<void(CatalogEntry &)> &callback) {
+	Scan(type, callback, nullptr);
+}
+
+void CrossingSchemaEntry::Scan(CatalogType type, const std::function<void(CatalogEntry &)> &callback,
+                               optional_ptr<Transaction> transaction) {
 	if (type != CatalogType::TABLE_ENTRY) {
 		return;
 	}
 	case_insensitive_set_t seen;
-	attach.ScanTables(name, *this, seen, callback);
+	attach.ScanTables(name, *this, seen, callback, transaction);
 }
 
-optional_ptr<CatalogEntry> CrossingSchemaEntry::LookupEntry(CatalogTransaction, const EntryLookupInfo &lookup_info) {
+optional_ptr<CatalogEntry> CrossingSchemaEntry::LookupEntry(CatalogTransaction transaction,
+                                                            const EntryLookupInfo &lookup_info) {
 	if (lookup_info.GetCatalogType() != CatalogType::TABLE_ENTRY) {
 		return nullptr;
 	}
-	return attach.LookupTable(name, *this, lookup_info.GetEntryName());
+	return attach.LookupTable(name, *this, lookup_info.GetEntryName(), transaction.transaction);
 }
 
 void CrossingSchemaEntry::DropEntry(ClientContext &context, DropInfo &info) {
-	if (info.type == CatalogType::TABLE_ENTRY && attach.ServesTable(name, info.name)) {
+	auto &transaction = Transaction::Get(context, catalog);
+	if (info.type == CatalogType::TABLE_ENTRY && attach.ServesTable(name, info.name, &transaction)) {
 		CrossingDdl ddl;
 		ddl.verb = CrossingVerb::DROP;
 		ddl.schema = name;
 		ddl.table = info.name;
 		ddl.drop = &info;
-		attach.Ddl(context, Transaction::Get(context, catalog), *this, ddl);
+		attach.Ddl(context, transaction, *this, ddl);
 		return;
 	}
 	attach.ThrowIfServed(name, info.name, "DROP");
@@ -168,7 +176,8 @@ void CrossingSchemaEntry::DropEntry(ClientContext &context, DropInfo &info) {
 }
 
 void CrossingSchemaEntry::Alter(CatalogTransaction transaction, AlterInfo &info) {
-	if (info.GetCatalogType() == CatalogType::TABLE_ENTRY && attach.ServesTable(name, info.name)) {
+	if (info.GetCatalogType() == CatalogType::TABLE_ENTRY &&
+	    attach.ServesTable(name, info.name, transaction.transaction)) {
 		CrossingDdl ddl;
 		ddl.verb = CrossingVerb::ALTER;
 		ddl.schema = name;
@@ -201,7 +210,7 @@ optional_ptr<CatalogEntry> CrossingSchemaEntry::CreateTable(CatalogTransaction t
 	ddl.table = info.Base().table;
 	ddl.create = info.base.get();
 	attach.Ddl(transaction.GetContext(), *transaction.transaction, *this, ddl);
-	return attach.LookupTable(name, *this, ddl.table);
+	return attach.LookupTable(name, *this, ddl.table, transaction.transaction);
 }
 
 optional_ptr<CatalogEntry> CrossingSchemaEntry::CreateView(CatalogTransaction, CreateViewInfo &) {

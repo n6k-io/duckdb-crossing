@@ -221,6 +221,7 @@ unique_ptr<FunctionData> MakeReadBindData(CrossingTableCatalogEntry &entry) {
 	request.verb = CrossingVerb::SELECT;
 	request.schema = entry.source_schema;
 	request.table = entry.described.name;
+	request.described = &entry.described;
 	auto floor = RequirePlan(entry.source.Plan(request), CrossingVerb::SELECT, entry.described.name);
 	auto fragment = BuildScanFragment(std::move(floor), entry.described.name, entry.described.column_names,
 	                                  entry.described.column_types);
