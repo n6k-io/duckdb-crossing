@@ -48,6 +48,8 @@ class LogicalOperator;
 class ClientContext;
 class ColumnDataCollection;
 class DatabaseInstance;
+class TableRef;
+class SQLStatement;
 struct AttachInfo;
 struct CreateInfo;
 struct AlterInfo;
@@ -192,6 +194,51 @@ unique_ptr<LogicalOperator> MakeSeamNode(vector<LogicalType> types);
 
 //! The rows a materialised-rows node holds: the seam the target filled, or a VALUES list.
 optional_ptr<const ColumnDataCollection> SeamRowsOf(const LogicalOperator &op);
+
+//! What stands for a floor when it is bound: a TableRef producing the floor's columns, in order.
+//! Null means the default, `catalog.schema.table`.
+using CrossingFloorResolver = std::function<unique_ptr<TableRef>(const CrossingFloor &)>;
+
+//! Replaces every floor in `plan` with the table it names, bound on `context`, which must have a
+//! transaction open. Each floor keeps its table index and column bindings. A table whose columns no
+//! longer match the floor is a CatalogException.
+void BindFloors(ClientContext &context, unique_ptr<LogicalOperator> &plan, const string &catalog,
+                const CrossingFloorResolver &resolver = nullptr);
+
+struct CrossingWriteTarget {
+	string catalog;
+	string schema;
+	string table;
+	CrossingVerb verb;
+	vector<string> key_columns;
+	vector<string> set_columns;
+};
+
+//! An INSERT, UPDATE or DELETE of the target reading its rows from the seam, as parser nodes. The
+//! seam is `seam_alias`, with one column per key column then set column, named `seam_columns`.
+struct CrossingWriteStatement {
+	unique_ptr<SQLStatement> statement;
+	string seam_alias;
+	vector<string> seam_columns;
+};
+
+//! A chance to change the statement before it binds, such as adding a row policy.
+using CrossingWriteShaper = std::function<void(CrossingWriteStatement &)>;
+
+//! A seam over rows already in memory. The rows must outlive the statement.
+unique_ptr<TableRef> SeamRefOfRows(const ColumnDataCollection &rows);
+
+//! The statement `ExecuteWrite` binds. `seam` is any TableRef whose columns are, by position, the
+//! key columns then the set columns.
+CrossingWriteStatement BuildWriteStatement(const CrossingWriteTarget &target, unique_ptr<TableRef> seam);
+
+//! Builds, binds and runs the write on `context`, which must have a transaction open. Returns the
+//! rows the target changed. The plan form takes a bound plan already on `context`, such as a
+//! received write plan after BindFloors.
+idx_t ExecuteWrite(ClientContext &context, const CrossingWriteTarget &target, unique_ptr<TableRef> seam,
+                   const CrossingWriteShaper &shape = nullptr);
+idx_t ExecuteWrite(ClientContext &context, const CrossingWriteTarget &target, unique_ptr<LogicalOperator> seam,
+                   const CrossingWriteShaper &shape = nullptr);
 
 struct CrossingParking;
 
