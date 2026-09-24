@@ -50,6 +50,7 @@ class ColumnDataCollection;
 class DatabaseInstance;
 class TableRef;
 class SQLStatement;
+class PendingQueryResult;
 struct AttachInfo;
 struct CreateInfo;
 struct AlterInfo;
@@ -204,6 +205,12 @@ using CrossingFloorResolver = std::function<unique_ptr<TableRef>(const CrossingF
 //! longer match the floor is a CatalogException.
 void BindFloors(ClientContext &context, unique_ptr<LogicalOperator> &plan, const string &catalog,
                 const CrossingFloorResolver &resolver = nullptr);
+
+//! Runs a bound plan on `context` as a query. Use this rather than LogicalPlanStatement: DuckDB
+//! copies a statement before planning it when an extension can ask for a rebind, and a plan
+//! holding a source's own scan cannot be copied.
+unique_ptr<PendingQueryResult> PendingCrossingPlan(ClientContext &context, unique_ptr<LogicalOperator> plan,
+                                                   bool stream);
 
 struct CrossingWriteTarget {
 	string catalog;

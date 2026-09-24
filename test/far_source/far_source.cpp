@@ -15,7 +15,6 @@
 #include "duckdb/parser/statement/alter_statement.hpp"
 #include "duckdb/parser/statement/create_statement.hpp"
 #include "duckdb/parser/statement/drop_statement.hpp"
-#include "duckdb/parser/statement/logical_plan_statement.hpp"
 #include "duckdb/planner/expression/bound_aggregate_expression.hpp"
 #include "duckdb/planner/expression/bound_function_expression.hpp"
 #include "duckdb/planner/expression/bound_window_expression.hpp"
@@ -79,7 +78,7 @@ void CollectOperators(const LogicalOperator &op, vector<LogicalOperatorType> &ou
 }
 
 unique_ptr<QueryResult> RunPlan(Connection &con, unique_ptr<LogicalOperator> plan) {
-	auto pending = con.context->PendingQuery(make_uniq<LogicalPlanStatement>(std::move(plan)), QueryParameters(false));
+	auto pending = PendingCrossingPlan(*con.context, std::move(plan), false);
 	if (pending->HasError()) {
 		pending->ThrowError();
 	}

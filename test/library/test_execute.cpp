@@ -8,7 +8,6 @@
 #include "duckdb/parser/expression/comparison_expression.hpp"
 #include "duckdb/parser/expression/conjunction_expression.hpp"
 #include "duckdb/parser/expression/constant_expression.hpp"
-#include "duckdb/parser/statement/logical_plan_statement.hpp"
 #include "duckdb/parser/statement/relation_statement.hpp"
 #include "duckdb/parser/statement/update_statement.hpp"
 #include "duckdb/planner/operator/logical_get.hpp"
@@ -42,7 +41,7 @@ unique_ptr<LogicalOperator> FloorOver(Connection &con, idx_t index, const string
 }
 
 idx_t RowsFrom(Connection &con, unique_ptr<LogicalOperator> plan) {
-	auto pending = con.context->PendingQuery(make_uniq<LogicalPlanStatement>(std::move(plan)), QueryParameters(false));
+	auto pending = PendingCrossingPlan(*con.context, std::move(plan), false);
 	if (pending->HasError()) {
 		pending->ThrowError();
 	}
