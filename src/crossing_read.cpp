@@ -1,11 +1,14 @@
 #include "internal/crossing_read.hpp"
 
 #include "crossing_attach.hpp"
+#include "internal/floor.hpp"
 #include "internal/parking.hpp"
+#include "internal/seam.hpp"
 #include "internal/table_indices.hpp"
 
 #include "duckdb/common/string_util.hpp"
 #include "duckdb/execution/physical_plan_generator.hpp"
+#include "duckdb/planner/operator/logical_get.hpp"
 #include "duckdb/transaction/transaction.hpp"
 
 namespace duckdb {
@@ -206,8 +209,26 @@ shared_ptr<CrossingFragment> BuildScanFragment(unique_ptr<LogicalOperator> floor
 	return fragment;
 }
 
+//! A scan of the source's own storage cannot travel: it is bound to the connection that made it.
+//! The source names its table with a floor or seam and binds it where the plan runs.
+void RequirePlaceholderScans(const LogicalOperator &op, CrossingVerb verb, const string &table) {
+	if (op.type == LogicalOperatorType::LOGICAL_GET) {
+		auto &get = op.Cast<LogicalGet>();
+		if (!FloorOf(get) && get.function.name != CROSSING_SEAM_FUNCTION) {
+			throw InternalException("crossing: the source's %s of '%s' holds a %s scan; return MakeFloorNode or "
+			                        "MakeSeamNode and bind the table in Read or Write",
+			                        verb == CrossingVerb::SELECT ? "scan" : CrossingVerbName(verb), table,
+			                        get.function.name);
+		}
+	}
+	for (auto &child : op.children) {
+		RequirePlaceholderScans(*child, verb, table);
+	}
+}
+
 unique_ptr<LogicalOperator> RequirePlan(CrossingPlan planned, CrossingVerb verb, const string &table) {
 	if (planned.plan) {
+		RequirePlaceholderScans(*planned.plan, verb, table);
 		return std::move(planned.plan);
 	}
 	auto &reason = planned.verdict.reason;

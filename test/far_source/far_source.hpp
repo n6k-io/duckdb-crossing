@@ -104,7 +104,8 @@ private:
 	vector<vector<Value>> Evaluate(const LogicalOperator &plan, FarCall &call);
 	vector<vector<Value>> EvaluateNative(const LogicalOperator &plan, FarCall &call);
 	vector<vector<Value>> EvaluateSubstrait(const LogicalOperator &plan, FarCall &call);
-	idx_t Apply(const CrossingQuery &query, const vector<vector<Value>> &rows);
+	idx_t Apply(const CrossingQuery &query);
+	string StageSeamRows(const LogicalOperator &plan);
 	FarCall Record(const CrossingQuery &query);
 
 	shared_ptr<FarStore> store;

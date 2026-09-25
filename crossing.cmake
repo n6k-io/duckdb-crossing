@@ -15,7 +15,11 @@ set(CROSSING_ENGINE_SOURCE_NAMES
     fill.cpp
     pass.cpp
     scan_columns.cpp
-    table_indices.cpp)
+    table_indices.cpp
+    execute.cpp)
+
+set(CROSSING_EXECUTE_SOURCE_NAMES crossing.cpp floor.cpp seam.cpp plan_wire.cpp table_indices.cpp
+                                  execute.cpp)
 
 set(CROSSING_LIBRARY_SOURCE_NAMES
     ${CROSSING_ENGINE_SOURCE_NAMES}
@@ -42,6 +46,13 @@ endfunction()
 
 function(crossing_engine_sources out_var)
   _crossing_expand(result ${CROSSING_ENGINE_SOURCE_NAMES})
+  set(${out_var}
+      ${result}
+      PARENT_SCOPE)
+endfunction()
+
+function(crossing_execute_sources out_var)
+  _crossing_expand(result ${CROSSING_EXECUTE_SOURCE_NAMES})
   set(${out_var}
       ${result}
       PARENT_SCOPE)

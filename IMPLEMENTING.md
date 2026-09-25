@@ -134,15 +134,18 @@ CrossingPlan ToyDB::Plan(const CrossingPlanRequest &request) {
 }
 ```
 
-- `SELECT` — a scan of the table emitting one column per described column, in
-  order. Crossed work is stacked on it; it is still there in `Read`. Row
-  filtering belongs here.
-- Write — the statement with a seam node where rows go. `request.seam.key_columns`
-  then `set_columns` are the seam's column order: insert = row image in
-  `Describe` order; update = key then set columns; delete = key.
+- `SELECT` — a floor: the table named, emitting one column per described
+  column, in order. Crossed work is stacked on it; it is still there in `Read`.
+  Row filtering may be stacked on the floor here.
+- Write — a seam node: where the rows go. `request.seam.key_columns` then
+  `set_columns` are the seam's column order: insert = row image in `Describe`
+  order; update = key then set columns; delete = key.
 - `CrossingPlan::Declined(reason)` refuses; the reason is in the error.
-- `MakeFloorNode` / `MakeSeamNode` are enough for a source that renders the tree
-  rather than executes it. `FloorOf(node)` returns the schema and table named.
+- The plan names tables; it never scans them. A `LogicalGet` of your own storage
+  is bound to the connection that made it and cannot travel, so crossing refuses
+  a plan holding one. Bind the table where the plan runs: `BindFloors` in
+  `Read`, `ExecuteWrite` in `Write`. `FloorOf(node)` returns the schema and
+  table named.
 - Table indices you use are yours; crossing remaps them.
 
 ## Accepts
@@ -189,6 +192,37 @@ prints it; `SerializeCrossingPlan(plan)` gives bytes.
   statement ended. Each pull gets its own waker.
 - Scan and readers are destroyed when DuckDB stops asking.
 
+### Running the plan on a DuckDB
+
+```cpp
+auto plan = DeserializeCrossingPlan(context, SerializeCrossingPlan(query.plan));
+BindFloors(context, plan, "mycatalog");
+auto pending = PendingCrossingPlan(context, std::move(plan), true);
+if (pending->HasError()) {
+	pending->ThrowError();
+}
+auto result = pending->Execute();
+if (result->HasError()) {
+	result->ThrowError();
+}
+```
+
+`PendingCrossingPlan` runs a bound plan as a query. Do not go through
+`LogicalPlanStatement`: DuckDB copies a statement before planning it whenever
+an extension can ask for a rebind, and a plan holding your scan cannot be copied.
+
+`BindFloors` replaces each floor with the table it names, bound on `context`,
+which must have a transaction open. The floor keeps its table index and column
+bindings, so the plan above it is untouched. A table whose columns no longer
+match the floor is a `CatalogException`. A resolver may stand something else
+in for a floor, such as a subquery with a row filter:
+
+```cpp
+BindFloors(context, plan, "mycatalog", [&](const CrossingFloor &floor) -> unique_ptr<TableRef> {
+	return con.Table("mycatalog", floor.schema, floor.table)->Filter(policy)->GetTableRef();
+});
+```
+
 ## Write
 
 ```cpp
@@ -207,6 +241,27 @@ CrossingWriter ToySession::Write(ClientContext &, const CrossingQuery &query) {
 - `Wait()` / `waker.Wake()` as for readers.
 - `Done(n)` is the rows the source changed, which DuckDB reports.
 - `RETURNING` never runs wholly on the source.
+
+### Running the write on a DuckDB
+
+```cpp
+CrossingWriteTarget target {"mycatalog", query.written.schema, query.written.table, query.kind,
+                            query.key_columns, query.set_columns};
+if (auto rows = SeamRowsOf(query.plan)) {
+	return ExecuteWrite(context, target, SeamRefOfRows(*rows));
+}
+auto plan = DeserializeCrossingPlan(context, SerializeCrossingPlan(query.plan));
+BindFloors(context, plan, "mycatalog");
+return ExecuteWrite(context, target, std::move(plan));
+```
+
+`ExecuteWrite` builds the INSERT, UPDATE or DELETE as parser nodes over the
+seam, binds it on `context` (a transaction must be open) and runs it, returning
+the rows changed. Keys match with `IS NOT DISTINCT FROM`. The seam is any
+`TableRef` whose columns are, by position, the key columns then the set
+columns, or a bound plan producing them. A shaper sees the statement before it
+binds, as `CrossingWriteStatement` with the seam's alias and column names, to
+add a row policy or a check.
 
 ### Shipping the plan
 

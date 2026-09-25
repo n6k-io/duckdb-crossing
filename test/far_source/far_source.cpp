@@ -15,13 +15,9 @@
 #include "duckdb/parser/statement/alter_statement.hpp"
 #include "duckdb/parser/statement/create_statement.hpp"
 #include "duckdb/parser/statement/drop_statement.hpp"
-#include "duckdb/parser/tableref/basetableref.hpp"
-#include "duckdb/planner/binder.hpp"
-#include "duckdb/planner/bound_statement.hpp"
 #include "duckdb/planner/expression/bound_aggregate_expression.hpp"
 #include "duckdb/planner/expression/bound_function_expression.hpp"
 #include "duckdb/planner/expression/bound_window_expression.hpp"
-#include "duckdb/planner/operator/logical_get.hpp"
 
 #include <algorithm>
 #include <chrono>
@@ -31,10 +27,6 @@ namespace duckdb {
 namespace {
 
 constexpr const char *FAR_CATALOG = "memory";
-
-string Quoted(const string &name) {
-	return "\"" + name + "\"";
-}
 
 vector<vector<Value>> RowsOf(QueryResult &result) {
 	if (result.HasError()) {
@@ -85,72 +77,17 @@ void CollectOperators(const LogicalOperator &op, vector<LogicalOperatorType> &ou
 	}
 }
 
-void ReplaceFloors(Binder &binder, unique_ptr<LogicalOperator> &op) {
-	for (auto &child : op->children) {
-		ReplaceFloors(binder, child);
+unique_ptr<QueryResult> RunPlan(Connection &con, unique_ptr<LogicalOperator> plan) {
+	auto pending = PendingCrossingPlan(*con.context, std::move(plan), false);
+	if (pending->HasError()) {
+		pending->ThrowError();
 	}
-	auto floor = FloorOf(*op);
-	if (!floor) {
-		return;
+	auto result = pending->Execute();
+	if (result->HasError()) {
+		result->ThrowError();
 	}
-	auto &floor_get = op->Cast<LogicalGet>();
-	BaseTableRef ref;
-	ref.catalog_name = FAR_CATALOG;
-	ref.schema_name = floor->schema;
-	ref.table_name = floor->table;
-	auto bound = binder.Bind(static_cast<TableRef &>(ref));
-	if (!bound.plan || bound.plan->type != LogicalOperatorType::LOGICAL_GET) {
-		throw InternalException("far: '%s.%s' did not bind to a scan", floor->schema, floor->table);
-	}
-	auto &get = bound.plan->Cast<LogicalGet>();
-	if (get.names != floor_get.names || get.returned_types != floor_get.returned_types) {
-		throw CatalogException("far: '%s.%s' changed on the source: the floor does not match the table", floor->schema,
-		                       floor->table);
-	}
-	get.table_index = floor_get.table_index;
-	vector<ColumnIndex> ids = floor_get.GetColumnIds();
-	get.SetColumnIds(std::move(ids));
-	op = std::move(bound.plan);
+	return result;
 }
-
-class PlanRelation : public Relation {
-public:
-	PlanRelation(const shared_ptr<ClientContext> &context, unique_ptr<LogicalOperator> plan_p)
-	    : Relation(context, RelationType::QUERY_RELATION), plan(std::move(plan_p)) {
-		plan->ResolveOperatorTypes();
-		for (idx_t i = 0; i < plan->types.size(); i++) {
-			columns.emplace_back("c" + to_string(i), plan->types[i]);
-		}
-	}
-
-	const vector<ColumnDefinition> &Columns() override {
-		return columns;
-	}
-	unique_ptr<QueryNode> GetQueryNode() override {
-		throw InternalException("far: a plan relation has no query node");
-	}
-	string GetQuery() override {
-		return plan->ToString();
-	}
-	string ToString(idx_t depth) override {
-		return plan->ToString();
-	}
-	BoundStatement Bind(Binder &binder) override {
-		BoundStatement result;
-		result.plan = plan->Copy(binder.context);
-		ReplaceFloors(binder, result.plan);
-		result.plan->ResolveOperatorTypes();
-		result.types = result.plan->types;
-		for (auto &column : columns) {
-			result.names.push_back(column.Name());
-		}
-		return result;
-	}
-
-private:
-	unique_ptr<LogicalOperator> plan;
-	vector<ColumnDefinition> columns;
-};
 
 void ArriveLater(FarStore &store, CrossingWaker waker, std::function<void()> arrive) {
 	if (store.keep_wakers) {
@@ -527,30 +464,35 @@ vector<vector<Value>> FarSession::EvaluateNative(const LogicalOperator &plan, Fa
 	call.wire = SerializeCrossingPlan(plan);
 	auto received = DeserializeCrossingPlan(*far.context, call.wire);
 	call.received_text = received->ToString();
-	auto rel = make_shared_ptr<PlanRelation>(far.context, std::move(received));
-	return RowsOf(*rel->Execute());
+	BindFloors(*far.context, received, FAR_CATALOG);
+	return RowsOf(*RunPlan(far, std::move(received)));
+}
+
+string FarSession::StageSeamRows(const LogicalOperator &plan) {
+	auto rows = FindSeamRows(plan);
+	if (!rows) {
+		return "";
+	}
+	string seam_view = "crossing_seam_rows";
+	string columns;
+	for (idx_t c = 0; c < rows->Types().size(); c++) {
+		columns += (c ? ", c" : "c") + to_string(c) + " " + rows->Types()[c].ToString();
+	}
+	auto created = far.Query("CREATE OR REPLACE TEMP TABLE " + seam_view + "(" + columns + ")");
+	if (created->HasError()) {
+		created->ThrowError();
+	}
+	Appender appender(far, "temp", "main", seam_view);
+	for (auto &chunk : rows->Chunks()) {
+		appender.AppendDataChunk(chunk);
+	}
+	appender.Close();
+	return seam_view;
 }
 
 vector<vector<Value>> FarSession::EvaluateSubstrait(const LogicalOperator &plan, FarCall &call) {
 	call.wire = RenderSubstraitJson(plan);
-	string seam_view;
-	if (auto rows = FindSeamRows(plan)) {
-		seam_view = "crossing_seam_rows";
-		string columns;
-		for (idx_t c = 0; c < rows->Types().size(); c++) {
-			columns += (c ? ", c" : "c") + to_string(c) + " " + rows->Types()[c].ToString();
-		}
-		auto created = far.Query("CREATE OR REPLACE TEMP TABLE " + seam_view + "(" + columns + ")");
-		if (created->HasError()) {
-			created->ThrowError();
-		}
-		Appender appender(far, "temp", "main", seam_view);
-		for (auto &chunk : rows->Chunks()) {
-			appender.AppendDataChunk(chunk);
-		}
-		appender.Close();
-	}
-	auto rel = DecodeSubstraitJson(far, FAR_CATALOG, call.wire, seam_view);
+	auto rel = DecodeSubstraitJson(far, FAR_CATALOG, call.wire, StageSeamRows(plan));
 	call.received_text = rel->ToString();
 	return RowsOf(*rel->Execute());
 }
@@ -604,77 +546,31 @@ CrossingWriter FarSession::Write(ClientContext &, const CrossingQuery &query) {
 			store->writes.push_back(std::move(call));
 		}
 		lock_guard<mutex> guard(far_lock);
-		return CrossingWriteResult::Done(Apply(query, rows));
+		return CrossingWriteResult::Done(Apply(query));
 	};
 }
 
-idx_t FarSession::Apply(const CrossingQuery &query, const vector<vector<Value>> &rows) {
+idx_t FarSession::Apply(const CrossingQuery &query) {
 	if (query.written.table.empty()) {
 		throw InternalException("far: a write names no table");
 	}
-	auto &use = query.written;
-	string target = Quoted(use.schema) + "." + Quoted(use.table);
-	string sql;
-	switch (query.kind) {
-	case CrossingVerb::INSERT: {
-		string columns;
-		string placeholders;
-		for (auto &column : query.set_columns) {
-			columns += (columns.empty() ? "" : ", ") + Quoted(column);
-			placeholders += placeholders.empty() ? "?" : ", ?";
-		}
-		sql = "INSERT INTO " + target + " (" + columns + ") VALUES (" + placeholders + ")";
-		break;
+	CrossingWriteTarget target;
+	target.catalog = FAR_CATALOG;
+	target.schema = query.written.schema;
+	target.table = query.written.table;
+	target.verb = query.kind;
+	target.key_columns = query.key_columns;
+	target.set_columns = query.set_columns;
+	if (auto rows = SeamRowsOf(query.plan)) {
+		return ExecuteWrite(*far.context, target, SeamRefOfRows(*rows));
 	}
-	case CrossingVerb::UPDATE: {
-		string sets;
-		for (auto &column : query.set_columns) {
-			sets += (sets.empty() ? "" : ", ") + Quoted(column) + " = ?";
-		}
-		string where;
-		for (auto &column : query.key_columns) {
-			where += (where.empty() ? "" : " AND ") + Quoted(column) + " IS NOT DISTINCT FROM ?";
-		}
-		sql = "UPDATE " + target + " SET " + sets + " WHERE " + where;
-		break;
+	if (store->transport == Transport::NATIVE) {
+		auto received = DeserializeCrossingPlan(*far.context, SerializeCrossingPlan(query.plan));
+		BindFloors(*far.context, received, FAR_CATALOG);
+		return ExecuteWrite(*far.context, target, std::move(received));
 	}
-	case CrossingVerb::DELETE_: {
-		string where;
-		for (auto &column : query.key_columns) {
-			where += (where.empty() ? "" : " AND ") + Quoted(column) + " IS NOT DISTINCT FROM ?";
-		}
-		sql = "DELETE FROM " + target + " WHERE " + where;
-		break;
-	}
-	default:
-		throw InternalException("far: cannot write a %s", CrossingVerbName(query.kind));
-	}
-	auto prepared = far.Prepare(sql);
-	if (prepared->HasError()) {
-		throw InternalException("far: %s: %s", sql, prepared->GetError());
-	}
-	idx_t affected = 0;
-	for (auto &row : rows) {
-		vector<Value> args;
-		if (query.kind == CrossingVerb::UPDATE) {
-			auto keys = query.key_columns.size();
-			for (idx_t i = keys; i < row.size(); i++) {
-				args.push_back(row[i]);
-			}
-			for (idx_t i = 0; i < keys; i++) {
-				args.push_back(row[i]);
-			}
-		} else {
-			args = row;
-		}
-		auto result = prepared->Execute(args, false);
-		if (result->HasError()) {
-			result->ThrowError();
-		}
-		auto counted = RowsOf(*result);
-		affected += counted.empty() ? 0 : counted[0][0].GetValue<idx_t>();
-	}
-	return affected;
+	auto rel = DecodeSubstraitJson(far, FAR_CATALOG, RenderSubstraitJson(query.plan), StageSeamRows(query.plan));
+	return ExecuteWrite(*far.context, target, rel->GetTableRef());
 }
 
 } // namespace duckdb
