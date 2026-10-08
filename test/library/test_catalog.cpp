@@ -5,6 +5,9 @@
 #include "duckdb/main/attached_database.hpp"
 #include "duckdb/main/database_manager.hpp"
 
+#include <atomic>
+#include <future>
+
 using namespace duckdb;
 
 namespace {
@@ -14,6 +17,51 @@ CrossingAttach &AttachedAs(Twin &twin, const string &alias) {
 	auto &attached = *twin.near.instance->GetDatabaseManager().GetDatabase(*twin.con.context, alias);
 	twin.con.Commit();
 	return CrossingAttach::Of(attached.GetCatalog());
+}
+
+//! Holds the first source call named `call` until Release; counts every one.
+struct HeldCall {
+	std::promise<void> entered;
+	std::promise<void> release;
+	std::shared_future<void> released = release.get_future().share();
+	std::atomic<bool> armed {false};
+	std::atomic<idx_t> calls {0};
+
+	FarStore &store;
+
+	HeldCall(FarStore &store_p, const string &call) : store(store_p) {
+		store.on_source_call = [this, call](const string &made) {
+			if (made != call) {
+				return;
+			}
+			calls++;
+			if (armed.exchange(false)) {
+				entered.set_value();
+				released.wait();
+			}
+		};
+	}
+	~HeldCall() {
+		store.on_source_call = nullptr;
+	}
+	void Arm() {
+		armed = true;
+	}
+	bool Entered() {
+		return entered.get_future().wait_for(std::chrono::seconds(5)) == std::future_status::ready;
+	}
+	void Release() {
+		release.set_value();
+	}
+};
+
+//! True when `refresh` returns while a source call is held.
+bool RefreshReturnsWhileHeld(HeldCall &held, const std::function<void()> &refresh) {
+	auto done = std::async(std::launch::async, refresh);
+	auto returned = done.wait_for(std::chrono::seconds(2)) == std::future_status::ready;
+	held.Release();
+	done.get();
+	return returned;
 }
 
 } // namespace
@@ -79,6 +127,42 @@ TEST_CASE("refreshing one schema relists only that schema", "[catalog]") {
 	twin.Same("SELECT id FROM far.late");
 	REQUIRE(twin.store->listings["main"] == main_listings + 1);
 	REQUIRE(twin.store->listings["aux"] == aux_listings);
+}
+
+TEST_CASE("a refresh does not wait for a schema listing in progress, and the next lookup relists", "[catalog]") {
+	Twin twin(Transport::NATIVE);
+	twin.Seed();
+	auto &attach = AttachedAs(twin, "far");
+	attach.Refresh();
+	HeldCall held(*twin.store, "schemas");
+	held.Arm();
+
+	auto listing = std::async(std::launch::async, [&] { return attach.Schemas(); });
+	REQUIRE(held.Entered());
+	REQUIRE(RefreshReturnsWhileHeld(held, [&] { attach.Refresh(); }));
+	listing.get();
+	auto listed = held.calls.load();
+
+	attach.Schemas();
+	REQUIRE(held.calls == listed + 1);
+}
+
+TEST_CASE("a schema refresh does not wait for a description in progress, and the next lookup redescribes",
+          "[catalog]") {
+	Twin twin(Transport::NATIVE);
+	twin.Seed();
+	auto &attach = AttachedAs(twin, "far");
+	HeldCall held(*twin.store, "describe");
+	held.Arm();
+
+	auto query = std::async(std::launch::async, [&] { return twin.con.Query("SELECT id FROM far.orders"); });
+	REQUIRE(held.Entered());
+	REQUIRE(RefreshReturnsWhileHeld(held, [&] { attach.Refresh("main"); }));
+	REQUIRE(!query.get()->HasError());
+	auto described = held.calls.load();
+
+	twin.Query("SELECT id FROM far.orders");
+	REQUIRE(held.calls == described + 1);
 }
 
 TEST_CASE("a description is taken once per table for the life of the attach", "[catalog]") {
