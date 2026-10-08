@@ -53,7 +53,8 @@ public:
 	bool ServesSchema(const string &schema);
 	bool ServesTable(const string &schema, const string &table, optional_ptr<Transaction> transaction);
 	//! Forgets what the source listed and described; the next lookup asks again. Entries already
-	//! handed out stay alive for the life of the attach.
+	//! handed out stay alive for the life of the attach. Never blocks on a lookup in progress, so it
+	//! is safe from the thread that delivers that lookup's reply; that lookup returns what it fetched.
 	void Refresh();
 	//! The same for one schema. The schema list itself is kept.
 	void Refresh(const string &schema);
@@ -119,12 +120,17 @@ private:
 	void Authorize(SchemaCatalogEntry &owner, const CrossingDdl &ddl, optional_ptr<Transaction> transaction);
 	void Settled(CrossingSession &released);
 
+	//! Applies queued Refresh calls. Caller holds schemas_lock.
+	void ApplyRefreshes();
 	case_insensitive_map_t<Listing> &ListedSchemas();
 	optional_ptr<const case_insensitive_set_t> TablesOf(const string &schema);
 	template <class F>
 	auto WithTables(const string &schema, optional_ptr<Transaction> transaction, F &&f);
 	void Pin(const string &schema, SchemaCatalogEntry &owner, const string &table);
 	void RetireCache(SchemaState &state);
+	//! Caller holds state.lock.
+	void RetireCacheLocked(SchemaState &state);
+	void RetireIfStale(SchemaState &state);
 	void Retire(Slot &slot);
 	SchemaState &StateOf(const string &schema);
 	SchemaState &StateOf(const string &schema, optional_ptr<Transaction> transaction);
@@ -139,6 +145,10 @@ private:
 	bool schemas_listed = false;
 	case_insensitive_map_t<Listing> served;
 	case_insensitive_map_t<unique_ptr<SchemaState>> schemas;
+	//! Never held across a source call.
+	mutex refresh_lock;
+	bool refresh_all = false;
+	case_insensitive_set_t refresh_schemas;
 	mutex transactions_lock;
 	unordered_map<Transaction *, unique_ptr<Slot>> begun;
 	unordered_map<CrossingSession *, vector<string>> settling;

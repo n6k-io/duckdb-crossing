@@ -7,6 +7,7 @@
 #include "duckdb/common/mutex.hpp"
 #include "duckdb/common/set.hpp"
 
+#include <functional>
 #include <thread>
 
 namespace duckdb {
@@ -81,6 +82,8 @@ struct FarStore {
 	vector<CrossingWaker> kept_wakers;
 	idx_t readers_open = 0;
 	idx_t readers_closed = 0;
+	//! Runs at the start of Schemas ("schemas") and Describe ("describe"), outside `lock`.
+	std::function<void(const string &call)> on_source_call;
 
 	void JoinArrivals();
 	const FarCall &LastRead();

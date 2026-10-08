@@ -215,6 +215,9 @@ void FarSource::Detach(ClientContext &) {
 }
 
 vector<string> FarSource::Schemas() {
+	if (store->on_source_call) {
+		store->on_source_call("schemas");
+	}
 	lock_guard<mutex> guard(store->lock);
 	auto result =
 	    store->con.Query("SELECT schema_name FROM duckdb_schemas() WHERE database_name = '" + string(FAR_CATALOG) +
@@ -281,6 +284,9 @@ CrossingTable FarSource::DescribeOn(FarStore &store, Connection &con, const stri
 }
 
 CrossingTable FarSource::Describe(const string &schema, const string &name) {
+	if (store->on_source_call) {
+		store->on_source_call("describe");
+	}
 	lock_guard<mutex> guard(store->lock);
 	return DescribeOn(*store, store->con, schema, name);
 }

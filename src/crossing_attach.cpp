@@ -4,6 +4,7 @@
 #include "internal/crossing_write.hpp"
 
 #include "duckdb/catalog/catalog_entry/schema_catalog_entry.hpp"
+#include "duckdb/common/atomic.hpp"
 #include "duckdb/common/exception/catalog_exception.hpp"
 #include "duckdb/parser/parsed_data/create_table_info.hpp"
 #include "duckdb/transaction/transaction.hpp"
@@ -14,6 +15,9 @@ namespace duckdb {
 
 struct CrossingAttach::SchemaState {
 	mutex lock;
+	//! Set under schemas_lock, consumed under `lock`: ApplyRefreshes must not wait on `lock`, which a
+	//! describe holds across a source call.
+	atomic<bool> stale {false};
 	case_insensitive_map_t<unique_ptr<CatalogEntry>> cache;
 	//! Never freed while the attach lives: a binder can hold a raw CatalogEntry* for the rest of
 	//! the statement.
@@ -45,7 +49,37 @@ AttachedDatabase &CrossingAttach::Database() {
 	return db;
 }
 
+void CrossingAttach::ApplyRefreshes() {
+	bool all;
+	case_insensitive_set_t names;
+	{
+		lock_guard<mutex> guard(refresh_lock);
+		all = refresh_all;
+		refresh_all = false;
+		names.swap(refresh_schemas);
+	}
+	if (all) {
+		schemas_listed = false;
+		served.clear();
+		for (auto &entry : schemas) {
+			entry.second->stale = true;
+		}
+		return;
+	}
+	for (auto &name : names) {
+		auto it = served.find(name);
+		if (it != served.end()) {
+			it->second = Listing();
+		}
+		auto state = schemas.find(name);
+		if (state != schemas.end()) {
+			state->second->stale = true;
+		}
+	}
+}
+
 case_insensitive_map_t<CrossingAttach::Listing> &CrossingAttach::ListedSchemas() {
+	ApplyRefreshes();
 	if (!schemas_listed) {
 		served.clear();
 		for (auto &schema : source->Schemas()) {
@@ -145,35 +179,38 @@ bool CrossingAttach::ServesTable(const string &schema, const string &table, opti
 
 void CrossingAttach::RetireCache(SchemaState &state) {
 	lock_guard<mutex> state_guard(state.lock);
+	RetireCacheLocked(state);
+}
+
+void CrossingAttach::RetireCacheLocked(SchemaState &state) {
 	for (auto &cached : state.cache) {
 		state.retired.push_back(std::move(cached.second));
 	}
 	state.cache.clear();
 }
 
-void CrossingAttach::Refresh() {
-	lock_guard<mutex> guard(schemas_lock);
-	schemas_listed = false;
-	served.clear();
-	for (auto &entry : schemas) {
-		RetireCache(*entry.second);
+void CrossingAttach::RetireIfStale(SchemaState &state) {
+	if (state.stale.exchange(false)) {
+		RetireCacheLocked(state);
 	}
 }
 
+void CrossingAttach::Refresh() {
+	lock_guard<mutex> guard(refresh_lock);
+	refresh_all = true;
+	refresh_schemas.clear();
+}
+
 void CrossingAttach::Refresh(const string &schema) {
-	lock_guard<mutex> guard(schemas_lock);
-	auto it = served.find(schema);
-	if (it != served.end()) {
-		it->second = Listing();
-	}
-	auto state = schemas.find(schema);
-	if (state != schemas.end()) {
-		RetireCache(*state->second);
+	lock_guard<mutex> guard(refresh_lock);
+	if (!refresh_all) {
+		refresh_schemas.insert(schema);
 	}
 }
 
 CrossingAttach::SchemaState &CrossingAttach::StateOf(const string &schema) {
 	lock_guard<mutex> guard(schemas_lock);
+	ApplyRefreshes();
 	auto &slot = schemas[schema];
 	if (!slot) {
 		slot = make_uniq<SchemaState>();
@@ -259,6 +296,7 @@ optional_ptr<CatalogEntry> CrossingAttach::LookupTable(const string &schema, Sch
 	}
 	auto &state = StateOf(schema, transaction);
 	lock_guard<mutex> guard(state.lock);
+	RetireIfStale(state);
 	return &GetOrDescribe(state, schema, owner, name, transaction);
 }
 
@@ -271,6 +309,7 @@ void CrossingAttach::ScanTables(const string &schema, SchemaCatalogEntry &owner,
 	}
 	auto &state = StateOf(schema, transaction);
 	lock_guard<mutex> guard(state.lock);
+	RetireIfStale(state);
 	for (auto &name : names) {
 		if (seen.count(name)) {
 			continue;
