@@ -353,3 +353,20 @@ TEST_CASE("a column-free query still reads the source once per row", "[pushdown]
 
 	REQUIRE(twin.LastRead().rows.size() == 5);
 }
+
+TEST_CASE("a join the source runs, read by an expression only the target computes, keeps both sides' columns",
+          "[pushdown]") {
+	auto transport = EACH_TRANSPORT();
+	INFO(TransportName(transport));
+	auto from = GENERATE(as<string> {}, "(SELECT 2 AS id, 'z' AS n) s", "(VALUES (2, 'z')) s(id, n)");
+	INFO(from);
+	if (transport == Transport::SUBSTRAIT && StringUtil::StartsWith(from, "(VALUES")) {
+		// Substrait has no operator for a VALUES list.
+		return;
+	}
+	Twin twin(transport);
+	twin.store->refused_functions.insert("upper");
+	twin.Seed();
+
+	twin.Same("SELECT upper(s.n) AS u, orders.name FROM far.orders, " + from + " WHERE orders.id = s.id");
+}

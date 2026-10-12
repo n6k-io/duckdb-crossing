@@ -40,7 +40,9 @@ TEST_CASE("a window the source knows folds in", "[pass]") {
 
 	FoldCrossableWorkIntoFragments(plan, TestIndices(), MemoryIdentity());
 
-	REQUIRE_PLAN(plan, "crossing[window{ROW_NUMBER() OVER (ORDER BY amt ASC NULLS LAST)} | proj{id, amt} | scan]");
+	REQUIRE_PLAN(plan,
+	             "crossing[proj{#[2.0], #[2.1], #[15.0]} | window{ROW_NUMBER() OVER (ORDER BY amt ASC NULLS LAST)} | "
+	             "proj{id, amt} | scan]");
 }
 
 TEST_CASE("a window the source does not know stays", "[pass]") {
@@ -56,7 +58,7 @@ TEST_CASE("an unnest folds in with what it unnests", "[pass]") {
 
 	FoldCrossableWorkIntoFragments(plan, TestIndices(), MemoryIdentity());
 
-	REQUIRE_PLAN(plan, "crossing[unnest{UNNEST(amt)} | proj{id, amt} | scan]");
+	REQUIRE_PLAN(plan, "crossing[proj{#[2.0], #[2.1], #[16.0]} | unnest{UNNEST(amt)} | proj{id, amt} | scan]");
 }
 
 TEST_CASE("a filter holding a case folds in", "[pass]") {
@@ -112,7 +114,7 @@ TEST_CASE("rows the target holds fold in beside a scan", "[pass]") {
 
 	FoldCrossableWorkIntoFragments(plan, TestIndices(), MemoryIdentity());
 
-	REQUIRE_PLAN(plan, "crossing[join(proj{id, amt} | scan, rows)]");
+	REQUIRE_PLAN(plan, "crossing[proj{#[2.0], #[2.1], #[32.0], #[32.1]} | join(proj{id, amt} | scan, rows)]");
 }
 
 TEST_CASE("rows with no scan beside them have nowhere to go", "[pass]") {

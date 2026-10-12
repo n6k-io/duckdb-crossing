@@ -3,9 +3,12 @@
 #include "internal/carrier.hpp"
 
 #include "duckdb/common/exception.hpp"
+#include "duckdb/planner/expression/bound_columnref_expression.hpp"
 #include "duckdb/planner/operator/logical_column_data_get.hpp"
 #include "duckdb/planner/operator/logical_get.hpp"
 #include "duckdb/planner/operator/logical_projection.hpp"
+
+#include <algorithm>
 
 namespace duckdb {
 
@@ -81,8 +84,11 @@ void UnfoldScansIntoPlace(unique_ptr<LogicalOperator> &subtree, const CrossingId
 	}
 }
 
-unique_ptr<LogicalOperator> FoldSubtreeIntoItsFragment(unique_ptr<LogicalOperator> subtree,
-                                                       const CrossingIdentity &identity) {
+namespace {
+
+unique_ptr<LogicalOperator> Fold(unique_ptr<LogicalOperator> subtree, const CrossingIdentity &identity,
+                                 optional_ptr<const FreshTableIndex> fresh,
+                                 optional_ptr<vector<ReplacementBinding>> rewired) {
 	if (CrossingReadFragmentOf(*subtree, identity)) {
 		return subtree;
 	}
@@ -114,6 +120,25 @@ unique_ptr<LogicalOperator> FoldSubtreeIntoItsFragment(unique_ptr<LogicalOperato
 
 	auto &get = host->Cast<LogicalGet>();
 	auto root_index = bindings.empty() ? get.table_index : bindings[0].table_index;
+	auto spans_tables = std::any_of(bindings.begin(), bindings.end(),
+	                                [&](const ColumnBinding &binding) { return binding.table_index != root_index; });
+	if (spans_tables) {
+		if (!fresh) {
+			throw InternalException("crossing: a subtree emitting more than one table's columns needs its readers "
+			                        "rewired");
+		}
+		// A projection under the fresh index keeps the subtree's columns answering to it if the fragment
+		// is unfolded back into place.
+		root_index = (*fresh)();
+		vector<unique_ptr<Expression>> columns;
+		for (idx_t i = 0; i < bindings.size(); i++) {
+			columns.push_back(make_uniq<BoundColumnRefExpression>(types[i], bindings[i]));
+			rewired->emplace_back(bindings[i], ColumnBinding(root_index, i));
+		}
+		auto projection = make_uniq<LogicalProjection>(root_index, std::move(columns));
+		projection->children.push_back(std::move(subtree));
+		subtree = std::move(projection);
+	}
 
 	host_fragment->plan = std::move(subtree);
 	host_fragment->ResolveTypesAndText();
@@ -140,6 +165,19 @@ unique_ptr<LogicalOperator> FoldSubtreeIntoItsFragment(unique_ptr<LogicalOperato
 	get.ResolveOperatorTypes();
 	host_fragment->VerifyInvariants();
 	return host;
+}
+
+} // namespace
+
+unique_ptr<LogicalOperator> FoldSubtreeIntoItsFragment(unique_ptr<LogicalOperator> subtree,
+                                                       const CrossingIdentity &identity) {
+	return Fold(std::move(subtree), identity, nullptr, nullptr);
+}
+
+unique_ptr<LogicalOperator> FoldSubtreeIntoItsFragment(unique_ptr<LogicalOperator> subtree,
+                                                       const CrossingIdentity &identity, const FreshTableIndex &fresh,
+                                                       vector<ReplacementBinding> &rewired) {
+	return Fold(std::move(subtree), identity, &fresh, &rewired);
 }
 
 } // namespace duckdb
