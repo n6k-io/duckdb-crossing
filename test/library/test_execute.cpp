@@ -10,6 +10,7 @@
 #include "duckdb/parser/expression/conjunction_expression.hpp"
 #include "duckdb/parser/expression/constant_expression.hpp"
 #include "duckdb/parser/expression/function_expression.hpp"
+#include "duckdb/parser/parser.hpp"
 #include "duckdb/parser/statement/relation_statement.hpp"
 #include "duckdb/parser/statement/update_statement.hpp"
 #include "duckdb/planner/operator/logical_get.hpp"
@@ -186,6 +187,29 @@ TEST_CASE("BindFloors needs a transaction", "[execute]") {
 	auto plan = FloorOver(con, 0, "orders");
 
 	REQUIRE_THROWS_WITH(BindFloors(*con.context, plan, STORE_CATALOG), Catch::Contains("transaction"));
+}
+
+TEST_CASE("PendingCrossingPlan streams when asked to", "[execute]") {
+	Twin twin(Transport::NATIVE);
+	auto &con = twin.store->con;
+	REQUIRE(!con.Query("SET threads = 1")->HasError());
+	con.BeginTransaction();
+
+	// Rows past the first five million raise, so only a plan that streams hands back its first chunk.
+	Parser parser;
+	parser.ParseQuery(
+	    "SELECT CASE WHEN i < 5000000 THEN i ELSE error('materialized')::BIGINT END FROM range(10000000) t(i)");
+	Planner planner(*con.context);
+	planner.CreatePlan(std::move(parser.statements[0]));
+	auto pending = PendingCrossingPlan(*con.context, std::move(planner.plan), true);
+	REQUIRE(!pending->HasError());
+	auto result = pending->Execute();
+	REQUIRE(!result->HasError());
+	auto chunk = result->Fetch();
+	REQUIRE(chunk);
+	REQUIRE(chunk->size() > 0);
+	result.reset();
+	con.Rollback();
 }
 
 TEST_CASE("ExecuteWrite deletes the rows the seam names", "[execute]") {

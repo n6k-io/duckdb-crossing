@@ -42,6 +42,8 @@ void NarrowEveryFragmentToItsScan(LogicalOperator &node, const FreshTableIndex &
 	}
 }
 
+} // namespace
+
 bool PlanHoldsCrossing(LogicalOperator &op, const CrossingIdentity &identity) {
 	if (CrossingReadFragmentOf(op, identity)) {
 		return true;
@@ -53,8 +55,6 @@ bool PlanHoldsCrossing(LogicalOperator &op, const CrossingIdentity &identity) {
 	}
 	return false;
 }
-
-} // namespace
 
 void NarrowScansToRequestedColumns(unique_ptr<LogicalOperator> &plan, const CrossingIdentity &identity) {
 	if (auto fragment = CrossingReadFragmentOf(*plan, identity)) {

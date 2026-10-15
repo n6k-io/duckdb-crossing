@@ -163,10 +163,6 @@ TEST_CASE("an update sets the values its FROM rows carry", "[writes]") {
 	auto from = GENERATE(as<string> {}, "staged", "(SELECT 2 AS id, 'changed' AS name) staged",
 	                     "(VALUES (2, 'changed')) staged(id, name)");
 	INFO(from);
-	if (transport == Transport::SUBSTRAIT && StringUtil::StartsWith(from, "(VALUES")) {
-		// Substrait has no operator for a VALUES list.
-		return;
-	}
 	Twin twin(transport);
 	twin.Seed();
 	twin.Query("CREATE TABLE staged(id INTEGER, name VARCHAR)");

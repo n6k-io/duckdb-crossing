@@ -13,8 +13,9 @@ struct ShapedWrite {
 	SeamFill split;
 };
 
-ShapedWrite ShapeBoundWrite(unique_ptr<LogicalOperator> &plan, vector<LogicalType> seam_types,
+ShapedWrite ShapeBoundWrite(Bound &env, unique_ptr<LogicalOperator> &plan, vector<LogicalType> seam_types,
                             vector<column_t> key_columns = {}) {
+	MaterialiseConstantRows(*env.con.context, plan->children[0]);
 	ShapedWrite shaped;
 	shaped.fragment = FragmentOverSeam(std::move(seam_types));
 	auto fresh = TestIndices();
@@ -91,10 +92,10 @@ TEST_CASE("INSERT INTO t VALUES (1, 2)", "[bound][split]") {
 	auto plan = env.Bind("INSERT INTO t VALUES (1, 2)");
 	REQUIRE_PLAN(plan, "insert | proj{id, amt} | rows | local");
 
-	auto shaped = ShapeBoundWrite(plan, {LogicalType::INTEGER, LogicalType::INTEGER});
+	auto shaped = ShapeBoundWrite(env, plan, {LogicalType::INTEGER, LogicalType::INTEGER});
 
 	REQUIRE(!shaped.split.remainder);
-	REQUIRE_FRAGMENT(*shaped.fragment, "proj{c0, c1} | proj{id, amt} | proj{id, amt} | rows | scan");
+	REQUIRE_FRAGMENT(*shaped.fragment, "proj{c0, c1} | proj{id, amt} | proj{id, amt} | rows");
 }
 
 TEST_CASE("INSERT INTO t VALUES (1, 2), (3, 4)", "[bound][split]") {
@@ -103,10 +104,10 @@ TEST_CASE("INSERT INTO t VALUES (1, 2), (3, 4)", "[bound][split]") {
 	auto plan = env.Bind("INSERT INTO t VALUES (1, 2), (3, 4)");
 	REQUIRE_PLAN(plan, "insert | proj{id, amt} | rows | local");
 
-	auto shaped = ShapeBoundWrite(plan, {LogicalType::INTEGER, LogicalType::INTEGER});
+	auto shaped = ShapeBoundWrite(env, plan, {LogicalType::INTEGER, LogicalType::INTEGER});
 
 	REQUIRE(!shaped.split.remainder);
-	REQUIRE_FRAGMENT(*shaped.fragment, "proj{c0, c1} | proj{id, amt} | proj{id, amt} | rows | scan");
+	REQUIRE_FRAGMENT(*shaped.fragment, "proj{c0, c1} | proj{id, amt} | proj{id, amt} | rows");
 }
 
 TEST_CASE("INSERT INTO t SELECT id, amt FROM memory_source()", "[bound][split]") {
@@ -118,7 +119,7 @@ TEST_CASE("INSERT INTO t SELECT id, amt FROM memory_source()", "[bound][split]")
 	FoldCrossableWorkIntoFragments(plan, TestIndices(), MemoryIdentity());
 	REQUIRE_PLAN(plan, "insert | crossing[proj{id, amt} | proj{id, amt} | scan]");
 
-	auto shaped = ShapeBoundWrite(plan, {LogicalType::INTEGER, LogicalType::INTEGER});
+	auto shaped = ShapeBoundWrite(env, plan, {LogicalType::INTEGER, LogicalType::INTEGER});
 
 	REQUIRE(!shaped.split.remainder);
 	REQUIRE_FRAGMENT(*shaped.fragment, "proj{c0, c1} | proj{c0, c1} | proj{id, amt} | proj{id, amt} | scan");
@@ -131,7 +132,7 @@ TEST_CASE("UPDATE t SET amt = 1 WHERE id = 2", "[bound][split]") {
 	REQUIRE_PLAN(plan, "update{#[1.0]} | proj{CAST(1 AS INTEGER), rowid} | "
 	                   "filter{id = CAST(2 AS INTEGER)} | local");
 
-	auto shaped = ShapeBoundWrite(plan, {LogicalType::BIGINT, LogicalType::INTEGER}, {0});
+	auto shaped = ShapeBoundWrite(env, plan, {LogicalType::BIGINT, LogicalType::INTEGER}, {0});
 
 	REQUIRE_PLAN(shaped.split.remainder, "local");
 	REQUIRE_FRAGMENT(*shaped.fragment, "proj{c0, c1} | proj{rowid, CAST(1 AS INTEGER)} | "
@@ -145,7 +146,7 @@ TEST_CASE("DELETE FROM t WHERE id = 2", "[bound][split]") {
 	auto plan = env.Bind("DELETE FROM t WHERE id = 2");
 	REQUIRE_PLAN(plan, "delete{rowid} | filter{id = CAST(2 AS INTEGER)} | local");
 
-	auto shaped = ShapeBoundWrite(plan, {LogicalType::BIGINT}, {0});
+	auto shaped = ShapeBoundWrite(env, plan, {LogicalType::BIGINT}, {0});
 
 	REQUIRE_PLAN(shaped.split.remainder, "local");
 	REQUIRE_FRAGMENT(*shaped.fragment, "proj{c0} | proj{rowid} | filter{id = CAST(2 AS INTEGER)} | seam");

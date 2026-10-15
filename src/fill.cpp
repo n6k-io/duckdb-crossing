@@ -6,11 +6,16 @@
 #include "internal/labelling.hpp"
 #include "internal/rules.hpp"
 #include "internal/seam.hpp"
+#include "internal/source_evaluation.hpp"
 
 #include "duckdb/common/string_util.hpp"
+#include "duckdb/common/types/column/column_data_collection.hpp"
+#include "duckdb/execution/expression_executor.hpp"
 #include "duckdb/optimizer/column_binding_replacer.hpp"
 #include "duckdb/planner/expression/bound_columnref_expression.hpp"
+#include "duckdb/planner/operator/logical_column_data_get.hpp"
 #include "duckdb/planner/operator/logical_delete.hpp"
+#include "duckdb/planner/operator/logical_expression_get.hpp"
 #include "duckdb/planner/operator/logical_get.hpp"
 #include "duckdb/planner/operator/logical_insert.hpp"
 #include "duckdb/planner/operator/logical_projection.hpp"
@@ -177,6 +182,17 @@ CrossingFeed DeleteFeed(LogicalDelete &del, const vector<column_t> &key_columns,
 	return result;
 }
 
+bool IsConstantRows(const LogicalExpressionGet &get) {
+	for (auto &row : get.expressions) {
+		for (auto &expr : row) {
+			if (!expr->IsFoldable() || !IsColumnFreeExpression(*expr)) {
+				return false;
+			}
+		}
+	}
+	return true;
+}
+
 string WhyItStays(LogicalOperator &node, CrossingSource &source) {
 	auto &identity = source.Identity();
 	auto name = StringUtil::Lower(LogicalOperatorToString(node.type));
@@ -282,6 +298,36 @@ SeamFill FillSeamFromFeed(unique_ptr<LogicalOperator> feed, CrossingFragment &fr
 	RejoinAdjacentFiltersEverywhere(fragment.plan, identity);
 	fragment.ResolveTypesAndText();
 	return fill;
+}
+
+void MaterialiseConstantRows(ClientContext &context, unique_ptr<LogicalOperator> &node) {
+	for (auto &child : node->children) {
+		MaterialiseConstantRows(context, child);
+	}
+	if (node->type != LogicalOperatorType::LOGICAL_EXPRESSION_GET) {
+		return;
+	}
+	auto &get = node->Cast<LogicalExpressionGet>();
+	if (!IsConstantRows(get)) {
+		return;
+	}
+	auto collection = make_uniq<ColumnDataCollection>(Allocator::DefaultAllocator(), get.expr_types);
+	DataChunk chunk;
+	chunk.Initialize(Allocator::DefaultAllocator(), get.expr_types);
+	for (auto &row : get.expressions) {
+		if (chunk.size() == STANDARD_VECTOR_SIZE) {
+			collection->Append(chunk);
+			chunk.Reset();
+		}
+		for (idx_t c = 0; c < row.size(); c++) {
+			chunk.SetValue(c, chunk.size(), ExpressionExecutor::EvaluateScalar(context, *row[c]));
+		}
+		chunk.SetCardinality(chunk.size() + 1);
+	}
+	if (chunk.size() > 0) {
+		collection->Append(chunk);
+	}
+	node = make_uniq<LogicalColumnDataGet>(get.table_index, get.expr_types, std::move(collection));
 }
 
 } // namespace duckdb

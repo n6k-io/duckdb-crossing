@@ -22,6 +22,4 @@ idx_t TableIndexOf(LogicalOperator &op);
 
 vector<string> SetColumnsOf(LogicalOperator &op, TableCatalogEntry &table);
 
-void MaterialiseConstantRows(ClientContext &context, unique_ptr<LogicalOperator> &node);
-
 } // namespace duckdb

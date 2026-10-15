@@ -16,6 +16,8 @@ namespace duckdb {
 void FoldCrossableWorkIntoFragments(unique_ptr<LogicalOperator> &plan, const FreshTableIndex &fresh,
                                     const CrossingIdentity &identity);
 
+bool PlanHoldsCrossing(LogicalOperator &op, const CrossingIdentity &identity);
+
 //! Wire into the optimizer's post hook: it runs after duckdb has dropped the columns nobody reads.
 void NarrowScansToRequestedColumns(unique_ptr<LogicalOperator> &plan, const CrossingIdentity &identity);
 

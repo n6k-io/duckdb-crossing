@@ -92,7 +92,7 @@ RuleKind RuleKindFor(LogicalOperatorType type) {
 }
 
 bool IsMaterialisedRows(LogicalOperatorType type) {
-	return type == LogicalOperatorType::LOGICAL_CHUNK_GET || type == LogicalOperatorType::LOGICAL_EXPRESSION_GET;
+	return type == LogicalOperatorType::LOGICAL_CHUNK_GET;
 }
 
 //! A limit's bound is not in `expressions`, so it is checked here rather than by CanEvaluateAll.
