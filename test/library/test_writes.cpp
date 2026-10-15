@@ -157,6 +157,25 @@ TEST_CASE("an update that sets a key column from another column lands", "[writes
 	REQUIRE(Scalar(twin, "SELECT amt FROM orders WHERE id = 2") == Value::INTEGER(151));
 }
 
+TEST_CASE("an update sets the values its FROM rows carry", "[writes]") {
+	auto transport = EACH_TRANSPORT();
+	INFO(TransportName(transport));
+	auto from = GENERATE(as<string> {}, "staged", "(SELECT 2 AS id, 'changed' AS name) staged",
+	                     "(VALUES (2, 'changed')) staged(id, name)");
+	INFO(from);
+	Twin twin(transport);
+	twin.Seed();
+	twin.Query("CREATE TABLE staged(id INTEGER, name VARCHAR)");
+	twin.Query("INSERT INTO staged VALUES (2, 'changed')");
+
+	auto result = twin.Query("UPDATE far.orders SET name = staged.name FROM " + from + " WHERE orders.id = staged.id");
+
+	REQUIRE(result->GetValue(0, 0) == Value::BIGINT(1));
+	REQUIRE(Scalar(twin, "SELECT name FROM orders WHERE id = 2") == Value("changed"));
+	REQUIRE(Scalar(twin, "SELECT name FROM orders WHERE id = 1") == Value("alpha"));
+	REQUIRE(Scalar(twin, "SELECT count(*) FROM orders WHERE name = 'changed'") == Value::BIGINT(1));
+}
+
 TEST_CASE("a delete addresses rows by the key and reports what the source removed", "[writes]") {
 	auto transport = EACH_TRANSPORT();
 	INFO(TransportName(transport));

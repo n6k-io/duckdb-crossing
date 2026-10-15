@@ -271,6 +271,8 @@ public:
 		auto highest = MaxTableIndex(*plan);
 		while (binder.GenerateTableIndex() < highest) {
 		}
+		// The default is to materialize; a statement bound from SQL is marked streamable only by its binder.
+		binder.GetStatementProperties().output_type = QueryResultOutputType::ALLOW_STREAMING;
 		BoundStatement result;
 		result.types = plan->types;
 		for (auto &column : columns) {

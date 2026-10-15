@@ -4,10 +4,13 @@
 #include "duckdb/main/pending_query_result.hpp"
 #include "duckdb/main/query_parameters.hpp"
 #include "duckdb/main/relation.hpp"
+#include "duckdb/parser/expression/case_expression.hpp"
 #include "duckdb/parser/expression/columnref_expression.hpp"
 #include "duckdb/parser/expression/comparison_expression.hpp"
 #include "duckdb/parser/expression/conjunction_expression.hpp"
 #include "duckdb/parser/expression/constant_expression.hpp"
+#include "duckdb/parser/expression/function_expression.hpp"
+#include "duckdb/parser/parser.hpp"
 #include "duckdb/parser/statement/relation_statement.hpp"
 #include "duckdb/parser/statement/update_statement.hpp"
 #include "duckdb/planner/operator/logical_get.hpp"
@@ -186,6 +189,29 @@ TEST_CASE("BindFloors needs a transaction", "[execute]") {
 	REQUIRE_THROWS_WITH(BindFloors(*con.context, plan, STORE_CATALOG), Catch::Contains("transaction"));
 }
 
+TEST_CASE("PendingCrossingPlan streams when asked to", "[execute]") {
+	Twin twin(Transport::NATIVE);
+	auto &con = twin.store->con;
+	REQUIRE(!con.Query("SET threads = 1")->HasError());
+	con.BeginTransaction();
+
+	// Rows past the first five million raise, so only a plan that streams hands back its first chunk.
+	Parser parser;
+	parser.ParseQuery(
+	    "SELECT CASE WHEN i < 5000000 THEN i ELSE error('materialized')::BIGINT END FROM range(10000000) t(i)");
+	Planner planner(*con.context);
+	planner.CreatePlan(std::move(parser.statements[0]));
+	auto pending = PendingCrossingPlan(*con.context, std::move(planner.plan), true);
+	REQUIRE(!pending->HasError());
+	auto result = pending->Execute();
+	REQUIRE(!result->HasError());
+	auto chunk = result->Fetch();
+	REQUIRE(chunk);
+	REQUIRE(chunk->size() > 0);
+	result.reset();
+	con.Rollback();
+}
+
 TEST_CASE("ExecuteWrite deletes the rows the seam names", "[execute]") {
 	Twin twin(Transport::NATIVE);
 	twin.Seed();
@@ -281,6 +307,48 @@ TEST_CASE("ExecuteWrite lets a shaper narrow the statement before it binds", "[e
 	REQUIRE(changed == 1);
 	REQUIRE(Scalar(con, "SELECT amt FROM orders WHERE id = 1") == Value::INTEGER(50));
 	REQUIRE(Scalar(con, "SELECT amt FROM orders WHERE id = 2") == Value::INTEGER(0));
+}
+
+TEST_CASE("ExecuteWrite writes into a crossing table, as a middle hop does", "[execute]") {
+	Twin twin(Transport::NATIVE);
+	twin.Seed();
+	auto &con = twin.con;
+	con.BeginTransaction();
+
+	auto far = [](CrossingVerb verb, vector<string> key_columns, vector<string> set_columns) {
+		auto target = TargetOf(verb, "orders", std::move(key_columns), std::move(set_columns));
+		target.catalog = "far";
+		return target;
+	};
+	// The guard a source puts on a written value, as a row policy's check does.
+	CrossingWriteShaper guarded = [](CrossingWriteStatement &built) {
+		auto &set_info = *built.statement->Cast<UpdateStatement>().set_info;
+		vector<unique_ptr<ParsedExpression>> error_args;
+		error_args.push_back(make_uniq<ConstantExpression>(Value("violates the check")));
+		auto guard = make_uniq<CaseExpression>();
+		CaseCheck branch;
+		branch.when_expr = make_uniq<ConstantExpression>(Value::BOOLEAN(true));
+		branch.then_expr = std::move(set_info.expressions[0]);
+		guard->case_checks.push_back(std::move(branch));
+		guard->else_expr = make_uniq<FunctionExpression>("error", std::move(error_args));
+		set_info.expressions[0] = std::move(guard);
+	};
+	auto update = Rows({LogicalType::INTEGER, LogicalType::INTEGER}, {{Value::INTEGER(2), Value::INTEGER(0)}});
+	auto updated =
+	    ExecuteWrite(*con.context, far(CrossingVerb::UPDATE, {"id"}, {"amt"}), SeamRefOfRows(*update), guarded);
+	auto removed = Rows({LogicalType::INTEGER}, {{Value::INTEGER(3)}});
+	auto deleted = ExecuteWrite(*con.context, far(CrossingVerb::DELETE_, {"id"}, {}), SeamRefOfRows(*removed));
+	auto added = Rows({LogicalType::INTEGER, LogicalType::VARCHAR}, {{Value::INTEGER(6), Value("zeta")}});
+	auto inserted = ExecuteWrite(*con.context, far(CrossingVerb::INSERT, {}, {"id", "name"}), SeamRefOfRows(*added));
+	con.Commit();
+	twin.store->JoinArrivals();
+
+	REQUIRE(updated == 1);
+	REQUIRE(deleted == 1);
+	REQUIRE(inserted == 1);
+	REQUIRE(Scalar(twin.store->con, "SELECT amt FROM orders WHERE id = 2") == Value::INTEGER(0));
+	REQUIRE(Scalar(twin.store->con, "SELECT count(*) FROM orders WHERE id = 3") == Value::BIGINT(0));
+	REQUIRE(Scalar(twin.store->con, "SELECT name FROM orders WHERE id = 6") == Value("zeta"));
 }
 
 TEST_CASE("a NULL key row reaches the source through a crossing and is updated", "[execute]") {

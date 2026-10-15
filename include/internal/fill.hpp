@@ -29,4 +29,7 @@ struct SeamFill {
 SeamFill FillSeamFromFeed(unique_ptr<LogicalOperator> feed, CrossingFragment &fragment, CrossingSource &source,
                           const SeamObstacle &stop, const FreshTableIndex &fresh);
 
+//! Replaces each VALUES list whose expressions are all constant with the rows they evaluate to.
+void MaterialiseConstantRows(ClientContext &context, unique_ptr<LogicalOperator> &node);
+
 } // namespace duckdb

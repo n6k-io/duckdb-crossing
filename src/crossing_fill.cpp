@@ -2,33 +2,19 @@
 
 #include "internal/crossing_write.hpp"
 #include "internal/fill.hpp"
-#include "internal/source_evaluation.hpp"
 
-#include "duckdb/common/types/column/column_data_collection.hpp"
-#include "duckdb/execution/expression_executor.hpp"
 #include "duckdb/parser/column_definition.hpp"
 #include "duckdb/parser/parsed_data/create_table_info.hpp"
-#include "duckdb/planner/operator/logical_column_data_get.hpp"
+#include "duckdb/planner/expression/bound_columnref_expression.hpp"
 #include "duckdb/planner/operator/logical_delete.hpp"
-#include "duckdb/planner/operator/logical_expression_get.hpp"
 #include "duckdb/planner/operator/logical_get.hpp"
 #include "duckdb/planner/operator/logical_insert.hpp"
+#include "duckdb/planner/operator/logical_projection.hpp"
 #include "duckdb/planner/operator/logical_update.hpp"
 
 namespace duckdb {
 
 namespace {
-
-bool IsConstantRows(const LogicalExpressionGet &get) {
-	for (auto &row : get.expressions) {
-		for (auto &expr : row) {
-			if (!expr->IsFoldable() || !IsColumnFreeExpression(*expr)) {
-				return false;
-			}
-		}
-	}
-	return true;
-}
 
 optional_ptr<CrossingTableCatalogEntry> CrossingTableOfWrite(LogicalOperator &op, const CrossingIdentity &identity) {
 	switch (op.type) {
@@ -50,8 +36,24 @@ unique_ptr<LogicalOperator> MakeFence(idx_t table_index, unique_ptr<CrossingBind
 	return std::move(get);
 }
 
+//! The seam insert reads its child by position, but the optimizers that run after this pass reorder by
+//! binding: a build/probe swap of a cross product flips its columns. A projection holds the order.
+unique_ptr<LogicalOperator> InSeamOrder(unique_ptr<LogicalOperator> rows, const FreshTableIndex &fresh) {
+	rows->ResolveOperatorTypes();
+	auto bindings = rows->GetColumnBindings();
+	vector<unique_ptr<Expression>> columns;
+	for (idx_t i = 0; i < bindings.size(); i++) {
+		columns.push_back(make_uniq<BoundColumnRefExpression>(rows->types[i], bindings[i]));
+	}
+	auto projection = make_uniq<LogicalProjection>(fresh(), std::move(columns));
+	projection->children.push_back(std::move(rows));
+	projection->ResolveOperatorTypes();
+	return std::move(projection);
+}
+
 unique_ptr<LogicalOperator> SeamInsert(ClientContext &context, idx_t table_index, unique_ptr<CrossingBindData> write,
-                                       bool returning, vector<idx_t> key_positions, SeamFill fill) {
+                                       bool returning, vector<idx_t> key_positions, SeamFill fill,
+                                       const FreshTableIndex &fresh) {
 	auto &table = write->table;
 	CreateTableInfo info(table.schema, table.name);
 	if (returning) {
@@ -69,7 +71,7 @@ unique_ptr<LogicalOperator> SeamInsert(ClientContext &context, idx_t table_index
 	auto insert = make_uniq<LogicalInsert>(*entry, table_index);
 	insert->return_chunk = returning;
 	insert->expected_types = std::move(fill.seam_types);
-	insert->children.push_back(std::move(fill.remainder));
+	insert->children.push_back(InSeamOrder(std::move(fill.remainder), fresh));
 	return std::move(insert);
 }
 
@@ -116,7 +118,8 @@ void FillWrite(ClientContext &context, unique_ptr<LogicalOperator> &node, const 
 		node = MakeFence(table_index, std::move(write));
 		return;
 	}
-	node = SeamInsert(context, table_index, std::move(write), returning, std::move(key_positions), std::move(fill));
+	node =
+	    SeamInsert(context, table_index, std::move(write), returning, std::move(key_positions), std::move(fill), fresh);
 }
 
 } // namespace
@@ -171,36 +174,6 @@ vector<string> SetColumnsOf(LogicalOperator &op, TableCatalogEntry &table) {
 		out.push_back(table.GetColumns().GetColumn(column_index).GetName());
 	}
 	return out;
-}
-
-void MaterialiseConstantRows(ClientContext &context, unique_ptr<LogicalOperator> &node) {
-	for (auto &child : node->children) {
-		MaterialiseConstantRows(context, child);
-	}
-	if (node->type != LogicalOperatorType::LOGICAL_EXPRESSION_GET) {
-		return;
-	}
-	auto &get = node->Cast<LogicalExpressionGet>();
-	if (!IsConstantRows(get)) {
-		return;
-	}
-	auto collection = make_uniq<ColumnDataCollection>(Allocator::DefaultAllocator(), get.expr_types);
-	DataChunk chunk;
-	chunk.Initialize(Allocator::DefaultAllocator(), get.expr_types);
-	for (auto &row : get.expressions) {
-		if (chunk.size() == STANDARD_VECTOR_SIZE) {
-			collection->Append(chunk);
-			chunk.Reset();
-		}
-		for (idx_t c = 0; c < row.size(); c++) {
-			chunk.SetValue(c, chunk.size(), ExpressionExecutor::EvaluateScalar(context, *row[c]));
-		}
-		chunk.SetCardinality(chunk.size() + 1);
-	}
-	if (chunk.size() > 0) {
-		collection->Append(chunk);
-	}
-	node = make_uniq<LogicalColumnDataGet>(get.table_index, get.expr_types, std::move(collection));
 }
 
 } // namespace duckdb

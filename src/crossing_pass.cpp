@@ -4,6 +4,7 @@
 #include "internal/crossing_read.hpp"
 #include "internal/crossing_table_entry.hpp"
 #include "internal/crossing_write.hpp"
+#include "internal/fill.hpp"
 #include "internal/pass.hpp"
 
 #include "duckdb/optimizer/optimizer.hpp"
@@ -61,6 +62,10 @@ void CrossingFoldPass(OptimizerExtensionInput &input, unique_ptr<LogicalOperator
 	FreshTableIndex fresh = [&binder]() {
 		return binder.GenerateTableIndex();
 	};
+	// A VALUES list crosses only as rows: a source is never asked about the expressions it holds.
+	if (PlanHoldsCrossing(*plan, identity)) {
+		MaterialiseConstantRows(input.context, plan);
+	}
 	ResolveKeyAliases(*plan, identity);
 	AddRowImageForReturning(*plan, identity);
 	FoldCrossableWorkIntoFragments(plan, fresh, identity);

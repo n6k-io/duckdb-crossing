@@ -15,14 +15,15 @@ namespace {
 //! Top-down, so the first labelled node reached is the largest one: everything below it is labelled
 //! too, and folding the biggest is what leaves the least behind.
 void FoldEveryLabelledSubtree(unique_ptr<LogicalOperator> &node, const SubtreeLabels &sources,
-                              const CrossingIdentity &identity) {
+                              const CrossingIdentity &identity, const FreshTableIndex &fresh,
+                              vector<ReplacementBinding> &rewired) {
 	auto label = sources.find(node.get());
 	if (label != sources.end() && label->second.source && !SubtreeHoldsFrozenScan(*node, identity)) {
-		node = FoldSubtreeIntoItsFragment(std::move(node), identity);
+		node = FoldSubtreeIntoItsFragment(std::move(node), identity, fresh, rewired);
 		return;
 	}
 	for (auto &child : node->children) {
-		FoldEveryLabelledSubtree(child, sources, identity);
+		FoldEveryLabelledSubtree(child, sources, identity, fresh, rewired);
 	}
 }
 
@@ -41,6 +42,8 @@ void NarrowEveryFragmentToItsScan(LogicalOperator &node, const FreshTableIndex &
 	}
 }
 
+} // namespace
+
 bool PlanHoldsCrossing(LogicalOperator &op, const CrossingIdentity &identity) {
 	if (CrossingReadFragmentOf(op, identity)) {
 		return true;
@@ -52,8 +55,6 @@ bool PlanHoldsCrossing(LogicalOperator &op, const CrossingIdentity &identity) {
 	}
 	return false;
 }
-
-} // namespace
 
 void NarrowScansToRequestedColumns(unique_ptr<LogicalOperator> &plan, const CrossingIdentity &identity) {
 	if (auto fragment = CrossingReadFragmentOf(*plan, identity)) {
@@ -75,7 +76,13 @@ void FoldCrossableWorkIntoFragments(unique_ptr<LogicalOperator> &plan, const Fre
 	PushFiltersIntoJoinBranches(plan, identity);
 	SplitFiltersAtEvaluableHalf(plan, identity);
 	auto sources = LabelSubtrees(*plan, identity);
-	FoldEveryLabelledSubtree(plan, sources, identity);
+	vector<ReplacementBinding> rewired;
+	FoldEveryLabelledSubtree(plan, sources, identity, fresh, rewired);
+	if (!rewired.empty()) {
+		ColumnBindingReplacer replacer;
+		replacer.replacement_bindings = std::move(rewired);
+		replacer.VisitOperator(*plan);
+	}
 	RejoinAdjacentFiltersEverywhere(plan, identity);
 }
 

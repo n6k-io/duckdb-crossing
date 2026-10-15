@@ -353,3 +353,37 @@ TEST_CASE("a column-free query still reads the source once per row", "[pushdown]
 
 	REQUIRE(twin.LastRead().rows.size() == 5);
 }
+
+TEST_CASE("a join the source runs, read by an expression only the target computes, keeps both sides' columns",
+          "[pushdown]") {
+	auto transport = EACH_TRANSPORT();
+	INFO(TransportName(transport));
+	auto from = GENERATE(as<string> {}, "(SELECT 2 AS id, 'z' AS n) s", "(VALUES (2, 'z')) s(id, n)");
+	INFO(from);
+	Twin twin(transport);
+	twin.store->refused_functions.insert("upper");
+	twin.Seed();
+
+	twin.Same("SELECT upper(s.n) AS u, orders.name FROM far.orders, " + from + " WHERE orders.id = s.id");
+}
+
+TEST_CASE("a VALUES row calling a function only the target has stays on the target", "[pushdown]") {
+	auto transport = EACH_TRANSPORT();
+	INFO(TransportName(transport));
+	Twin twin(transport);
+	twin.Seed();
+	// Volatile, so the planner cannot fold the call away before crossing sees it.
+	ScalarFunction near_only(
+	    "near_only", {LogicalType::VARCHAR}, LogicalType::VARCHAR,
+	    [](DataChunk &args, ExpressionState &, Vector &result) { result.Reference(args.data[0]); });
+	near_only.stability = FunctionStability::VOLATILE;
+	ExtensionLoader loader(*twin.near.instance, "near_only");
+	loader.RegisterFunction(near_only);
+
+	auto result = twin.Query(
+	    "SELECT orders.name, s.n FROM far.orders, (VALUES (2, near_only('z'))) s(id, n) WHERE orders.id = s.id");
+
+	REQUIRE(result->RowCount() == 1);
+	REQUIRE(result->GetValue(0, 0) == Value("beta"));
+	REQUIRE(result->GetValue(1, 0) == Value("z"));
+}
