@@ -59,7 +59,7 @@ SubtreeLabel LabelSubtree(LogicalOperator &op, SubtreeLabels &out, optional_ptr<
 			}
 			continue;
 		}
-		if (agreed.source && agreed.source != child_label.source) {
+		if (agreed.source && agreed.source->Group() != child_label.source->Group()) {
 			agrees = false;
 			continue;
 		}

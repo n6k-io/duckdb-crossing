@@ -413,7 +413,7 @@ optional_ptr<CatalogEntry> CrossingAttach::CreateView(ClientContext &context, Tr
 	ResolveKeyAliases(*bound.plan, identity);
 	FoldCrossableWorkIntoFragments(bound.plan, fresh, identity);
 	auto fragment = CrossingReadFragmentOf(*bound.plan, identity);
-	if (!fragment || fragment->frozen) {
+	if (!fragment || fragment->frozen || CrossingSourceOf(*bound.plan, identity)->Group() != source->Group()) {
 		throw BinderException("crossing: the body of view '%s' does not run wholly on the source", info.view_name);
 	}
 	if (fragment->plan->types.size() != info.names.size()) {

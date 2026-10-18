@@ -197,7 +197,7 @@ string WhyItStays(LogicalOperator &node, CrossingSource &source) {
 	auto &identity = source.Identity();
 	auto name = StringUtil::Lower(LogicalOperatorToString(node.type));
 	if (CrossingReadFragmentOf(node, identity)) {
-		if (CrossingSourceOf(node, identity).get() == &source) {
+		if (CrossingSourceOf(node, identity)->Group() == source.Group()) {
 			return "a frozen scan stays on the target";
 		}
 		return "a read of another source stays on the target";
@@ -251,7 +251,8 @@ SeamFill FillSeamFromFeed(unique_ptr<LogicalOperator> feed, CrossingFragment &fr
 			break;
 		}
 		auto label = labels.find(&node);
-		if (!stop.node && label != labels.end() && (label->second.runs_anywhere || label->second.source == &source) &&
+		if (!stop.node && label != labels.end() &&
+		    (label->second.runs_anywhere || label->second.source->Group() == source.Group()) &&
 		    !SubtreeHoldsFrozenScan(node, identity)) {
 			whole = true;
 			break;

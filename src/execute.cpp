@@ -100,7 +100,7 @@ void BindFloorsBelow(Binder &binder, unique_ptr<LogicalOperator> &op, const stri
 	unique_ptr<TableRef> ref = resolver ? resolver(*floor) : nullptr;
 	if (!ref) {
 		auto base = make_uniq<BaseTableRef>();
-		base->catalog_name = catalog;
+		base->catalog_name = floor->catalog.empty() ? catalog : floor->catalog;
 		base->schema_name = floor->schema;
 		base->table_name = floor->table;
 		ref = std::move(base);

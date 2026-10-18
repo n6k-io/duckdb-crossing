@@ -26,6 +26,7 @@ struct ToyDB {
 
 	unique_ptr<Session> Begin(ClientContext &context);
 	void Detach(ClientContext &context);
+	const void *Group();
 };
 
 struct ToySession {
@@ -51,6 +52,7 @@ default when absent:
 | `AcceptsType` | no expression crosses |
 | `AcceptsOperator` | every operator accepted |
 | `Detach` | nothing |
+| `Group` | the source is its own group |
 | `Session::Write` | no table may declare a write verb; one that does is refused at first use |
 | `Session::Ddl` | no table may declare `ALTER` or `DROP`, no schema `CREATE`; one that does is refused at first use |
 | `Session::Tables`, `Session::Describe` | the source's `Tables` and `Describe` |
@@ -173,6 +175,24 @@ carrying it on the target.
 - `AcceptsOperator` — asked per operator after its expressions passed.
 
 A yes claims the source computes the expression as DuckDB does.
+
+## Group
+
+Attaches whose sources return one non-null `Group()` cross together: a join or
+view body over them folds into one fragment, planned by whichever source owns
+its first scan. Return one group only for sources that answer `Accepts*` alike.
+A view's body must be in the group of the attach that holds the view.
+
+The fragment is read through one attach's session, so each floor must say where
+its table lives: pass `catalog` to `MakeFloorNode` when the group spans
+catalogs. Substrait then names the table `[catalog, schema, table]`, and
+`BindFloors` binds it there instead of in the receiver's catalog. A receiver
+decoding Substrait checks those catalogs with the `check` argument of
+`DecodeSubstraitJson` / `DecodeSubstraitView`.
+
+The session is the first scan's attach's, unless the transaction has written to
+another attach in the fragment. That attach's session is used instead, so the
+read sees the write.
 
 ## Read
 

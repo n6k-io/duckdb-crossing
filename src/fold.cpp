@@ -108,15 +108,36 @@ unique_ptr<LogicalOperator> Fold(unique_ptr<LogicalOperator> subtree, const Cros
 	// given that same index by AdoptTableIndex -- so the splices need no rewriting.
 	unique_ptr<LogicalOperator> host;
 	optional_ptr<CrossingFragment> host_fragment;
+	optional_ptr<CrossingSource> host_source;
+	vector<reference<CrossingSource>> folded_sources;
+	auto fold_source = [&](CrossingSource &source) {
+		if (&source == host_source.get()) {
+			return;
+		}
+		for (auto &seen : folded_sources) {
+			if (&seen.get() == &source) {
+				return;
+			}
+		}
+		folded_sources.emplace_back(source);
+	};
 	for (auto slot : slots) {
 		auto scan = std::move(*slot);
 		auto fragment = CrossingReadFragmentOf(*scan, identity);
+		if (!host_source) {
+			host_source = CrossingSourceOf(*scan, identity);
+		}
+		fold_source(*CrossingSourceOf(*scan, identity));
+		for (auto &source : fragment->folded_sources) {
+			fold_source(source);
+		}
 		*slot = std::move(fragment->plan);
 		if (!host) {
 			host = std::move(scan);
 			host_fragment = fragment;
 		}
 	}
+	host_fragment->folded_sources = std::move(folded_sources);
 
 	auto &get = host->Cast<LogicalGet>();
 	auto root_index = bindings.empty() ? get.table_index : bindings[0].table_index;

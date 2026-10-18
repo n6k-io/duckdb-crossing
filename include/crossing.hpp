@@ -141,6 +141,8 @@ struct CrossingDdl {
 vector<string> CrossingViewColumnNames(const CreateViewInfo &view);
 
 struct CrossingTableUse {
+	//! Empty unless the floor names one.
+	string catalog;
 	string schema;
 	string table;
 	//! Indexes into the table's columns, in the order Describe declared them.
@@ -148,13 +150,15 @@ struct CrossingTableUse {
 };
 
 struct CrossingFloor {
+	//! Empty: the catalog the receiver binds in. Set by a source whose group spans catalogs.
+	string catalog;
 	string schema;
 	string table;
 	vector<string> column_names;
 };
 
 unique_ptr<LogicalOperator> MakeFloorNode(idx_t table_index, string schema, string table, vector<string> column_names,
-                                          vector<LogicalType> column_types);
+                                          vector<LogicalType> column_types, string catalog = string());
 unique_ptr<LogicalOperator> MakeFloorNode(string schema, string table, vector<string> column_names,
                                           vector<LogicalType> column_types);
 
@@ -208,8 +212,8 @@ optional_ptr<const ColumnDataCollection> SeamRowsOf(const LogicalOperator &op);
 using CrossingFloorResolver = std::function<unique_ptr<TableRef>(const CrossingFloor &)>;
 
 //! Replaces every floor in `plan` with the table it names, bound on `context`, which must have a
-//! transaction open. Each floor keeps its table index and column bindings. A table whose columns no
-//! longer match the floor is a CatalogException.
+//! transaction open. A floor naming no catalog is bound in `catalog`. Each floor keeps its table index and column
+//! bindings. A table whose columns no longer match the floor is a CatalogException.
 void BindFloors(ClientContext &context, unique_ptr<LogicalOperator> &plan, const string &catalog,
                 const CrossingFloorResolver &resolver = nullptr);
 
@@ -403,6 +407,12 @@ public:
 		return CrossingVerdict::Yes();
 	}
 
+	//! Sources with one group serve one store through one transport, so a plan may join them. They
+	//! must answer the Accepts* calls alike.
+	virtual const void *Group() const {
+		return this;
+	}
+
 	virtual unique_ptr<CrossingSession> Begin(ClientContext &context) = 0;
 	virtual void Detach(ClientContext &context) {
 	}
@@ -508,6 +518,7 @@ CROSSING_MEMBER(AcceptsOperator, "CrossingVerdict AcceptsOperator(const LogicalO
                 const LogicalOperator &);
 CROSSING_MEMBER(Begin, "unique_ptr<Session> Begin(ClientContext &context)", unique_ptr<SessionOf<T>>, ClientContext &);
 CROSSING_MEMBER(Detach, "void Detach(ClientContext &context)", void, ClientContext &);
+CROSSING_MEMBER(Group, "const void *Group()", const void *);
 CROSSING_MEMBER(Read, "CrossingScan Read(ClientContext &context, const CrossingQuery &query)", CrossingScan,
                 ClientContext &, const CrossingQuery &);
 CROSSING_MEMBER(Write, "CrossingWriter Write(ClientContext &context, const CrossingQuery &query)", CrossingWriter,
@@ -529,7 +540,8 @@ struct SourceContract : CheckTables<S, true>,
                         CheckAcceptsCall<S, false>,
                         CheckAcceptsType<S, false>,
                         CheckAcceptsOperator<S, false>,
-                        CheckDetach<S, false> {
+                        CheckDetach<S, false>,
+                        CheckGroup<S, false> {
 	static_assert(!std::is_final<S>::value, "crossing: a source type must not be final");
 	static_assert(!std::is_void<SessionOf<S>>::value, "crossing: S needs `using Session = <your session type>;`");
 };
@@ -639,6 +651,14 @@ void DetachOn(S &source, ClientContext &context, std::true_type) {
 }
 template <class S>
 void DetachOn(S &, ClientContext &, std::false_type) {
+}
+template <class S>
+const void *GroupOn(S &source, std::true_type) {
+	return source.Group();
+}
+template <class S>
+const void *GroupOn(S &, std::false_type) {
+	return nullptr;
 }
 
 } // namespace crossing_contract
@@ -753,6 +773,10 @@ public:
 	}
 	void Detach(ClientContext &context) override {
 		crossing_contract::DetachOn(*source, context, crossing_contract::HasDetach<S> {});
+	}
+	const void *Group() const override {
+		auto group = crossing_contract::GroupOn(*source, crossing_contract::HasGroup<S> {});
+		return group ? group : this;
 	}
 
 private:

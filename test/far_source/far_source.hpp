@@ -1,6 +1,7 @@
 #pragma once
 
 #include "crossing.hpp"
+#include "crossing_substrait.hpp"
 
 #include "duckdb.hpp"
 #include "duckdb/common/case_insensitive_map.hpp"
@@ -62,6 +63,8 @@ struct FarStore {
 	vector<FarCall> reads;
 	vector<FarCall> writes;
 	vector<FarDdl> ddls;
+	//! Interned `GROUP` attach options; an element's address is the group of every attach naming it.
+	set<string> groups;
 	vector<string> attached_paths;
 	vector<string> detached_paths;
 	vector<string> transaction_ends;
@@ -85,6 +88,8 @@ struct FarStore {
 	idx_t readers_closed = 0;
 	//! Runs at the start of Schemas ("schemas") and Describe ("describe"), outside `lock`.
 	std::function<void(const string &call)> on_source_call;
+	//! Handed to the Substrait decode of every received plan.
+	SubstraitCatalogCheck catalog_check;
 
 	void JoinArrivals();
 	const FarCall &LastRead();
@@ -93,7 +98,7 @@ struct FarStore {
 
 class FarSession {
 public:
-	explicit FarSession(shared_ptr<FarStore> store);
+	FarSession(shared_ptr<FarStore> store, string catalog);
 	~FarSession();
 
 	CrossingScan Read(ClientContext &context, const CrossingQuery &query);
@@ -114,6 +119,7 @@ private:
 	FarCall Record(const CrossingQuery &query);
 
 	shared_ptr<FarStore> store;
+	string catalog;
 	mutex far_lock;
 	Connection far;
 };
@@ -122,27 +128,33 @@ class FarSource {
 public:
 	using Session = FarSession;
 
-	FarSource(shared_ptr<FarStore> store, string path);
+	//! `catalog` is the store's catalog this attach serves; naming one puts it in every floor.
+	FarSource(shared_ptr<FarStore> store, string path, const string &group = "", const string &catalog = "");
 
 	vector<string> Schemas();
 	vector<string> Tables(const string &schema);
 	CrossingTable Describe(const string &schema, const string &name);
 	CrossingSchema DescribeSchema(const string &schema);
-	static vector<string> TablesOn(Connection &con, const string &schema);
-	static bool IsView(Connection &con, const string &schema, const string &name);
-	static CrossingTable DescribeOn(FarStore &store, Connection &con, const string &schema, const string &name);
+	static vector<string> TablesOn(Connection &con, const string &catalog, const string &schema);
+	static bool IsView(Connection &con, const string &catalog, const string &schema, const string &name);
+	static CrossingTable DescribeOn(FarStore &store, Connection &con, const string &catalog, const string &schema,
+	                                const string &name);
 	CrossingPlan Plan(const CrossingPlanRequest &request);
 	CrossingVerdict AcceptsCall(const Expression &expr);
 	CrossingVerdict AcceptsType(const LogicalType &type);
 	CrossingVerdict AcceptsOperator(const LogicalOperator &op);
 	unique_ptr<FarSession> Begin(ClientContext &context);
 	void Detach(ClientContext &context);
+	const void *Group();
 
 	static void Register(ExtensionLoader &loader, shared_ptr<FarStore> store);
 
 private:
 	shared_ptr<FarStore> store;
 	string path;
+	const string *group = nullptr;
+	string catalog;
+	string floor_catalog;
 };
 
 } // namespace duckdb

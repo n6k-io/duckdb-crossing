@@ -207,9 +207,18 @@ const FarCall &FarStore::LastWrite() {
 	return writes.back();
 }
 
-FarSource::FarSource(shared_ptr<FarStore> store_p, string path_p) : store(std::move(store_p)), path(std::move(path_p)) {
+FarSource::FarSource(shared_ptr<FarStore> store_p, string path_p, const string &group_p, const string &catalog_p)
+    : store(std::move(store_p)), path(std::move(path_p)), catalog(catalog_p.empty() ? FAR_CATALOG : catalog_p),
+      floor_catalog(catalog_p) {
 	lock_guard<mutex> guard(store->lock);
 	store->attached_paths.push_back(path);
+	if (!group_p.empty()) {
+		group = &*store->groups.insert(group_p).first;
+	}
+}
+
+const void *FarSource::Group() {
+	return group;
 }
 
 void FarSource::Detach(ClientContext &) {
@@ -222,9 +231,8 @@ vector<string> FarSource::Schemas() {
 		store->on_source_call("schemas");
 	}
 	lock_guard<mutex> guard(store->lock);
-	auto result =
-	    store->con.Query("SELECT schema_name FROM duckdb_schemas() WHERE database_name = '" + string(FAR_CATALOG) +
-	                     "' AND schema_name NOT IN ('information_schema', 'pg_catalog') ORDER BY 1");
+	auto result = store->con.Query("SELECT schema_name FROM duckdb_schemas() WHERE database_name = '" + catalog +
+	                               "' AND schema_name NOT IN ('information_schema', 'pg_catalog') ORDER BY 1");
 	vector<string> names;
 	for (auto &row : RowsOf(*result)) {
 		names.push_back(row[0].GetValue<string>());
@@ -232,12 +240,11 @@ vector<string> FarSource::Schemas() {
 	return names;
 }
 
-vector<string> FarSource::TablesOn(Connection &con, const string &schema) {
-	auto prepared = con.Prepare("SELECT table_name FROM duckdb_tables() WHERE database_name = '" + string(FAR_CATALOG) +
-	                            "' AND schema_name = ? UNION ALL SELECT view_name FROM duckdb_views() WHERE "
-	                            "database_name = '" +
-	                            string(FAR_CATALOG) + "' AND schema_name = ? AND NOT internal ORDER BY 1");
-	vector<Value> args {Value(schema), Value(schema)};
+vector<string> FarSource::TablesOn(Connection &con, const string &catalog, const string &schema) {
+	auto prepared = con.Prepare("SELECT table_name FROM duckdb_tables() WHERE database_name = ? AND schema_name = ? "
+	                            "UNION ALL SELECT view_name FROM duckdb_views() WHERE database_name = ? AND "
+	                            "schema_name = ? AND NOT internal ORDER BY 1");
+	vector<Value> args {Value(catalog), Value(schema), Value(catalog), Value(schema)};
 	auto result = prepared->Execute(args, false);
 	vector<string> names;
 	for (auto &row : RowsOf(*result)) {
@@ -249,23 +256,24 @@ vector<string> FarSource::TablesOn(Connection &con, const string &schema) {
 vector<string> FarSource::Tables(const string &schema) {
 	lock_guard<mutex> guard(store->lock);
 	store->listings[schema]++;
-	return TablesOn(store->con, schema);
+	return TablesOn(store->con, catalog, schema);
 }
 
-bool FarSource::IsView(Connection &con, const string &schema, const string &name) {
-	auto prepared = con.Prepare("SELECT count(*) FROM duckdb_views() WHERE database_name = '" + string(FAR_CATALOG) +
-	                            "' AND schema_name = ? AND view_name = ?");
-	vector<Value> args {Value(schema), Value(name)};
+bool FarSource::IsView(Connection &con, const string &catalog, const string &schema, const string &name) {
+	auto prepared = con.Prepare(
+	    "SELECT count(*) FROM duckdb_views() WHERE database_name = ? AND schema_name = ? AND view_name = ?");
+	vector<Value> args {Value(catalog), Value(schema), Value(name)};
 	return RowsOf(*prepared->Execute(args, false))[0][0].GetValue<int64_t>() > 0;
 }
 
-CrossingTable FarSource::DescribeOn(FarStore &store, Connection &con, const string &schema, const string &name) {
+CrossingTable FarSource::DescribeOn(FarStore &store, Connection &con, const string &catalog, const string &schema,
+                                    const string &name) {
 	CrossingTable table;
 	table.name = name;
-	if (IsView(con, schema, name)) {
-		auto result =
-		    con.Query("SELECT * FROM " + string(FAR_CATALOG) + "." + KeywordHelper::WriteOptionallyQuoted(schema) +
-		              "." + KeywordHelper::WriteOptionallyQuoted(name) + " LIMIT 0");
+	if (IsView(con, catalog, schema, name)) {
+		auto result = con.Query("SELECT * FROM " + KeywordHelper::WriteOptionallyQuoted(catalog) + "." +
+		                        KeywordHelper::WriteOptionallyQuoted(schema) + "." +
+		                        KeywordHelper::WriteOptionallyQuoted(name) + " LIMIT 0");
 		if (result->HasError()) {
 			result->ThrowError();
 		}
@@ -277,7 +285,7 @@ CrossingTable FarSource::DescribeOn(FarStore &store, Connection &con, const stri
 		                                         : vector<CrossingVerb> {CrossingVerb::SELECT, CrossingVerb::DROP};
 		return table;
 	}
-	auto description = con.TableInfo(FAR_CATALOG, schema, name);
+	auto description = con.TableInfo(catalog, schema, name);
 	if (!description) {
 		throw CatalogException("far: no table '%s.%s'", schema, name);
 	}
@@ -288,9 +296,9 @@ CrossingTable FarSource::DescribeOn(FarStore &store, Connection &con, const stri
 	if (key != store.keys.end()) {
 		table.key = key->second;
 	} else {
-		auto prepared = con.Prepare("SELECT constraint_column_names FROM duckdb_constraints() WHERE schema_name "
-		                            "= ? AND table_name = ? AND constraint_type = 'PRIMARY KEY'");
-		vector<Value> args {Value(schema), Value(name)};
+		auto prepared = con.Prepare("SELECT constraint_column_names FROM duckdb_constraints() WHERE database_name "
+		                            "= ? AND schema_name = ? AND table_name = ? AND constraint_type = 'PRIMARY KEY'");
+		vector<Value> args {Value(catalog), Value(schema), Value(name)};
 		auto rows = RowsOf(*prepared->Execute(args, false));
 		if (!rows.empty()) {
 			for (auto &column : ListValue::GetChildren(rows[0][0])) {
@@ -315,7 +323,7 @@ CrossingTable FarSource::Describe(const string &schema, const string &name) {
 		store->on_source_call("describe");
 	}
 	lock_guard<mutex> guard(store->lock);
-	return DescribeOn(*store, store->con, schema, name);
+	return DescribeOn(*store, store->con, catalog, schema, name);
 }
 
 CrossingSchema FarSource::DescribeSchema(const string &schema) {
@@ -336,8 +344,8 @@ CrossingPlan FarSource::Plan(const CrossingPlanRequest &request) {
 	}
 	if (request.verb == CrossingVerb::SELECT) {
 		auto &described = *request.described;
-		return CrossingPlan::Of(
-		    MakeFloorNode(0, request.schema, request.table, described.column_names, described.column_types));
+		return CrossingPlan::Of(MakeFloorNode(0, request.schema, request.table, described.column_names,
+		                                      described.column_types, floor_catalog));
 	}
 	return CrossingPlan::Of(MakeSeamNode(0, request.seam.types));
 }
@@ -398,15 +406,21 @@ CrossingVerdict FarSource::AcceptsOperator(const LogicalOperator &op) {
 unique_ptr<FarSession> FarSource::Begin(ClientContext &) {
 	lock_guard<mutex> guard(store->lock);
 	store->sessions_begun++;
-	return make_uniq<FarSession>(store);
+	return make_uniq<FarSession>(store, catalog);
 }
 
 void FarSource::Register(ExtensionLoader &loader, shared_ptr<FarStore> store) {
-	Crossing<FarSource>::Register(
-	    loader, "fardb", [store](ClientContext &, AttachInfo &info) { return make_uniq<FarSource>(store, info.path); });
+	Crossing<FarSource>::Register(loader, "fardb", [store](ClientContext &, AttachInfo &info) {
+		auto option = [&info](const string &name) {
+			auto found = info.options.find(name);
+			return found == info.options.end() ? string() : found->second.ToString();
+		};
+		return make_uniq<FarSource>(store, info.path, option("group"), option("catalog"));
+	});
 }
 
-FarSession::FarSession(shared_ptr<FarStore> store_p) : store(std::move(store_p)), far(store->db) {
+FarSession::FarSession(shared_ptr<FarStore> store_p, string catalog_p)
+    : store(std::move(store_p)), catalog(std::move(catalog_p)), far(store->db) {
 	far.BeginTransaction();
 }
 
@@ -418,13 +432,13 @@ FarSession::~FarSession() {
 
 vector<string> FarSession::Tables(const string &schema) {
 	lock_guard<mutex> guard(far_lock);
-	return FarSource::TablesOn(far, schema);
+	return FarSource::TablesOn(far, catalog, schema);
 }
 
 CrossingTable FarSession::Describe(const string &schema, const string &name) {
 	lock_guard<mutex> guard(far_lock);
 	lock_guard<mutex> store_guard(store->lock);
-	return FarSource::DescribeOn(*store, far, schema, name);
+	return FarSource::DescribeOn(*store, far, catalog, schema, name);
 }
 
 void FarSession::Commit() {
@@ -448,7 +462,7 @@ void FarSession::Ddl(ClientContext &, const CrossingDdl &ddl) {
 			create->info = ReceiveView(ddl.create->Cast<CreateViewInfo>(), *ddl.plan);
 		} else {
 			create->info = ddl.create->Copy();
-			create->info->catalog = FAR_CATALOG;
+			create->info->catalog = catalog;
 		}
 		statement = std::move(create);
 		break;
@@ -456,14 +470,14 @@ void FarSession::Ddl(ClientContext &, const CrossingDdl &ddl) {
 	case CrossingVerb::ALTER: {
 		auto alter = make_uniq<AlterStatement>();
 		alter->info = ddl.alter->Copy();
-		alter->info->catalog = FAR_CATALOG;
+		alter->info->catalog = catalog;
 		statement = std::move(alter);
 		break;
 	}
 	case CrossingVerb::DROP: {
 		auto drop = make_uniq<DropStatement>();
 		drop->info = ddl.drop->Copy();
-		drop->info->catalog = FAR_CATALOG;
+		drop->info->catalog = catalog;
 		statement = std::move(drop);
 		break;
 	}
@@ -486,8 +500,9 @@ void FarSession::Ddl(ClientContext &, const CrossingDdl &ddl) {
 // Over Substrait whatever the transport: a native plan cannot be turned back into a SelectStatement.
 unique_ptr<CreateViewInfo> FarSession::ReceiveView(const CreateViewInfo &view, const LogicalOperator &plan) {
 	lock_guard<mutex> guard(far_lock);
-	auto received = make_uniq<CreateViewInfo>(FAR_CATALOG, view.schema, view.view_name);
-	received->query = DecodeSubstraitView(far, FAR_CATALOG, RenderSubstraitJson(plan), CrossingViewColumnNames(view));
+	auto received = make_uniq<CreateViewInfo>(catalog, view.schema, view.view_name);
+	received->query = DecodeSubstraitView(far, catalog, RenderSubstraitJson(plan), CrossingViewColumnNames(view),
+	                                      store->catalog_check);
 	received->on_conflict = view.on_conflict;
 	return received;
 }
@@ -510,7 +525,7 @@ vector<vector<Value>> FarSession::EvaluateNative(const LogicalOperator &plan, Fa
 	call.wire = SerializeCrossingPlan(plan);
 	auto received = DeserializeCrossingPlan(*far.context, call.wire);
 	call.received_text = received->ToString();
-	BindFloors(*far.context, received, FAR_CATALOG);
+	BindFloors(*far.context, received, catalog);
 	return RowsOf(*RunPlan(far, std::move(received)));
 }
 
@@ -538,7 +553,7 @@ string FarSession::StageSeamRows(const LogicalOperator &plan) {
 
 vector<vector<Value>> FarSession::EvaluateSubstrait(const LogicalOperator &plan, FarCall &call) {
 	call.wire = RenderSubstraitJson(plan);
-	auto rel = DecodeSubstraitJson(far, FAR_CATALOG, call.wire, StageSeamRows(plan));
+	auto rel = DecodeSubstraitJson(far, catalog, call.wire, StageSeamRows(plan), store->catalog_check);
 	call.received_text = rel->ToString();
 	return RowsOf(*rel->Execute());
 }
@@ -601,7 +616,7 @@ idx_t FarSession::Apply(const CrossingQuery &query) {
 		throw InternalException("far: a write names no table");
 	}
 	CrossingWriteTarget target;
-	target.catalog = FAR_CATALOG;
+	target.catalog = catalog;
 	target.schema = query.written.schema;
 	target.table = query.written.table;
 	target.verb = query.kind;
@@ -612,10 +627,11 @@ idx_t FarSession::Apply(const CrossingQuery &query) {
 	}
 	if (store->transport == Transport::NATIVE) {
 		auto received = DeserializeCrossingPlan(*far.context, SerializeCrossingPlan(query.plan));
-		BindFloors(*far.context, received, FAR_CATALOG);
+		BindFloors(*far.context, received, catalog);
 		return ExecuteWrite(*far.context, target, std::move(received));
 	}
-	auto rel = DecodeSubstraitJson(far, FAR_CATALOG, RenderSubstraitJson(query.plan), StageSeamRows(query.plan));
+	auto rel = DecodeSubstraitJson(far, catalog, RenderSubstraitJson(query.plan), StageSeamRows(query.plan),
+	                               store->catalog_check);
 	return ExecuteWrite(*far.context, target, rel->GetTableRef());
 }
 
