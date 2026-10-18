@@ -6,6 +6,7 @@
 #include "duckdb/common/helper.hpp"
 #include "duckdb/common/limits.hpp"
 #include "duckdb/common/numeric_utils.hpp"
+#include "duckdb/common/string_util.hpp"
 #include "duckdb/main/relation/aggregate_relation.hpp"
 #include "duckdb/main/relation/query_relation.hpp"
 #include "duckdb/main/relation/setop_relation.hpp"
@@ -21,6 +22,7 @@
 #include "duckdb/parser/expression/star_expression.hpp"
 #include "duckdb/parser/expression/window_expression.hpp"
 #include "duckdb/parser/parsed_data/sample_options.hpp"
+#include "duckdb/parser/parsed_expression_iterator.hpp"
 #include "duckdb/parser/query_node/select_node.hpp"
 #include "duckdb/parser/result_modifier.hpp"
 #include "duckdb/parser/statement/select_statement.hpp"
@@ -810,6 +812,17 @@ unique_ptr<SelectStatement> DecodeSubstraitView(Connection &conn, const string &
 	}
 	auto body = make_uniq<SelectStatement>();
 	body->node = rel->GetQueryNode();
+	// A view binds in its own catalog first; naming it would pin the view to that catalog's alias.
+	ParsedExpressionIterator::EnumerateQueryNodeChildren(
+	    *body->node, [](unique_ptr<ParsedExpression> &) {},
+	    [&catalog](TableRef &ref) {
+		    if (ref.type == TableReferenceType::BASE_TABLE) {
+			    auto &base = ref.Cast<BaseTableRef>();
+			    if (StringUtil::CIEquals(base.catalog_name, catalog)) {
+				    base.catalog_name.clear();
+			    }
+		    }
+	    });
 	auto node = make_uniq<SelectNode>();
 	for (idx_t i = 0; i < columns.size(); i++) {
 		auto column = make_uniq<ColumnRefExpression>(columns[i].Name());

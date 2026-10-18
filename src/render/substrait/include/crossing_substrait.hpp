@@ -19,7 +19,8 @@ bool SubstraitCanRenderOperator(const LogicalOperator &op, string &reason);
 shared_ptr<Relation> DecodeSubstraitJson(Connection &conn, const string &catalog, const string &json,
                                          const string &seam_view);
 
-//! A CREATE VIEW body (CrossingDdl::plan) as a query whose columns are `names`, in order.
+//! A CREATE VIEW body (CrossingDdl::plan) as a query whose columns are `names`, in order. Tables are named
+//! without `catalog`, so the view resolves them in the catalog it is created in.
 unique_ptr<SelectStatement> DecodeSubstraitView(Connection &conn, const string &catalog, const string &json,
                                                 const vector<string> &names);
 

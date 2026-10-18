@@ -310,6 +310,8 @@ TEST_CASE("create view ships its body and the view is served at once", "[ddl][vi
 	REQUIRE(twin.store->ddls[0].verb == CrossingVerb::CREATE);
 	REQUIRE(twin.store->ddls[0].table == "big");
 	REQUIRE(FarColumns(twin, "big") == "id,amt");
+	REQUIRE_THAT(FarScalar(twin, "SELECT sql FROM duckdb_views() WHERE view_name = 'big'").ToString(),
+	             !Catch::Contains("memory."));
 	twin.Same("SELECT id, amt FROM far.big ORDER BY id");
 }
 
