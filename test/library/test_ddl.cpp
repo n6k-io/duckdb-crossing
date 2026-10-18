@@ -433,3 +433,13 @@ TEST_CASE("create view rolls back and commits with the transaction", "[ddl][view
 	REQUIRE(FarViewCount(twin, "kept") == Value::BIGINT(1));
 	twin.Same("SELECT count(*) FROM far.kept");
 }
+
+TEST_CASE("a source view with an alias list is read under its aliases", "[ddl][view]") {
+	auto transport = EACH_TRANSPORT();
+	Twin twin(transport);
+	twin.Seed();
+	twin.Far("CREATE VIEW aliased(a, b) AS SELECT id, amt FROM orders");
+	twin.Query("DETACH far");
+	twin.Attach();
+	twin.Same("SELECT a, b FROM far.aliased ORDER BY a");
+}
