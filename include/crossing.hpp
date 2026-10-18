@@ -53,6 +53,7 @@ class SQLStatement;
 class PendingQueryResult;
 struct AttachInfo;
 struct CreateInfo;
+struct CreateViewInfo;
 struct AlterInfo;
 struct DropInfo;
 
@@ -131,7 +132,13 @@ struct CrossingDdl {
 	optional_ptr<const CreateInfo> create;
 	optional_ptr<const AlterInfo> alter;
 	optional_ptr<const DropInfo> drop;
+	//! A CREATE VIEW's body, floors only: `create` is then a CreateViewInfo whose `query` is the
+	//! target's spelling. Its columns are CrossingViewColumnNames(view), in order.
+	optional_ptr<const LogicalOperator> plan;
 };
+
+//! A view's column names: its alias where given, else what its body names.
+vector<string> CrossingViewColumnNames(const CreateViewInfo &view);
 
 struct CrossingTableUse {
 	string schema;

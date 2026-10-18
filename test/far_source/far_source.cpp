@@ -11,10 +11,13 @@
 #include "duckdb/parser/parsed_data/alter_info.hpp"
 #include "duckdb/parser/parsed_data/attach_info.hpp"
 #include "duckdb/parser/parsed_data/create_info.hpp"
+#include "duckdb/parser/parsed_data/create_view_info.hpp"
 #include "duckdb/parser/parsed_data/drop_info.hpp"
 #include "duckdb/parser/statement/alter_statement.hpp"
 #include "duckdb/parser/statement/create_statement.hpp"
 #include "duckdb/parser/statement/drop_statement.hpp"
+#include "duckdb/parser/statement/select_statement.hpp"
+#include "duckdb/parser/keyword_helper.hpp"
 #include "duckdb/planner/expression/bound_aggregate_expression.hpp"
 #include "duckdb/planner/expression/bound_function_expression.hpp"
 #include "duckdb/planner/expression/bound_window_expression.hpp"
@@ -231,8 +234,10 @@ vector<string> FarSource::Schemas() {
 
 vector<string> FarSource::TablesOn(Connection &con, const string &schema) {
 	auto prepared = con.Prepare("SELECT table_name FROM duckdb_tables() WHERE database_name = '" + string(FAR_CATALOG) +
-	                            "' AND schema_name = ? ORDER BY 1");
-	vector<Value> args {Value(schema)};
+	                            "' AND schema_name = ? UNION ALL SELECT view_name FROM duckdb_views() WHERE "
+	                            "database_name = '" +
+	                            string(FAR_CATALOG) + "' AND schema_name = ? AND NOT internal ORDER BY 1");
+	vector<Value> args {Value(schema), Value(schema)};
 	auto result = prepared->Execute(args, false);
 	vector<string> names;
 	for (auto &row : RowsOf(*result)) {
@@ -247,13 +252,35 @@ vector<string> FarSource::Tables(const string &schema) {
 	return TablesOn(store->con, schema);
 }
 
+bool FarSource::IsView(Connection &con, const string &schema, const string &name) {
+	auto prepared = con.Prepare("SELECT count(*) FROM duckdb_views() WHERE database_name = '" + string(FAR_CATALOG) +
+	                            "' AND schema_name = ? AND view_name = ?");
+	vector<Value> args {Value(schema), Value(name)};
+	return RowsOf(*prepared->Execute(args, false))[0][0].GetValue<int64_t>() > 0;
+}
+
 CrossingTable FarSource::DescribeOn(FarStore &store, Connection &con, const string &schema, const string &name) {
+	CrossingTable table;
+	table.name = name;
+	if (IsView(con, schema, name)) {
+		auto result =
+		    con.Query("SELECT * FROM " + string(FAR_CATALOG) + "." + KeywordHelper::WriteOptionallyQuoted(schema) +
+		              "." + KeywordHelper::WriteOptionallyQuoted(name) + " LIMIT 0");
+		if (result->HasError()) {
+			result->ThrowError();
+		}
+		for (idx_t c = 0; c < result->ColumnCount(); c++) {
+			table.Column(result->names[c], result->types[c]);
+		}
+		auto verbs = store.verbs.find(name);
+		table.verbs = verbs != store.verbs.end() ? verbs->second
+		                                         : vector<CrossingVerb> {CrossingVerb::SELECT, CrossingVerb::DROP};
+		return table;
+	}
 	auto description = con.TableInfo(FAR_CATALOG, schema, name);
 	if (!description) {
 		throw CatalogException("far: no table '%s.%s'", schema, name);
 	}
-	CrossingTable table;
-	table.name = name;
 	for (auto &column : description->columns) {
 		table.Column(column.Name(), column.Type());
 	}
@@ -417,8 +444,12 @@ void FarSession::Ddl(ClientContext &, const CrossingDdl &ddl) {
 	switch (ddl.verb) {
 	case CrossingVerb::CREATE: {
 		auto create = make_uniq<CreateStatement>();
-		create->info = ddl.create->Copy();
-		create->info->catalog = FAR_CATALOG;
+		if (ddl.plan) {
+			create->info = ReceiveView(ddl.create->Cast<CreateViewInfo>(), *ddl.plan);
+		} else {
+			create->info = ddl.create->Copy();
+			create->info->catalog = FAR_CATALOG;
+		}
 		statement = std::move(create);
 		break;
 	}
@@ -450,6 +481,15 @@ void FarSession::Ddl(ClientContext &, const CrossingDdl &ddl) {
 	}
 	lock_guard<mutex> store_guard(store->lock);
 	store->ddls.push_back(FarDdl {ddl.verb, ddl.schema, ddl.table});
+}
+
+// Over Substrait whatever the transport: a native plan cannot be turned back into a SelectStatement.
+unique_ptr<CreateViewInfo> FarSession::ReceiveView(const CreateViewInfo &view, const LogicalOperator &plan) {
+	lock_guard<mutex> guard(far_lock);
+	auto received = make_uniq<CreateViewInfo>(FAR_CATALOG, view.schema, view.view_name);
+	received->query = DecodeSubstraitView(far, FAR_CATALOG, RenderSubstraitJson(plan), CrossingViewColumnNames(view));
+	received->on_conflict = view.on_conflict;
+	return received;
 }
 
 FarCall FarSession::Record(const CrossingQuery &query) {

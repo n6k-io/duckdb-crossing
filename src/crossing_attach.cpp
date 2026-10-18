@@ -1,12 +1,17 @@
 #include "crossing_attach.hpp"
 
+#include "internal/carrier.hpp"
 #include "internal/crossing_table_entry.hpp"
 #include "internal/crossing_write.hpp"
+#include "internal/pass.hpp"
 
 #include "duckdb/catalog/catalog_entry/schema_catalog_entry.hpp"
 #include "duckdb/common/atomic.hpp"
 #include "duckdb/common/exception/catalog_exception.hpp"
 #include "duckdb/parser/parsed_data/create_table_info.hpp"
+#include "duckdb/parser/parsed_data/create_view_info.hpp"
+#include "duckdb/parser/statement/select_statement.hpp"
+#include "duckdb/planner/binder.hpp"
 #include "duckdb/transaction/transaction.hpp"
 
 #include <algorithm>
@@ -391,6 +396,39 @@ void CrossingAttach::Ddl(ClientContext &context, Transaction &transaction, Schem
 	} else {
 		overlay.state = make_uniq<SchemaState>();
 	}
+}
+
+optional_ptr<CatalogEntry> CrossingAttach::CreateView(ClientContext &context, Transaction &transaction,
+                                                      SchemaCatalogEntry &owner, CreateViewInfo &info) {
+	auto binder = Binder::CreateBinder(context);
+	binder->SetSearchPath(owner.ParentCatalog(), owner.name);
+	auto query = info.query->Copy();
+	auto bound = binder->Bind(*query);
+	auto &identity = Identity();
+	FreshTableIndex fresh = [&binder]() {
+		return binder->GenerateTableIndex();
+	};
+	// No MaterialiseConstantRows: rows staged for one read cannot live on in a view, so a VALUES list
+	// keeps the body on the target.
+	ResolveKeyAliases(*bound.plan, identity);
+	FoldCrossableWorkIntoFragments(bound.plan, fresh, identity);
+	auto fragment = CrossingReadFragmentOf(*bound.plan, identity);
+	if (!fragment || fragment->frozen) {
+		throw BinderException("crossing: the body of view '%s' does not run wholly on the source", info.view_name);
+	}
+	if (fragment->plan->types.size() != info.names.size()) {
+		throw InternalException("crossing: view '%s' plans %llu columns but names %llu", info.view_name,
+		                        fragment->plan->types.size(), info.names.size());
+	}
+
+	CrossingDdl ddl;
+	ddl.verb = CrossingVerb::CREATE;
+	ddl.schema = owner.name;
+	ddl.table = info.view_name;
+	ddl.create = &info;
+	ddl.plan = fragment->plan.get();
+	Ddl(context, transaction, owner, ddl);
+	return LookupTable(owner.name, owner, info.view_name, &transaction);
 }
 
 CrossingAttach::Slot &CrossingAttach::SlotOf(Transaction &transaction) {

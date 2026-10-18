@@ -6,6 +6,7 @@
 #include "duckdb/common/case_insensitive_map.hpp"
 #include "duckdb/common/mutex.hpp"
 #include "duckdb/common/set.hpp"
+#include "duckdb/parser/parsed_data/create_view_info.hpp"
 
 #include <functional>
 #include <thread>
@@ -109,6 +110,7 @@ private:
 	vector<vector<Value>> EvaluateSubstrait(const LogicalOperator &plan, FarCall &call);
 	idx_t Apply(const CrossingQuery &query);
 	string StageSeamRows(const LogicalOperator &plan);
+	unique_ptr<CreateViewInfo> ReceiveView(const CreateViewInfo &view, const LogicalOperator &plan);
 	FarCall Record(const CrossingQuery &query);
 
 	shared_ptr<FarStore> store;
@@ -127,6 +129,7 @@ public:
 	CrossingTable Describe(const string &schema, const string &name);
 	CrossingSchema DescribeSchema(const string &schema);
 	static vector<string> TablesOn(Connection &con, const string &schema);
+	static bool IsView(Connection &con, const string &schema, const string &name);
 	static CrossingTable DescribeOn(FarStore &store, Connection &con, const string &schema, const string &name);
 	CrossingPlan Plan(const CrossingPlanRequest &request);
 	CrossingVerdict AcceptsCall(const Expression &expr);

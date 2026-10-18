@@ -25,6 +25,7 @@
 #include "duckdb/parser/result_modifier.hpp"
 #include "duckdb/parser/statement/select_statement.hpp"
 #include "duckdb/parser/tableref/basetableref.hpp"
+#include "duckdb/parser/tableref/subqueryref.hpp"
 
 #include <functional>
 #include <unordered_map>
@@ -797,6 +798,28 @@ shared_ptr<Relation> DecodeSubstraitJson(Connection &conn, const string &catalog
 		yyjson_doc_free(doc);
 		throw;
 	}
+}
+
+unique_ptr<SelectStatement> DecodeSubstraitView(Connection &conn, const string &catalog, const string &json,
+                                                const vector<string> &names) {
+	auto rel = DecodeSubstraitJson(conn, catalog, json, "");
+	auto &columns = rel->Columns();
+	if (columns.size() != names.size()) {
+		throw InvalidInputException("substrait: the view body has %llu columns but %llu names", columns.size(),
+		                            names.size());
+	}
+	auto body = make_uniq<SelectStatement>();
+	body->node = rel->GetQueryNode();
+	auto node = make_uniq<SelectNode>();
+	for (idx_t i = 0; i < columns.size(); i++) {
+		auto column = make_uniq<ColumnRefExpression>(columns[i].Name());
+		column->alias = names[i];
+		node->select_list.push_back(std::move(column));
+	}
+	node->from_table = make_uniq<SubqueryRef>(std::move(body));
+	auto statement = make_uniq<SelectStatement>();
+	statement->node = std::move(node);
+	return statement;
 }
 
 } // namespace duckdb

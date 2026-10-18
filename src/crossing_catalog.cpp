@@ -151,7 +151,9 @@ void CrossingSchemaEntry::Scan(CatalogType type, const std::function<void(Catalo
 
 optional_ptr<CatalogEntry> CrossingSchemaEntry::LookupEntry(CatalogTransaction transaction,
                                                             const EntryLookupInfo &lookup_info) {
-	if (lookup_info.GetCatalogType() != CatalogType::TABLE_ENTRY) {
+	// A source reports its views as tables.
+	auto type = lookup_info.GetCatalogType();
+	if (type != CatalogType::TABLE_ENTRY && type != CatalogType::VIEW_ENTRY) {
 		return nullptr;
 	}
 	return attach.LookupTable(name, *this, lookup_info.GetEntryName(), transaction.transaction);
@@ -159,7 +161,8 @@ optional_ptr<CatalogEntry> CrossingSchemaEntry::LookupEntry(CatalogTransaction t
 
 void CrossingSchemaEntry::DropEntry(ClientContext &context, DropInfo &info) {
 	auto &transaction = Transaction::Get(context, catalog);
-	if (info.type == CatalogType::TABLE_ENTRY && attach.ServesTable(name, info.name, &transaction)) {
+	if ((info.type == CatalogType::TABLE_ENTRY || info.type == CatalogType::VIEW_ENTRY) &&
+	    attach.ServesTable(name, info.name, &transaction)) {
 		CrossingDdl ddl;
 		ddl.verb = CrossingVerb::DROP;
 		ddl.schema = name;
@@ -213,8 +216,8 @@ optional_ptr<CatalogEntry> CrossingSchemaEntry::CreateTable(CatalogTransaction t
 	return attach.LookupTable(name, *this, ddl.table, transaction.transaction);
 }
 
-optional_ptr<CatalogEntry> CrossingSchemaEntry::CreateView(CatalogTransaction, CreateViewInfo &) {
-	throw CreateNotSupported(name);
+optional_ptr<CatalogEntry> CrossingSchemaEntry::CreateView(CatalogTransaction transaction, CreateViewInfo &info) {
+	return attach.CreateView(transaction.GetContext(), *transaction.transaction, *this, info);
 }
 
 optional_ptr<CatalogEntry> CrossingSchemaEntry::CreateSequence(CatalogTransaction, CreateSequenceInfo &) {
