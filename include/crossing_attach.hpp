@@ -95,6 +95,7 @@ public:
 	//! The attach behind a catalog crossing built, or behind the catalog served entries name as
 	//! their parent.
 	static CrossingAttach &Of(Catalog &catalog);
+	static optional_ptr<CrossingAttach> TryOf(Catalog &catalog);
 
 private:
 	struct SchemaState;

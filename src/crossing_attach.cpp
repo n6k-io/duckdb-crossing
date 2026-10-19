@@ -550,9 +550,17 @@ Catalog &CrossingAttach::WriteCatalog() {
 }
 
 CrossingAttach &CrossingAttach::Of(Catalog &catalog) {
+	auto attach = TryOf(catalog);
+	if (!attach) {
+		throw InternalException("crossing: '%s' is not a crossing catalog", catalog.GetName());
+	}
+	return *attach;
+}
+
+optional_ptr<CrossingAttach> CrossingAttach::TryOf(Catalog &catalog) {
 	auto owner = dynamic_cast<CrossingAttachOwner *>(&catalog);
 	if (!owner) {
-		throw InternalException("crossing: '%s' is not a crossing catalog", catalog.GetName());
+		return nullptr;
 	}
 	return owner->Attach();
 }

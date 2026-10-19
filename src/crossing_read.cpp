@@ -131,17 +131,18 @@ void CheckScanPartitions(const CrossingReadGlobalState &state, const string &sou
 Catalog &ReadingCatalog(ClientContext &context, CrossingBindData &bind_data) {
 	auto &host = bind_data.table.ParentCatalog();
 	auto modified = MetaTransaction::Get(context).ModifiedDatabase();
-	if (!modified || &modified->GetCatalog() == &host) {
+	if (!modified) {
 		return host;
 	}
-	auto owner = dynamic_cast<CrossingAttachOwner *>(&modified->GetCatalog());
-	if (!owner) {
+	auto &modified_catalog = modified->GetCatalog();
+	auto attach = CrossingAttach::TryOf(modified_catalog);
+	if (!attach) {
 		return host;
 	}
-	auto &written = owner->Attach().Source();
+	auto &written = attach->Source();
 	for (auto &source : bind_data.fragment->folded_sources) {
 		if (&source.get() == &written) {
-			return modified->GetCatalog();
+			return modified_catalog;
 		}
 	}
 	return host;
