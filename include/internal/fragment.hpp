@@ -7,6 +7,7 @@
 #include "duckdb/planner/logical_operator.hpp"
 #include "duckdb/planner/operator/logical_projection.hpp"
 
+#include "crossing.hpp"
 #include "internal/table_indices.hpp"
 
 namespace duckdb {
@@ -32,6 +33,9 @@ struct CrossingFragment {
 	idx_t table_index = 0;
 
 	bool frozen = false;
+
+	//! Sources other than the host's whose scans were folded in.
+	vector<reference<CrossingSource>> folded_sources;
 
 	//! The seam node (MakeSeamNode) still in the plan, or null once something has filled it.
 	unique_ptr<LogicalOperator> *SeamSlot();

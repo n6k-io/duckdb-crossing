@@ -13,6 +13,7 @@
 #include "duckdb/parser/expression/comparison_expression.hpp"
 #include "duckdb/parser/expression/conjunction_expression.hpp"
 #include "duckdb/parser/expression/positional_reference_expression.hpp"
+#include "duckdb/parser/expression/star_expression.hpp"
 #include "duckdb/parser/query_node/select_node.hpp"
 #include "duckdb/parser/statement/delete_statement.hpp"
 #include "duckdb/parser/statement/insert_statement.hpp"
@@ -96,17 +97,28 @@ void BindFloorsBelow(Binder &binder, unique_ptr<LogicalOperator> &op, const stri
 		return;
 	}
 	auto &floor_get = op->Cast<LogicalGet>();
-	unique_ptr<TableRef> ref = resolver ? resolver(*floor) : nullptr;
-	if (!ref) {
+	auto make_ref = [&]() -> unique_ptr<TableRef> {
+		unique_ptr<TableRef> ref = resolver ? resolver(*floor) : nullptr;
+		if (ref) {
+			return ref;
+		}
 		auto base = make_uniq<BaseTableRef>();
-		base->catalog_name = catalog;
+		base->catalog_name = floor->catalog.empty() ? catalog : floor->catalog;
 		base->schema_name = floor->schema;
 		base->table_name = floor->table;
-		ref = std::move(base);
-	}
+		return std::move(base);
+	};
+	auto ref = make_ref();
 	auto bound = binder.Bind(*ref);
 	if (!bound.plan) {
 		throw InternalException("crossing: '%s.%s' bound to nothing", floor->schema, floor->table);
+	}
+	if (bound.names != floor_get.names && bound.types == floor_get.returned_types) {
+		// A view with an alias list binds under its body's names; a star over it reads the aliases.
+		auto node = make_uniq<SelectNode>();
+		node->select_list.push_back(make_uniq<StarExpression>());
+		node->from_table = make_ref();
+		bound = Binder::CreateBinder(binder.context, &binder)->Bind(*node);
 	}
 	if (bound.names != floor_get.names || bound.types != floor_get.returned_types) {
 		throw CatalogException("crossing: '%s.%s' changed on the source: it now has [%s] as [%s], the floor expects "

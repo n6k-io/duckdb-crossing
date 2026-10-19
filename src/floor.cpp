@@ -20,8 +20,8 @@ struct CrossingFloorBindData : public FunctionData {
 	}
 	bool Equals(const FunctionData &other_p) const override {
 		auto &other = other_p.Cast<CrossingFloorBindData>();
-		return floor.schema == other.floor.schema && floor.table == other.floor.table &&
-		       floor.column_names == other.floor.column_names;
+		return floor.catalog == other.floor.catalog && floor.schema == other.floor.schema &&
+		       floor.table == other.floor.table && floor.column_names == other.floor.column_names;
 	}
 };
 
@@ -30,6 +30,7 @@ void SerializeFloor(Serializer &serializer, const optional_ptr<FunctionData> bin
 	serializer.WriteProperty(100, "schema", floor.schema);
 	serializer.WriteProperty(101, "table", floor.table);
 	serializer.WriteProperty(102, "column_names", floor.column_names);
+	serializer.WritePropertyWithDefault(103, "catalog", floor.catalog);
 }
 
 unique_ptr<FunctionData> DeserializeFloor(Deserializer &deserializer, TableFunction &) {
@@ -37,6 +38,7 @@ unique_ptr<FunctionData> DeserializeFloor(Deserializer &deserializer, TableFunct
 	deserializer.ReadProperty(100, "schema", bind_data->floor.schema);
 	deserializer.ReadProperty(101, "table", bind_data->floor.table);
 	deserializer.ReadProperty(102, "column_names", bind_data->floor.column_names);
+	deserializer.ReadPropertyWithDefault(103, "catalog", bind_data->floor.catalog);
 	return std::move(bind_data);
 }
 
@@ -50,12 +52,13 @@ TableFunction CrossingFloorFunction() {
 }
 
 unique_ptr<LogicalOperator> MakeFloorNode(idx_t table_index, string schema, string table, vector<string> column_names,
-                                          vector<LogicalType> column_types) {
+                                          vector<LogicalType> column_types, string catalog) {
 	if (column_names.size() != column_types.size()) {
 		throw InternalException("crossing: a floor of '%s' names %llu columns and %llu types", table,
 		                        column_names.size(), column_types.size());
 	}
 	auto bind_data = make_uniq<CrossingFloorBindData>();
+	bind_data->floor.catalog = std::move(catalog);
 	bind_data->floor.schema = std::move(schema);
 	bind_data->floor.table = std::move(table);
 	bind_data->floor.column_names = column_names;
@@ -70,8 +73,9 @@ unique_ptr<LogicalOperator> MakeFloorNode(idx_t table_index, string schema, stri
 }
 
 unique_ptr<LogicalOperator> MakeFloorNode(string schema, string table, vector<string> column_names,
-                                          vector<LogicalType> column_types) {
-	return MakeFloorNode(0, std::move(schema), std::move(table), std::move(column_names), std::move(column_types));
+                                          vector<LogicalType> column_types, string catalog) {
+	return MakeFloorNode(0, std::move(schema), std::move(table), std::move(column_names), std::move(column_types),
+	                     std::move(catalog));
 }
 
 optional_ptr<const CrossingFloor> FloorOf(const LogicalOperator &op) {

@@ -654,6 +654,9 @@ private:
 		auto *table_names = yyjson_mut_arr(doc);
 
 		if (auto floor = FloorOf(get)) {
+			if (!floor->catalog.empty()) {
+				yyjson_mut_arr_add_strcpy(doc, table_names, floor->catalog.c_str());
+			}
 			yyjson_mut_arr_add_strcpy(doc, table_names, floor->schema.c_str());
 			yyjson_mut_arr_add_strcpy(doc, table_names, floor->table.c_str());
 		} else if (auto table = get.GetTable()) {

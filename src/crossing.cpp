@@ -1,6 +1,7 @@
 #include "crossing.hpp"
 
 #include "duckdb/common/exception.hpp"
+#include "duckdb/parser/parsed_data/create_view_info.hpp"
 #include "duckdb/planner/logical_operator.hpp"
 
 namespace duckdb {
@@ -35,6 +36,14 @@ const vector<CrossingVerb> &CrossingVerbs() {
 
 bool IsDdlVerb(CrossingVerb verb) {
 	return verb == CrossingVerb::CREATE || verb == CrossingVerb::ALTER || verb == CrossingVerb::DROP;
+}
+
+vector<string> CrossingViewColumnNames(const CreateViewInfo &view) {
+	auto names = view.names;
+	for (idx_t i = 0; i < view.aliases.size() && i < names.size(); i++) {
+		names[i] = view.aliases[i];
+	}
+	return names;
 }
 
 CrossingWriter CrossingSession::Write(ClientContext &, const CrossingQuery &) {

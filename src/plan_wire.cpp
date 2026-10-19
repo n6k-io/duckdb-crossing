@@ -32,6 +32,7 @@ void CollectFloors(const LogicalOperator &op, vector<CrossingTableUse> &out) {
 		CrossingTableUse use;
 		bool named = false;
 		if (auto floor = FloorOf(get)) {
+			use.catalog = floor->catalog;
 			use.schema = floor->schema;
 			use.table = floor->table;
 			named = true;

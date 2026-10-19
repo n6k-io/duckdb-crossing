@@ -6,6 +6,7 @@
 #include "duckdb/common/helper.hpp"
 #include "duckdb/common/limits.hpp"
 #include "duckdb/common/numeric_utils.hpp"
+#include "duckdb/common/string_util.hpp"
 #include "duckdb/main/relation/aggregate_relation.hpp"
 #include "duckdb/main/relation/query_relation.hpp"
 #include "duckdb/main/relation/setop_relation.hpp"
@@ -21,10 +22,12 @@
 #include "duckdb/parser/expression/star_expression.hpp"
 #include "duckdb/parser/expression/window_expression.hpp"
 #include "duckdb/parser/parsed_data/sample_options.hpp"
+#include "duckdb/parser/parsed_expression_iterator.hpp"
 #include "duckdb/parser/query_node/select_node.hpp"
 #include "duckdb/parser/result_modifier.hpp"
 #include "duckdb/parser/statement/select_statement.hpp"
 #include "duckdb/parser/tableref/basetableref.hpp"
+#include "duckdb/parser/tableref/subqueryref.hpp"
 
 #include <functional>
 #include <unordered_map>
@@ -109,8 +112,9 @@ int64_t Int64Of(yyjson_val *val, int64_t fallback) {
 
 class Decoder {
 public:
-	Decoder(Connection &conn_p, const string &catalog_p, const string &seam_view_p)
-	    : conn(conn_p), catalog(catalog_p), seam_view(seam_view_p) {
+	Decoder(Connection &conn_p, const string &catalog_p, const string &seam_view_p,
+	        const SubstraitCatalogCheck &check_p)
+	    : conn(conn_p), catalog(catalog_p), seam_view(seam_view_p), check(check_p) {
 	}
 
 	shared_ptr<Relation> Decode(yyjson_val *plan) {
@@ -434,6 +438,9 @@ private:
 			}
 			rel = conn.View(seam_view);
 		} else if (names.size() == 2 || names.size() == 3) {
+			if (names.size() == 3 && check) {
+				check(names[0]);
+			}
 			auto ref = make_uniq<BaseTableRef>();
 			ref->catalog_name = names.size() == 3 ? names[0] : catalog;
 			ref->schema_name = names[names.size() - 2];
@@ -777,19 +784,20 @@ private:
 	Connection &conn;
 	const string &catalog;
 	const string &seam_view;
+	const SubstraitCatalogCheck &check;
 	std::unordered_map<uint64_t, string> functions;
 };
 
 } // namespace
 
 shared_ptr<Relation> DecodeSubstraitJson(Connection &conn, const string &catalog, const string &json,
-                                         const string &seam_view) {
+                                         const string &seam_view, const SubstraitCatalogCheck &check) {
 	auto *doc = yyjson_read(json.data(), json.size(), 0);
 	if (!doc) {
 		throw InvalidInputException("substrait: the plan is not valid JSON");
 	}
 	try {
-		Decoder decoder(conn, catalog, seam_view);
+		Decoder decoder(conn, catalog, seam_view, check);
 		auto rel = decoder.Decode(yyjson_doc_get_root(doc));
 		yyjson_doc_free(doc);
 		return rel;
@@ -797,6 +805,39 @@ shared_ptr<Relation> DecodeSubstraitJson(Connection &conn, const string &catalog
 		yyjson_doc_free(doc);
 		throw;
 	}
+}
+
+unique_ptr<SelectStatement> DecodeSubstraitView(Connection &conn, const string &catalog, const string &json,
+                                                const vector<string> &names, const SubstraitCatalogCheck &check) {
+	auto rel = DecodeSubstraitJson(conn, catalog, json, "", check);
+	auto &columns = rel->Columns();
+	if (columns.size() != names.size()) {
+		throw InvalidInputException("substrait: the view body has %llu columns but %llu names", columns.size(),
+		                            names.size());
+	}
+	auto body = make_uniq<SelectStatement>();
+	body->node = rel->GetQueryNode();
+	// A view binds in its own catalog first; naming it would pin the view to that catalog's alias.
+	ParsedExpressionIterator::EnumerateQueryNodeChildren(
+	    *body->node, [](unique_ptr<ParsedExpression> &) {},
+	    [&catalog](TableRef &ref) {
+		    if (ref.type == TableReferenceType::BASE_TABLE) {
+			    auto &base = ref.Cast<BaseTableRef>();
+			    if (StringUtil::CIEquals(base.catalog_name, catalog)) {
+				    base.catalog_name.clear();
+			    }
+		    }
+	    });
+	auto node = make_uniq<SelectNode>();
+	for (idx_t i = 0; i < columns.size(); i++) {
+		auto column = make_uniq<ColumnRefExpression>(columns[i].Name());
+		column->alias = names[i];
+		node->select_list.push_back(std::move(column));
+	}
+	node->from_table = make_uniq<SubqueryRef>(std::move(body));
+	auto statement = make_uniq<SelectStatement>();
+	statement->node = std::move(node);
+	return statement;
 }
 
 } // namespace duckdb

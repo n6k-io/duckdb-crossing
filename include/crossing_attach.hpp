@@ -73,6 +73,9 @@ public:
 	void ThrowIfSchemaServed(const string &schema);
 
 	void Ddl(ClientContext &context, Transaction &transaction, SchemaCatalogEntry &owner, const CrossingDdl &ddl);
+	//! Plans the view's body, which must run wholly on the source, and hands it to Ddl as a CREATE.
+	optional_ptr<CatalogEntry> CreateView(ClientContext &context, Transaction &transaction, SchemaCatalogEntry &owner,
+	                                      CreateViewInfo &info);
 	PhysicalOperator &PlanCreateTableAs(ClientContext &context, PhysicalPlanGenerator &planner, LogicalCreateTable &op,
 	                                    PhysicalOperator &plan);
 
@@ -92,6 +95,7 @@ public:
 	//! The attach behind a catalog crossing built, or behind the catalog served entries name as
 	//! their parent.
 	static CrossingAttach &Of(Catalog &catalog);
+	static optional_ptr<CrossingAttach> TryOf(Catalog &catalog);
 
 private:
 	struct SchemaState;

@@ -199,7 +199,8 @@ TEST_CASE("nothing can be created in a served schema that does not declare creat
 	REQUIRE_THAT(twin.Error("CREATE TABLE far.main.scratch (x INTEGER)"),
 	             Catch::Contains("schema 'main' does not have 'create' permission"));
 	REQUIRE_THAT(twin.Error("CREATE SCHEMA far.other"), Catch::Contains("schemas are served by the source"));
-	REQUIRE_THAT(twin.Error("CREATE VIEW far.main.v AS SELECT 1"), Catch::Contains("served by a source"));
+	REQUIRE_THAT(twin.Error("CREATE VIEW far.main.v AS SELECT id FROM far.orders"),
+	             Catch::Contains("schema 'main' does not have 'create' permission"));
 	REQUIRE(twin.Query("SELECT count(*) FROM duckdb_tables() WHERE database_name = 'far'")->GetValue(0, 0) ==
 	        Value::BIGINT(5));
 	REQUIRE(twin.store->ddls.empty());

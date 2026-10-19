@@ -16,6 +16,17 @@ Value FarTableCount(Twin &twin, const string &name) {
 	return FarScalar(twin, "SELECT count(*) FROM duckdb_tables() WHERE table_name = '" + name + "'");
 }
 
+Value FarViewCount(Twin &twin, const string &name) {
+	return FarScalar(twin, "SELECT count(*) FROM duckdb_views() WHERE view_name = '" + name + "'");
+}
+
+string FarColumns(Twin &twin, const string &name) {
+	return FarScalar(twin, "SELECT string_agg(column_name, ',' ORDER BY column_index) FROM duckdb_columns() WHERE "
+	                       "table_name = '" +
+	                           name + "'")
+	    .ToString();
+}
+
 } // namespace
 
 TEST_CASE("create table reaches the source and the table is served at once", "[ddl]") {
@@ -285,4 +296,159 @@ TEST_CASE("uncommitted ddl is invisible to other transactions", "[ddl]") {
 		twin.Query("COMMIT");
 		REQUIRE(other_scalar("SELECT extra FROM far.orders LIMIT 1") == Value::INTEGER(1));
 	}
+}
+
+TEST_CASE("create view ships its body and the view is served at once", "[ddl][view]") {
+	auto transport = EACH_TRANSPORT();
+	Twin twin(transport);
+	twin.Seed();
+
+	twin.Query("CREATE VIEW far.main.big AS SELECT id, amt FROM far.orders WHERE amt > 100");
+
+	REQUIRE(FarViewCount(twin, "big") == Value::BIGINT(1));
+	REQUIRE(twin.store->ddls.size() == 1);
+	REQUIRE(twin.store->ddls[0].verb == CrossingVerb::CREATE);
+	REQUIRE(twin.store->ddls[0].table == "big");
+	REQUIRE(FarColumns(twin, "big") == "id,amt");
+	REQUIRE_THAT(FarScalar(twin, "SELECT sql FROM duckdb_views() WHERE view_name = 'big'").ToString(),
+	             !Catch::Contains("memory."));
+	twin.Same("SELECT id, amt FROM far.big ORDER BY id");
+}
+
+TEST_CASE("view bodies that run wholly on the source", "[ddl][view]") {
+	Twin twin(Transport::SUBSTRAIT);
+	twin.Seed();
+
+	SECTION("join of two served tables") {
+		twin.Query("CREATE VIEW far.main.v AS SELECT o.id, c.cname FROM far.orders o JOIN far.customers c ON "
+		           "o.tenant = c.tenant");
+		twin.Same("SELECT id, cname FROM far.v ORDER BY id");
+	}
+	SECTION("aggregate") {
+		twin.Query("CREATE VIEW far.main.v AS SELECT tenant, sum(amt) AS total FROM far.orders GROUP BY tenant");
+		twin.Same("SELECT tenant, total FROM far.v ORDER BY tenant");
+	}
+	SECTION("order by and limit") {
+		twin.Query("CREATE VIEW far.main.v AS SELECT id FROM far.orders ORDER BY amt DESC LIMIT 2");
+		twin.Same("SELECT id FROM far.v ORDER BY id");
+	}
+	SECTION("unqualified names resolve in the view's own schema") {
+		twin.Query("CREATE VIEW far.main.v AS SELECT id FROM orders");
+		twin.Same("SELECT id FROM far.v ORDER BY id");
+	}
+	SECTION("column aliases name the view's columns") {
+		twin.Query("CREATE VIEW far.main.v(a, b) AS SELECT id, amt FROM far.orders");
+		REQUIRE(FarColumns(twin, "v") == "a,b");
+		twin.Same("SELECT a, b FROM far.v ORDER BY a");
+	}
+	REQUIRE(FarViewCount(twin, "v") == Value::BIGINT(1));
+}
+
+TEST_CASE("a view body that does not run wholly on the source is refused", "[ddl][view]") {
+	Twin twin(Transport::SUBSTRAIT);
+	twin.store->refused_functions.insert("upper");
+	twin.Seed();
+	twin.Query("CREATE TABLE local(x INTEGER)");
+
+	for (auto sql :
+	     {"CREATE VIEW far.main.v AS SELECT 1 AS x",
+	      "CREATE VIEW far.main.v AS SELECT o.id FROM far.orders o JOIN local l ON o.id = l.x",
+	      "CREATE VIEW far.main.v AS SELECT o.id FROM far.orders o JOIN (VALUES (1), (2)) t(x) ON o.id = t.x",
+	      "CREATE VIEW far.main.v AS SELECT upper(name) AS u FROM far.orders"}) {
+		INFO(sql);
+		REQUIRE_THAT(twin.Error(sql), Catch::Contains("does not run wholly on the source"));
+	}
+	REQUIRE(twin.store->ddls.empty());
+	REQUIRE(FarViewCount(twin, "v") == Value::BIGINT(0));
+}
+
+TEST_CASE("create view conflicts", "[ddl][view]") {
+	Twin twin(Transport::SUBSTRAIT);
+	twin.Seed();
+	twin.Query("CREATE VIEW far.main.v AS SELECT id FROM far.orders");
+
+	SECTION("plain create of an existing view fails") {
+		REQUIRE_THAT(twin.Error("CREATE VIEW far.main.v AS SELECT amt FROM far.orders"), Catch::Contains("v"));
+		REQUIRE(FarColumns(twin, "v") == "id");
+	}
+	SECTION("or replace replaces it") {
+		twin.Query("CREATE OR REPLACE VIEW far.main.v AS SELECT amt FROM far.orders");
+		REQUIRE(FarColumns(twin, "v") == "amt");
+		twin.Same("SELECT amt FROM far.v ORDER BY amt");
+	}
+	SECTION("if not exists leaves it") {
+		twin.Query("CREATE VIEW IF NOT EXISTS far.main.v AS SELECT amt FROM far.orders");
+		REQUIRE(FarColumns(twin, "v") == "id");
+		REQUIRE(twin.store->ddls.size() == 1);
+	}
+	SECTION("if not exists does not plan the body") {
+		twin.Query("CREATE TABLE local(x INTEGER)");
+		twin.Query("CREATE VIEW IF NOT EXISTS far.main.v AS SELECT o.id FROM far.orders o JOIN local l ON o.id = l.x");
+		REQUIRE(FarColumns(twin, "v") == "id");
+		REQUIRE(twin.store->ddls.size() == 1);
+	}
+}
+
+TEST_CASE("create view needs create on the schema, and drop to replace", "[ddl][view]") {
+	Twin twin(Transport::SUBSTRAIT);
+	twin.store->verbs["v"] = {CrossingVerb::SELECT};
+
+	SECTION("no create on the schema") {
+		twin.store->schema_verbs["main"] = {};
+		twin.Seed();
+		REQUIRE_THAT(twin.Error("CREATE VIEW far.main.v AS SELECT id FROM far.orders"),
+		             Catch::Contains("schema 'main' does not have 'create' permission"));
+		REQUIRE(twin.store->ddls.empty());
+	}
+	SECTION("no drop on the view") {
+		twin.Seed();
+		twin.Query("CREATE VIEW far.main.v AS SELECT id FROM far.orders");
+		REQUIRE_THAT(twin.Error("CREATE OR REPLACE VIEW far.main.v AS SELECT amt FROM far.orders"),
+		             Catch::Contains("'v' does not have 'drop' permission"));
+		REQUIRE_THAT(twin.Error("DROP VIEW far.v"), Catch::Contains("'v' does not have 'drop' permission"));
+		REQUIRE(twin.store->ddls.size() == 1);
+		REQUIRE(FarViewCount(twin, "v") == Value::BIGINT(1));
+	}
+}
+
+TEST_CASE("drop view reaches the source and the view is gone", "[ddl][view]") {
+	Twin twin(Transport::SUBSTRAIT);
+	twin.Seed();
+	twin.Query("CREATE VIEW far.main.v AS SELECT id FROM far.orders");
+
+	twin.Query("DROP VIEW far.v");
+
+	REQUIRE(FarViewCount(twin, "v") == Value::BIGINT(0));
+	REQUIRE(twin.store->ddls.size() == 2);
+	REQUIRE(twin.store->ddls[1].verb == CrossingVerb::DROP);
+	REQUIRE_THAT(twin.Error("SELECT * FROM far.v"), Catch::Contains("v"));
+	twin.Query("DROP VIEW IF EXISTS far.v");
+	REQUIRE(twin.store->ddls.size() == 2);
+}
+
+TEST_CASE("create view rolls back and commits with the transaction", "[ddl][view]") {
+	Twin twin(Transport::SUBSTRAIT);
+	twin.Seed();
+
+	twin.Query("BEGIN");
+	twin.Query("CREATE VIEW far.main.gone AS SELECT id FROM far.orders");
+	REQUIRE(twin.Query("SELECT count(*) FROM far.gone")->GetValue(0, 0) == Value::BIGINT(5));
+	twin.Query("ROLLBACK");
+	REQUIRE(FarViewCount(twin, "gone") == Value::BIGINT(0));
+
+	twin.Query("BEGIN");
+	twin.Query("CREATE VIEW far.main.kept AS SELECT id FROM far.orders");
+	twin.Query("COMMIT");
+	REQUIRE(FarViewCount(twin, "kept") == Value::BIGINT(1));
+	twin.Same("SELECT count(*) FROM far.kept");
+}
+
+TEST_CASE("a source view with an alias list is read under its aliases", "[ddl][view]") {
+	auto transport = EACH_TRANSPORT();
+	Twin twin(transport);
+	twin.Seed();
+	twin.Far("CREATE VIEW aliased(a, b) AS SELECT id, amt FROM orders");
+	twin.Query("DETACH far");
+	twin.Attach();
+	twin.Same("SELECT a, b FROM far.aliased ORDER BY a");
 }

@@ -26,6 +26,7 @@ struct ToyDB {
 
 	unique_ptr<Session> Begin(ClientContext &context);
 	void Detach(ClientContext &context);
+	const void *Group();
 };
 
 struct ToySession {
@@ -51,6 +52,7 @@ default when absent:
 | `AcceptsType` | no expression crosses |
 | `AcceptsOperator` | every operator accepted |
 | `Detach` | nothing |
+| `Group` | the source is its own group |
 | `Session::Write` | no table may declare a write verb; one that does is refused at first use |
 | `Session::Ddl` | no table may declare `ALTER` or `DROP`, no schema `CREATE`; one that does is refused at first use |
 | `Session::Tables`, `Session::Describe` | the source's `Tables` and `Describe` |
@@ -112,8 +114,19 @@ did not declare. After the call the schema is listed and described again
 through `Session::Tables` and `Session::Describe` for the rest of that
 transaction, so the transaction sees its own uncommitted DDL and no other
 transaction's; once it commits or rolls back the schema is listed again through
-the source. Views, indexes, sequences and schemas themselves are
-never created through crossing.
+the source. Indexes, sequences and schemas themselves are never created
+through crossing.
+
+`CREATE VIEW` is a `CREATE` whose `ddl.create` is a `CreateViewInfo` and whose
+`ddl.plan` is the body, planned and folded as a read: floors only, the same plan
+`Session::Read` would get. A body that does not fold wholly onto the source is
+refused before the source is asked. The plan's columns are
+`CrossingViewColumnNames(view)`, in order; the plan itself names them `c0`, `c1`,
+... A source that stores views as SQL renders the plan rather than reusing
+`view.query`, which names the target's catalog: `DecodeSubstraitView` gives the
+body as a query with its columns named. A source that serves views lists and describes them as tables;
+`DROP VIEW` and `CREATE OR REPLACE VIEW` need `DROP` on the described view.
+A `CREATE` with no `ddl.plan` is a table.
 
 `CREATE TABLE ... AS` is a `CREATE` followed by an `INSERT` of the gathered
 rows into the new table, so it needs `CREATE` on the schema and `INSERT` on
@@ -162,6 +175,24 @@ carrying it on the target.
 - `AcceptsOperator` — asked per operator after its expressions passed.
 
 A yes claims the source computes the expression as DuckDB does.
+
+## Group
+
+Attaches whose sources return one non-null `Group()` cross together: a join or
+view body over them folds into one fragment, planned by whichever source owns
+its first scan. Return one group only for sources that answer `Accepts*` alike.
+A view's body must be in the group of the attach that holds the view.
+
+The fragment is read through one attach's session, so each floor must say where
+its table lives: pass `catalog` to `MakeFloorNode` when the group spans
+catalogs. Substrait then names the table `[catalog, schema, table]`, and
+`BindFloors` binds it there instead of in the receiver's catalog. A receiver
+decoding Substrait checks those catalogs with the `check` argument of
+`DecodeSubstraitJson` / `DecodeSubstraitView`.
+
+The session is the first scan's attach's, unless the transaction has written to
+another attach in the fragment. That attach's session is used instead, so the
+read sees the write.
 
 ## Read
 
@@ -321,8 +352,8 @@ void ToyExtension::Load(ExtensionLoader &loader) {
 passed through; the path is never opened as a file. The factory runs once per
 `ATTACH`. Registering installs the storage extension, transaction manager and,
 once per instance, the optimizer pass. The catalog holds the source's tables
-only; `CREATE TABLE`, `ALTER TABLE` and `DROP TABLE` go to the source when the
-verb is declared, and everything else is refused.
+only; `CREATE TABLE`, `ALTER TABLE`, `DROP TABLE`, `CREATE VIEW` and `DROP VIEW`
+go to the source when the verb is declared, and everything else is refused.
 
 ### Identity
 
@@ -352,7 +383,8 @@ class MyCatalog : public DuckCatalog, public CrossingAttachOwner {
 - `Ddl(context, transaction, owner, ddl)` — checks the verb, runs it in the
   transaction's session, forgets the schema. `DescribedSchema(schema)` is what
   the schema declares. `PlanCreateTableAs(...)` is what a catalog's own
-  `PlanCreateTableAs` forwards to.
+  `PlanCreateTableAs` forwards to; `CreateView(context, transaction, owner,
+  info)` what its schema's `CreateView` forwards to.
 - `ServesTable`, `ThrowIfServed`, `ThrowIfSchemaServed` — for a catalog that
   refuses `DROP`/`ALTER` instead.
 - `Session(context, transaction)`; `Release(transaction)` then

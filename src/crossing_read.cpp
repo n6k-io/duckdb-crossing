@@ -9,6 +9,7 @@
 #include "duckdb/common/string_util.hpp"
 #include "duckdb/execution/physical_plan_generator.hpp"
 #include "duckdb/planner/operator/logical_get.hpp"
+#include "duckdb/transaction/meta_transaction.hpp"
 #include "duckdb/transaction/transaction.hpp"
 
 namespace duckdb {
@@ -123,6 +124,28 @@ void CheckScanPartitions(const CrossingReadGlobalState &state, const string &sou
 		                            "an ordered scan must come back as one",
 		                            source_table, state.scan.partitions);
 	}
+}
+
+//! The host's catalog, unless this transaction wrote to another attach whose scans were folded in:
+//! only that attach's session sees the writes.
+Catalog &ReadingCatalog(ClientContext &context, CrossingBindData &bind_data) {
+	auto &host = bind_data.table.ParentCatalog();
+	auto modified = MetaTransaction::Get(context).ModifiedDatabase();
+	if (!modified) {
+		return host;
+	}
+	auto &modified_catalog = modified->GetCatalog();
+	auto attach = CrossingAttach::TryOf(modified_catalog);
+	if (!attach) {
+		return host;
+	}
+	auto &written = attach->Source();
+	for (auto &source : bind_data.fragment->folded_sources) {
+		if (&source.get() == &written) {
+			return modified_catalog;
+		}
+	}
+	return host;
 }
 
 } // namespace
@@ -304,7 +327,7 @@ unique_ptr<GlobalSourceState> CrossingRead::GetGlobalSourceState(ClientContext &
 	}
 	auto state = PrepareReadState(*bind_data->fragment, bind_data->SourceTable(), column_ids);
 
-	auto &catalog = bind_data->table.ParentCatalog();
+	auto &catalog = ReadingCatalog(context, *bind_data);
 	auto &session = CrossingAttach::Of(catalog).Session(context, Transaction::Get(context, catalog));
 	state->scan = session.Read(context, *state->query);
 	CheckScanPartitions(*state, bind_data->SourceTable());
