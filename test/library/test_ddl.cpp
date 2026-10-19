@@ -379,6 +379,13 @@ TEST_CASE("create view conflicts", "[ddl][view]") {
 	SECTION("if not exists leaves it") {
 		twin.Query("CREATE VIEW IF NOT EXISTS far.main.v AS SELECT amt FROM far.orders");
 		REQUIRE(FarColumns(twin, "v") == "id");
+		REQUIRE(twin.store->ddls.size() == 1);
+	}
+	SECTION("if not exists does not plan the body") {
+		twin.Query("CREATE TABLE local(x INTEGER)");
+		twin.Query("CREATE VIEW IF NOT EXISTS far.main.v AS SELECT o.id FROM far.orders o JOIN local l ON o.id = l.x");
+		REQUIRE(FarColumns(twin, "v") == "id");
+		REQUIRE(twin.store->ddls.size() == 1);
 	}
 }
 

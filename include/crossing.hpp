@@ -160,7 +160,7 @@ struct CrossingFloor {
 unique_ptr<LogicalOperator> MakeFloorNode(idx_t table_index, string schema, string table, vector<string> column_names,
                                           vector<LogicalType> column_types, string catalog = string());
 unique_ptr<LogicalOperator> MakeFloorNode(string schema, string table, vector<string> column_names,
-                                          vector<LogicalType> column_types);
+                                          vector<LogicalType> column_types, string catalog = string());
 
 optional_ptr<const CrossingFloor> FloorOf(const LogicalOperator &op);
 

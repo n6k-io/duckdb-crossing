@@ -400,6 +400,10 @@ void CrossingAttach::Ddl(ClientContext &context, Transaction &transaction, Schem
 
 optional_ptr<CatalogEntry> CrossingAttach::CreateView(ClientContext &context, Transaction &transaction,
                                                       SchemaCatalogEntry &owner, CreateViewInfo &info) {
+	if (info.on_conflict == OnCreateConflict::IGNORE_ON_CONFLICT &&
+	    ServesTable(owner.name, info.view_name, &transaction)) {
+		return LookupTable(owner.name, owner, info.view_name, &transaction);
+	}
 	auto binder = Binder::CreateBinder(context);
 	binder->SetSearchPath(owner.ParentCatalog(), owner.name);
 	auto query = info.query->Copy();

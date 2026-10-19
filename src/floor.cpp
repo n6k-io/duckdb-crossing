@@ -73,8 +73,9 @@ unique_ptr<LogicalOperator> MakeFloorNode(idx_t table_index, string schema, stri
 }
 
 unique_ptr<LogicalOperator> MakeFloorNode(string schema, string table, vector<string> column_names,
-                                          vector<LogicalType> column_types) {
-	return MakeFloorNode(0, std::move(schema), std::move(table), std::move(column_names), std::move(column_types));
+                                          vector<LogicalType> column_types, string catalog) {
+	return MakeFloorNode(0, std::move(schema), std::move(table), std::move(column_names), std::move(column_types),
+	                     std::move(catalog));
 }
 
 optional_ptr<const CrossingFloor> FloorOf(const LogicalOperator &op) {
