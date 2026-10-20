@@ -9,6 +9,11 @@
 
 namespace duckdb {
 
+//! Turns every update and delete that reads nothing of the rows it writes into one that names no key.
+//! Runs before any fold, while such a write still sits directly on its own table's scan.
+void FillBareWrites(ClientContext &context, unique_ptr<LogicalOperator> &plan, const FreshTableIndex &fresh,
+                    const CrossingIdentity &identity);
+
 //! Fills every write's seam from its feed: a fence where the feed crosses whole, otherwise a seam
 //! insert of the remainder.
 void FillWrites(ClientContext &context, unique_ptr<LogicalOperator> &plan, const FreshTableIndex &fresh,

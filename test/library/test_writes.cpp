@@ -234,11 +234,90 @@ TEST_CASE("a key whose NULL and zero rows are distinct keys is counted as two", 
 	twin.Far("INSERT INTO dup VALUES (0, 1), (NULL, 2)");
 	twin.Attach();
 
-	auto result = twin.Query("UPDATE far.dup SET v = 9");
+	auto result = twin.Query("UPDATE far.dup SET v = 9 WHERE v < 9");
 
 	REQUIRE(result->GetValue(0, 0) == Value::BIGINT(2));
 	REQUIRE(twin.LastWrite().rows.size() == 2);
 	REQUIRE(Scalar(twin, "SELECT count(*) FROM dup WHERE v = 9") == Value::BIGINT(2));
+}
+
+TEST_CASE("an update reading no row hands the source one row of values and no key", "[writes]") {
+	auto transport = EACH_TRANSPORT();
+	INFO(TransportName(transport));
+	Twin twin(transport);
+	twin.store->keys["dup"] = {"k"};
+	twin.store->key_unique["dup"] = false;
+	twin.Far("CREATE TABLE dup(k INTEGER, v INTEGER)");
+	twin.Far("INSERT INTO dup VALUES (1, 1), (1, 2), (2, 3)");
+	twin.Attach();
+
+	auto result = twin.Query("UPDATE far.dup SET v = 9");
+
+	REQUIRE(result->GetValue(0, 0) == Value::BIGINT(3));
+	auto &call = twin.LastWrite();
+	REQUIRE(call.key_columns.empty());
+	REQUIRE(call.set_columns == vector<string> {"v"});
+	REQUIRE(call.rows.size() == 1);
+	REQUIRE(twin.store->reads.empty());
+	REQUIRE(Scalar(twin, "SELECT count(*) FROM dup WHERE v = 9") == Value::BIGINT(3));
+}
+
+TEST_CASE("a delete reading no row hands the source no seam", "[writes]") {
+	auto transport = EACH_TRANSPORT();
+	INFO(TransportName(transport));
+	Twin twin(transport);
+	twin.store->keys["dup"] = {"k"};
+	twin.store->key_unique["dup"] = false;
+	twin.Far("CREATE TABLE dup(k INTEGER, v INTEGER)");
+	twin.Far("INSERT INTO dup VALUES (1, 1), (1, 2), (2, 3)");
+	twin.Attach();
+
+	auto result = twin.Query("DELETE FROM far.dup");
+
+	REQUIRE(result->GetValue(0, 0) == Value::BIGINT(3));
+	auto &call = twin.LastWrite();
+	REQUIRE(call.key_columns.empty());
+	REQUIRE(call.types.empty());
+	REQUIRE(twin.store->reads.empty());
+	REQUIRE(Scalar(twin, "SELECT count(*) FROM dup") == Value::BIGINT(0));
+}
+
+TEST_CASE("a write reading its rows still addresses them by key", "[writes]") {
+	auto transport = EACH_TRANSPORT();
+	INFO(TransportName(transport));
+	Twin twin(transport);
+	twin.Seed();
+
+	SECTION("a SET over a column") {
+		twin.Query("UPDATE far.orders SET amt = amt + 1");
+	}
+	SECTION("a WHERE") {
+		twin.Query("DELETE FROM far.orders WHERE id = 1");
+	}
+	SECTION("a RETURNING") {
+		twin.Query("DELETE FROM far.orders RETURNING id");
+	}
+	SECTION("a volatile SET") {
+		twin.Query("UPDATE far.orders SET amt = random()");
+	}
+
+	REQUIRE(twin.LastWrite().key_columns == vector<string> {"id"});
+}
+
+TEST_CASE("a table granted update and delete without select takes only writes reading no row", "[writes]") {
+	auto transport = EACH_TRANSPORT();
+	INFO(TransportName(transport));
+	Twin twin(transport);
+	twin.store->verbs["orders"] = {CrossingVerb::UPDATE, CrossingVerb::DELETE_};
+	twin.Seed();
+
+	REQUIRE(twin.Query("UPDATE far.orders SET amt = 0")->GetValue(0, 0) == Value::BIGINT(5));
+	for (auto &sql : {"UPDATE far.orders SET amt = amt + 1", "DELETE FROM far.orders WHERE id = 1",
+	                  "DELETE FROM far.orders RETURNING id", "SELECT * FROM far.orders"}) {
+		INFO(sql);
+		REQUIRE_THAT(twin.Error(sql), Catch::Contains("does not have 'select' permission"));
+	}
+	REQUIRE(twin.Query("DELETE FROM far.orders")->GetValue(0, 0) == Value::BIGINT(5));
 }
 
 TEST_CASE("a merge on a key the source vouches for does not count what it sent", "[writes]") {

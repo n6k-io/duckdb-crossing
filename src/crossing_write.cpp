@@ -410,6 +410,7 @@ CrossingSeamFilledWrite::CrossingSeamFilledWrite(const CrossingBindData &write, 
 	query->written = WrittenTable(table.source_schema, table.described, write.seam);
 	query->key_columns = write.seam.key_columns;
 	query->set_columns = write.seam.set_columns;
+	query->reads_rows = write.verb == CrossingVerb::INSERT || !write.seam.key_columns.empty();
 }
 
 CrossingSeamFilledWrite::~CrossingSeamFilledWrite() {

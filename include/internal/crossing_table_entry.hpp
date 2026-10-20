@@ -38,7 +38,8 @@ optional_ptr<CrossingTableCatalogEntry> CrossingTableOf(TableCatalogEntry &table
 
 TableStorageInfo UniqueConstraintStorageInfo(TableCatalogEntry &table);
 
-//! Turns every key alias in a crossing scan's column ids into the key column it stands for.
+//! Turns every key alias in a crossing scan's column ids into the key column it stands for. A scan
+//! still reading here is refused unless granted 'select'.
 void ResolveKeyAliases(LogicalOperator &plan, const CrossingIdentity &identity);
 
 } // namespace duckdb

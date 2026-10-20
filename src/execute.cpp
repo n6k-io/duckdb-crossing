@@ -220,7 +220,9 @@ unique_ptr<SQLStatement> DeleteOf(const CrossingWriteTarget &target, unique_ptr<
                                   const vector<string> &seam_columns) {
 	auto statement = make_uniq<DeleteStatement>();
 	statement->table = TargetRef(target);
-	statement->using_clauses.push_back(std::move(seam));
+	if (seam) {
+		statement->using_clauses.push_back(std::move(seam));
+	}
 	statement->condition = KeysMatch(target, seam_columns);
 	return std::move(statement);
 }
@@ -353,14 +355,19 @@ unique_ptr<TableRef> SeamRefOfRows(const ColumnDataCollection &rows) {
 }
 
 CrossingWriteStatement BuildWriteStatement(const CrossingWriteTarget &target, unique_ptr<TableRef> seam) {
-	if (target.verb != CrossingVerb::INSERT && target.key_columns.empty()) {
+	if (target.verb != CrossingVerb::INSERT && target.reads_rows && target.key_columns.empty()) {
 		throw InvalidInputException("crossing: a %s of '%s.%s' names no key columns to address rows by",
 		                            CrossingVerbName(target.verb), target.schema, target.table);
 	}
 	CrossingWriteStatement built;
 	built.seam_alias = SEAM_ALIAS;
 	built.seam_columns = SeamColumnNames(target);
-	auto named = SeamNamed(std::move(seam), built.seam_columns);
+	if (!seam != built.seam_columns.empty()) {
+		throw InvalidInputException("crossing: a %s of '%s.%s' carries %llu seam columns but %s seam",
+		                            CrossingVerbName(target.verb), target.schema, target.table,
+		                            built.seam_columns.size(), seam ? "was handed a" : "has no");
+	}
+	auto named = seam ? SeamNamed(std::move(seam), built.seam_columns) : nullptr;
 	switch (target.verb) {
 	case CrossingVerb::INSERT:
 		built.statement = InsertOf(target, std::move(named), built.seam_columns);
@@ -388,7 +395,7 @@ idx_t ExecuteWrite(ClientContext &context, const CrossingWriteTarget &target, un
                    const CrossingWriteShaper &shape) {
 	RequireTransaction(context, "ExecuteWrite");
 	Planner planner(context);
-	auto ref = SeamRefOfPlan(*planner.binder, std::move(seam));
+	auto ref = seam ? SeamRefOfPlan(*planner.binder, std::move(seam)) : nullptr;
 	return ExecuteBuilt(context, planner, target, BuildWriteStatement(target, std::move(ref)), shape);
 }
 

@@ -1,6 +1,7 @@
 #include "internal/crossing_table_entry.hpp"
 
 #include "internal/crossing_read.hpp"
+#include "internal/crossing_write.hpp"
 
 #include "duckdb/parser/constraints/unique_constraint.hpp"
 #include "duckdb/planner/operator/logical_get.hpp"
@@ -64,7 +65,10 @@ unique_ptr<BaseStatistics> CrossingTableCatalogEntry::GetStatistics(ClientContex
 }
 
 TableFunction CrossingTableCatalogEntry::GetScanFunction(ClientContext &, unique_ptr<FunctionData> &bind_data) {
-	if (!described.Allows(CrossingVerb::SELECT)) {
+	// An update or delete binds this scan too, so 'select' is required only once the pass sees the
+	// scan read (ResolveKeyAliases).
+	if (!described.Allows(CrossingVerb::SELECT) && !described.Allows(CrossingVerb::UPDATE) &&
+	    !described.Allows(CrossingVerb::DELETE_)) {
 		throw PermissionException("crossing: '%s' does not have 'select' permission", name);
 	}
 	bind_data = MakeReadBindData(*this);
@@ -121,6 +125,7 @@ void ResolveKeyAliases(LogicalOperator &plan, const CrossingIdentity &identity) 
 	if (!data || data->verb != CrossingVerb::SELECT) {
 		return;
 	}
+	RequireVerb(data->table, CrossingVerb::SELECT);
 	for (auto &column_index : get.GetMutableColumnIds()) {
 		if (!column_index.IsVirtualColumn()) {
 			continue;
