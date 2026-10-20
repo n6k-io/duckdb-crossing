@@ -11,6 +11,7 @@
 #include "duckdb/planner/expression/bound_columnref_expression.hpp"
 #include "duckdb/planner/operator/logical_delete.hpp"
 #include "duckdb/planner/operator/logical_dummy_scan.hpp"
+#include "duckdb/planner/operator/logical_expression_get.hpp"
 #include "duckdb/planner/operator/logical_get.hpp"
 #include "duckdb/planner/operator/logical_insert.hpp"
 #include "duckdb/planner/operator/logical_projection.hpp"
@@ -79,6 +80,21 @@ unique_ptr<LogicalOperator> SeamInsert(ClientContext &context, idx_t table_index
 	return std::move(insert);
 }
 
+void FillFromFeed(ClientContext &context, unique_ptr<LogicalOperator> &node, CrossingTableCatalogEntry &table,
+                  CrossingVerb verb, CrossingSeam seam, shared_ptr<CrossingFragment> fragment,
+                  unique_ptr<LogicalOperator> feed, const SeamObstacle &stop, bool returning,
+                  vector<idx_t> key_positions, const FreshTableIndex &fresh) {
+	auto table_index = TableIndexOf(*node);
+	auto fill = FillSeamFromFeed(std::move(feed), *fragment, table.source, stop, fresh);
+	auto write = MakeWriteBindData(table, verb, std::move(seam), std::move(fragment));
+	if (!fill.remainder) {
+		node = MakeFence(table_index, std::move(write));
+		return;
+	}
+	node =
+	    SeamInsert(context, table_index, std::move(write), returning, std::move(key_positions), std::move(fill), fresh);
+}
+
 void FillWrite(ClientContext &context, unique_ptr<LogicalOperator> &node, const FreshTableIndex &fresh,
                const CrossingIdentity &identity) {
 	auto table = CrossingTableOfWrite(*node, identity);
@@ -98,7 +114,6 @@ void FillWrite(ClientContext &context, unique_ptr<LogicalOperator> &node, const 
 	auto fragment = PlanWriteFragment(*table, verb, seam);
 	auto keys = table->KeyColumnIndexes();
 	auto returning = ReturnsRows(*node);
-	auto table_index = TableIndexOf(*node);
 	MaterialiseConstantRows(context, node->children[0]);
 	auto feed = FeedOf(*node, keys, std::move(node->children[0]), fresh);
 
@@ -116,14 +131,8 @@ void FillWrite(ClientContext &context, unique_ptr<LogicalOperator> &node, const 
 		stop.obstacle = "RETURNING needs the rows on the target";
 	}
 
-	auto fill = FillSeamFromFeed(std::move(feed.plan), *fragment, table->source, stop, fresh);
-	auto write = MakeWriteBindData(*table, verb, std::move(seam), std::move(fragment));
-	if (!fill.remainder) {
-		node = MakeFence(table_index, std::move(write));
-		return;
-	}
-	node =
-	    SeamInsert(context, table_index, std::move(write), returning, std::move(key_positions), std::move(fill), fresh);
+	FillFromFeed(context, node, *table, verb, std::move(seam), std::move(fragment), std::move(feed.plan), stop,
+	             returning, std::move(key_positions), fresh);
 }
 
 optional_ptr<LogicalGet> OwnScan(LogicalOperator &op, CrossingTableCatalogEntry &table,
@@ -164,7 +173,7 @@ vector<unique_ptr<Expression>> ValuesReadingNoRow(LogicalUpdate &update, Crossin
 		} else {
 			return {};
 		}
-		if (!IsColumnFreeExpression(*value)) {
+		if (!value->IsFoldable() || !IsColumnFreeExpression(*value)) {
 			return {};
 		}
 		values.push_back(std::move(value));
@@ -172,17 +181,19 @@ vector<unique_ptr<Expression>> ValuesReadingNoRow(LogicalUpdate &update, Crossin
 	return values;
 }
 
-unique_ptr<LogicalOperator> OneRowOf(vector<unique_ptr<Expression>> values, const vector<LogicalType> &types,
-                                     const FreshTableIndex &fresh) {
+unique_ptr<LogicalOperator> OneRowOf(ClientContext &context, vector<unique_ptr<Expression>> values,
+                                     const vector<LogicalType> &types, const FreshTableIndex &fresh) {
 	for (idx_t i = 0; i < values.size(); i++) {
 		if (values[i]->return_type != types[i]) {
 			values[i] = BoundCastExpression::AddDefaultCastToType(std::move(values[i]), types[i]);
 		}
 	}
-	auto projection = make_uniq<LogicalProjection>(fresh(), std::move(values));
-	projection->children.push_back(make_uniq<LogicalDummyScan>(fresh()));
-	projection->ResolveOperatorTypes();
-	return std::move(projection);
+	vector<vector<unique_ptr<Expression>>> rows;
+	rows.push_back(std::move(values));
+	unique_ptr<LogicalOperator> row = make_uniq<LogicalExpressionGet>(fresh(), types, std::move(rows));
+	MaterialiseConstantRows(context, row);
+	row->ResolveOperatorTypes();
+	return row;
 }
 
 //! An update or delete that reads nothing of the rows it writes addresses every row of the table, so
@@ -209,26 +220,21 @@ void FillBareWrite(ClientContext &context, unique_ptr<LogicalOperator> &node, co
 	RequireVerb(*table, verb);
 
 	CrossingSeam seam;
-	seam.reads_rows = false;
 	seam.set_columns = SetColumnsOf(*node, *table);
 	seam.types = ColumnTypesByName(*table, seam.set_columns);
-	auto table_index = TableIndexOf(*node);
 	if (verb == CrossingVerb::DELETE_) {
 		// Nothing goes in: DuckDB has no scan of zero columns to stand for a seam, so the source is not
 		// asked for a plan and the query carries a placeholder.
 		auto fragment = make_shared_ptr<CrossingFragment>();
 		fragment->plan = make_uniq<LogicalDummyScan>(fresh());
 		fragment->ResolveTypesAndText();
-		node = MakeFence(table_index, MakeWriteBindData(*table, verb, std::move(seam), std::move(fragment)));
+		node = MakeFence(TableIndexOf(*node), MakeWriteBindData(*table, verb, std::move(seam), std::move(fragment)));
 		return;
 	}
 	auto fragment = PlanWriteFragment(*table, verb, seam);
-	SeamFill fill;
-	fill.seam_types = seam.types;
-	fill.remainder = OneRowOf(std::move(values), seam.types, fresh);
-	fill.obstacle = "an update reading no row has its values worked out on the target";
-	node = SeamInsert(context, table_index, MakeWriteBindData(*table, verb, std::move(seam), std::move(fragment)), false,
-	                  {}, std::move(fill), fresh);
+	auto feed = OneRowOf(context, std::move(values), seam.types, fresh);
+	FillFromFeed(context, node, *table, verb, std::move(seam), std::move(fragment), std::move(feed), SeamObstacle(),
+	             false, {}, fresh);
 }
 
 } // namespace
@@ -239,19 +245,6 @@ void FillBareWrites(ClientContext &context, unique_ptr<LogicalOperator> &plan, c
 		FillBareWrites(context, child, fresh, identity);
 	}
 	FillBareWrite(context, plan, fresh, identity);
-}
-
-void ThrowIfUnreadableScans(LogicalOperator &plan, const CrossingIdentity &identity) {
-	for (auto &child : plan.children) {
-		ThrowIfUnreadableScans(*child, identity);
-	}
-	if (plan.type != LogicalOperatorType::LOGICAL_GET) {
-		return;
-	}
-	auto data = CrossingBindDataOf(plan.Cast<LogicalGet>(), identity);
-	if (data && data->verb == CrossingVerb::SELECT) {
-		RequireVerb(data->table, CrossingVerb::SELECT);
-	}
 }
 
 void FillWrites(ClientContext &context, unique_ptr<LogicalOperator> &plan, const FreshTableIndex &fresh,

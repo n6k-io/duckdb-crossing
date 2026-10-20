@@ -336,7 +336,6 @@ struct CrossingSeam {
 	vector<string> key_columns;
 	vector<string> set_columns;
 	vector<LogicalType> types;
-	bool reads_rows = true;
 };
 
 //! What the source is asked to plan. SELECT wants a scan of the table emitting one column per

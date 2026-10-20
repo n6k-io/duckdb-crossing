@@ -395,10 +395,7 @@ idx_t ExecuteWrite(ClientContext &context, const CrossingWriteTarget &target, un
                    const CrossingWriteShaper &shape) {
 	RequireTransaction(context, "ExecuteWrite");
 	Planner planner(context);
-	if (target.key_columns.empty() && target.set_columns.empty()) {
-		return ExecuteBuilt(context, planner, target, BuildWriteStatement(target, nullptr), shape);
-	}
-	auto ref = SeamRefOfPlan(*planner.binder, std::move(seam));
+	auto ref = seam ? SeamRefOfPlan(*planner.binder, std::move(seam)) : nullptr;
 	return ExecuteBuilt(context, planner, target, BuildWriteStatement(target, std::move(ref)), shape);
 }
 

@@ -66,9 +66,8 @@ void CrossingFoldPass(OptimizerExtensionInput &input, unique_ptr<LogicalOperator
 	if (PlanHoldsCrossing(*plan, identity)) {
 		MaterialiseConstantRows(input.context, plan);
 	}
-	ResolveKeyAliases(*plan, identity);
 	FillBareWrites(input.context, plan, fresh, identity);
-	ThrowIfUnreadableScans(*plan, identity);
+	ResolveKeyAliases(*plan, identity);
 	AddRowImageForReturning(*plan, identity);
 	FoldCrossableWorkIntoFragments(plan, fresh, identity);
 	FillWrites(input.context, plan, fresh, identity);

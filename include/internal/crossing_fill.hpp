@@ -14,9 +14,6 @@ namespace duckdb {
 void FillBareWrites(ClientContext &context, unique_ptr<LogicalOperator> &plan, const FreshTableIndex &fresh,
                     const CrossingIdentity &identity);
 
-//! A scan granted no 'select' is refused here rather than at bind, where a write's own scan binds too.
-void ThrowIfUnreadableScans(LogicalOperator &plan, const CrossingIdentity &identity);
-
 //! Fills every write's seam from its feed: a fence where the feed crosses whole, otherwise a seam
 //! insert of the remainder.
 void FillWrites(ClientContext &context, unique_ptr<LogicalOperator> &plan, const FreshTableIndex &fresh,

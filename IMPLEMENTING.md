@@ -276,7 +276,7 @@ CrossingWriter ToySession::Write(ClientContext &, const CrossingQuery &query) {
 - `RETURNING` never runs wholly on the source.
 - `query.reads_rows` is false on an update or delete with no `WHERE`, no
   `RETURNING` and no `SET` over a column. It names no key and writes every row of
-  the table: an update's seam holds one row of values, worked out on the target;
+  the table: an update's seam holds one row of values;
   a delete takes nothing (`query.types` is empty, `query.plan` a placeholder). A source with row
   policies can tell such a write, which needs no read of the rows, from one that
   reads them.

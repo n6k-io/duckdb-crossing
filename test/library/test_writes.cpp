@@ -297,6 +297,9 @@ TEST_CASE("a write reading its rows still addresses them by key", "[writes]") {
 	SECTION("a RETURNING") {
 		twin.Query("DELETE FROM far.orders RETURNING id");
 	}
+	SECTION("a volatile SET") {
+		twin.Query("UPDATE far.orders SET amt = random()");
+	}
 
 	REQUIRE(twin.LastWrite().key_columns == vector<string> {"id"});
 }
