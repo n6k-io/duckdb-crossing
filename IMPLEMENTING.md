@@ -152,7 +152,9 @@ CrossingPlan ToyDB::Plan(const CrossingPlanRequest &request) {
   Row filtering may be stacked on the floor here.
 - Write — a seam node: where the rows go. `request.seam.key_columns` then
   `set_columns` are the seam's column order: insert = row image in `Describe`
-  order; update = key then set columns; delete = key.
+  order; update = key then set columns; delete = key. An update that reads
+  nothing of its rows (`request.seam.reads_rows` false) names no key: its seam
+  is its set columns. A delete that reads nothing is never planned.
 - `CrossingPlan::Declined(reason)` refuses; the reason is in the error.
 - The plan names tables; it never scans them. A `LogicalGet` of your own storage
   is bound to the connection that made it and cannot travel, so crossing refuses
@@ -272,12 +274,21 @@ CrossingWriter ToySession::Write(ClientContext &, const CrossingQuery &query) {
 - `Wait()` / `waker.Wake()` as for readers.
 - `Done(n)` is the rows the source changed, which DuckDB reports.
 - `RETURNING` never runs wholly on the source.
+- `query.reads_rows` is false on an update or delete with no `WHERE`, no
+  `RETURNING` and no `SET` over a column. It names no key and writes every row of
+  the table: an update's seam holds one row of values, worked out on the target;
+  a delete takes nothing (`query.types` is empty, `query.plan` a placeholder). A source with row
+  policies can tell such a write, which needs no read of the rows, from one that
+  reads them.
 
 ### Running the write on a DuckDB
 
 ```cpp
 CrossingWriteTarget target {"mycatalog", query.written.schema, query.written.table, query.kind,
-                            query.key_columns, query.set_columns};
+                            query.key_columns, query.set_columns, query.reads_rows};
+if (query.types.empty()) {
+	return ExecuteWrite(context, target, unique_ptr<TableRef>());
+}
 if (auto rows = SeamRowsOf(query.plan)) {
 	return ExecuteWrite(context, target, SeamRefOfRows(*rows));
 }
@@ -290,7 +301,7 @@ return ExecuteWrite(context, target, std::move(plan));
 seam, binds it on `context` (a transaction must be open) and runs it, returning
 the rows changed. Keys match with `IS NOT DISTINCT FROM`. The seam is any
 `TableRef` whose columns are, by position, the key columns then the set
-columns, or a bound plan producing them. A shaper sees the statement before it
+columns, or a bound plan producing them; null when there are none. A shaper sees the statement before it
 binds, as `CrossingWriteStatement` with the seam's alias and column names, to
 add a row policy or a check.
 

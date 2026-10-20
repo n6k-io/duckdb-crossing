@@ -391,14 +391,15 @@ TableFunction CrossingWriteFunction() {
 
 CrossingSeamFilledWrite::CrossingSeamFilledWrite(const CrossingBindData &write, unique_ptr<ColumnDataCollection> rows)
     : table(write.table), fragment(write.fragment), slot(fragment->SeamSlot()) {
-	if (slot && (!rows || rows->Count() == 0)) {
+	auto takes_nothing = fragment->seam_types.empty();
+	if (slot && !takes_nothing && (!rows || rows->Count() == 0)) {
 		empty = true;
 		return;
 	}
 	if (!slot && rows) {
 		throw InternalException("crossing: rows were gathered for a seam a plan already fills");
 	}
-	if (slot) {
+	if (slot && !takes_nothing) {
 		seam_node = std::move(*slot);
 		auto table_index = seam_node->Cast<LogicalGet>().table_index;
 		*slot = make_uniq<LogicalColumnDataGet>(table_index, fragment->seam_types, std::move(rows));
@@ -410,6 +411,7 @@ CrossingSeamFilledWrite::CrossingSeamFilledWrite(const CrossingBindData &write, 
 	query->written = WrittenTable(table.source_schema, table.described, write.seam);
 	query->key_columns = write.seam.key_columns;
 	query->set_columns = write.seam.set_columns;
+	query->reads_rows = write.seam.reads_rows;
 }
 
 CrossingSeamFilledWrite::~CrossingSeamFilledWrite() {

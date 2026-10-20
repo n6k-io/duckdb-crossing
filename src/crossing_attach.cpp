@@ -1,6 +1,7 @@
 #include "crossing_attach.hpp"
 
 #include "internal/carrier.hpp"
+#include "internal/crossing_fill.hpp"
 #include "internal/crossing_table_entry.hpp"
 #include "internal/crossing_write.hpp"
 #include "internal/pass.hpp"
@@ -415,6 +416,7 @@ optional_ptr<CatalogEntry> CrossingAttach::CreateView(ClientContext &context, Tr
 	// No MaterialiseConstantRows: rows staged for one read cannot live on in a view, so a VALUES list
 	// keeps the body on the target.
 	ResolveKeyAliases(*bound.plan, identity);
+	ThrowIfUnreadableScans(*bound.plan, identity);
 	FoldCrossableWorkIntoFragments(bound.plan, fresh, identity);
 	auto fragment = CrossingReadFragmentOf(*bound.plan, identity);
 	if (!fragment || fragment->frozen || CrossingSourceOf(*bound.plan, identity)->Group() != source->Group()) {

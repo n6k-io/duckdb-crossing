@@ -64,7 +64,10 @@ unique_ptr<BaseStatistics> CrossingTableCatalogEntry::GetStatistics(ClientContex
 }
 
 TableFunction CrossingTableCatalogEntry::GetScanFunction(ClientContext &, unique_ptr<FunctionData> &bind_data) {
-	if (!described.Allows(CrossingVerb::SELECT)) {
+	// An update or delete binds this scan too, so 'select' is required only once the pass sees the
+	// scan read (ThrowIfUnreadableScans).
+	if (!described.Allows(CrossingVerb::SELECT) && !described.Allows(CrossingVerb::UPDATE) &&
+	    !described.Allows(CrossingVerb::DELETE_)) {
 		throw PermissionException("crossing: '%s' does not have 'select' permission", name);
 	}
 	bind_data = MakeReadBindData(*this);

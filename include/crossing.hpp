@@ -199,6 +199,11 @@ struct CrossingQuery {
 	//! The columns a write sets. An insert names every column of the table, in the order Describe
 	//! declared them. An update names the columns it sets. A delete names none.
 	vector<string> set_columns;
+	//! False on an update or delete that reads nothing of the rows it writes: no WHERE, no RETURNING,
+	//! no SET over a column. It names no key columns and addresses every row of the table; the seam
+	//! carries an update's one row of values. A delete takes nothing: `types` is empty, `plan` is a
+	//! placeholder, and the statement is built with a null seam.
+	bool reads_rows = true;
 };
 
 unique_ptr<LogicalOperator> MakeSeamNode(idx_t table_index, vector<LogicalType> types);
@@ -230,6 +235,8 @@ struct CrossingWriteTarget {
 	CrossingVerb verb;
 	vector<string> key_columns;
 	vector<string> set_columns;
+	//! As CrossingQuery::reads_rows: false lets an update or delete name no key columns.
+	bool reads_rows = true;
 };
 
 //! An INSERT, UPDATE or DELETE of the target reading its rows from the seam, as parser nodes. The
@@ -247,7 +254,7 @@ using CrossingWriteShaper = std::function<void(CrossingWriteStatement &)>;
 unique_ptr<TableRef> SeamRefOfRows(const ColumnDataCollection &rows);
 
 //! The statement `ExecuteWrite` binds. `seam` is any TableRef whose columns are, by position, the
-//! key columns then the set columns.
+//! key columns then the set columns; null when there are none.
 CrossingWriteStatement BuildWriteStatement(const CrossingWriteTarget &target, unique_ptr<TableRef> seam);
 
 //! Builds, binds and runs the write on `context`, which must have a transaction open. Returns the
@@ -329,6 +336,7 @@ struct CrossingSeam {
 	vector<string> key_columns;
 	vector<string> set_columns;
 	vector<LogicalType> types;
+	bool reads_rows = true;
 };
 
 //! What the source is asked to plan. SELECT wants a scan of the table emitting one column per

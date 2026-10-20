@@ -600,7 +600,7 @@ CrossingWriter FarSession::Write(ClientContext &, const CrossingQuery &query) {
 			store->write_arrived = false;
 		}
 		auto call = Record(query);
-		auto rows = Evaluate(query.plan, call);
+		auto rows = query.types.empty() ? vector<vector<Value>>() : Evaluate(query.plan, call);
 		call.rows = rows;
 		{
 			lock_guard<mutex> guard(store->lock);
@@ -622,6 +622,10 @@ idx_t FarSession::Apply(const CrossingQuery &query) {
 	target.verb = query.kind;
 	target.key_columns = query.key_columns;
 	target.set_columns = query.set_columns;
+	target.reads_rows = query.reads_rows;
+	if (query.types.empty()) {
+		return ExecuteWrite(*far.context, target, unique_ptr<TableRef>());
+	}
 	if (auto rows = SeamRowsOf(query.plan)) {
 		return ExecuteWrite(*far.context, target, SeamRefOfRows(*rows));
 	}
