@@ -73,6 +73,16 @@ struct FarStore {
 
 	idx_t read_partitions = 1;
 	bool partition_ordered_reads = false;
+	//! Non-zero: readers take blocks of this many rows from one counter per scan, block b with batch
+	//! index b.
+	idx_t batch_block_rows = 0;
+	//! Non-zero: block b goes to partition b % partitions with batch index b, which breaks the
+	//! contract once a thread drains a second partition.
+	idx_t round_robin_batch_rows = 0;
+	//! A batch-indexed scan whose pulls carry no index.
+	bool drop_batch_index = false;
+	//! An unindexed scan whose pulls carry an index.
+	bool stray_batch_index = false;
 	set<idx_t> partitions_read;
 	bool wait_before_chunks = false;
 	bool wake_before_returning = false;

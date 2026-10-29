@@ -119,10 +119,32 @@ void CheckScanPartitions(const CrossingReadGlobalState &state, const string &sou
 	if (state.scan.partitions == 0) {
 		throw InvalidInputException("crossing: the scan of '%s' offers no partitions", source_table);
 	}
-	if (state.query->ordered && state.scan.partitions > 1) {
-		throw InvalidInputException("crossing: the scan of '%s' is ordered but the source offered %llu partitions; "
-		                            "an ordered scan must come back as one",
+	if (state.query->ordered && state.scan.partitions > 1 && !state.scan.batch_indexed) {
+		throw InvalidInputException("crossing: the scan of '%s' is ordered but the source offered %llu partitions "
+		                            "without batch indexes; an ordered scan must come back as one or index its rows",
 		                            source_table, state.scan.partitions);
+	}
+}
+
+//! The thread's last index spans every reader it drained: DuckDB refuses an index that goes down.
+void CheckBatchIndex(const CrossingReadGlobalState &state, const CrossingReadLocalState &local,
+                     const CrossingReadResult &pulled, const string &source_table) {
+	if (!state.scan.batch_indexed) {
+		if (pulled.batch_index.IsValid()) {
+			throw InvalidInputException("crossing: the scan of '%s' is not batch indexed but a pull returned rows "
+			                            "with batch index %llu",
+			                            source_table, pulled.batch_index.GetIndex());
+		}
+		return;
+	}
+	if (!pulled.batch_index.IsValid()) {
+		throw InvalidInputException("crossing: the scan of '%s' is batch indexed but a pull returned rows without one",
+		                            source_table);
+	}
+	if (local.batch_index.IsValid() && pulled.batch_index.GetIndex() < local.batch_index.GetIndex()) {
+		throw InvalidInputException("crossing: the scan of '%s' handed batch index %llu after %llu on one thread; "
+		                            "batch indexes must never go down on a thread",
+		                            source_table, pulled.batch_index.GetIndex(), local.batch_index.GetIndex());
 	}
 }
 
@@ -357,6 +379,7 @@ SourceResultType CrossingRead::GetDataInternal(ExecutionContext &context, DataCh
 				throw InternalException("crossing: the scan of '%s' opened no reader for partition %llu", source_table,
 				                        claimed);
 			}
+			local.partition = claimed;
 		}
 		auto parking = CrossingParking::Of(input.interrupt_state);
 		local.source_chunk.Reset();
@@ -383,6 +406,8 @@ SourceResultType CrossingRead::GetDataInternal(ExecutionContext &context, DataCh
 			                            "query wants [%s]",
 			                            source_table, TypeList(produced), TypeList(expected));
 		}
+		CheckBatchIndex(state, local, pulled, source_table);
+		local.batch_index = pulled.batch_index;
 		EmitChunk(state, local.source_chunk, output);
 		return SourceResultType::HAVE_MORE_OUTPUT;
 	}
@@ -394,6 +419,27 @@ ProgressData CrossingRead::GetProgress(ClientContext &, GlobalSourceState &gstat
 	progress.done = static_cast<double>(state.finished_partitions.load());
 	progress.total = static_cast<double>(state.scan.partitions);
 	return progress;
+}
+
+OperatorPartitionData CrossingRead::GetPartitionData(ExecutionContext &, DataChunk &, GlobalSourceState &gstate,
+                                                     LocalSourceState &lstate,
+                                                     const OperatorPartitionInfo &partition_info) const {
+	if (partition_info.RequiresPartitionColumns()) {
+		throw InternalException("crossing: a read cannot partition by columns");
+	}
+	auto &state = gstate.Cast<CrossingReadGlobalState>();
+	auto &local = lstate.Cast<CrossingReadLocalState>();
+	return OperatorPartitionData(state.scan.batch_indexed ? local.batch_index.GetIndex() : local.partition);
+}
+
+//! The source ran the ORDER BY: no operator above re-sorts, so the rows must keep the order they
+//! arrive in even when insertion order is not preserved.
+OrderPreservationType CrossingRead::SourceOrder() const {
+	auto &fragment = bind_data->fragment;
+	if (fragment && fragment->plan && PlanIsOrdered(*fragment->plan)) {
+		return OrderPreservationType::FIXED_ORDER;
+	}
+	return OrderPreservationType::INSERTION_ORDER;
 }
 
 string CrossingRead::GetName() const {

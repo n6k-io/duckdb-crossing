@@ -26,6 +26,7 @@
 //   verdict    a yes, or a no with a reason
 //   obstacle   why a write cannot run wholly on its source
 
+#include "duckdb/common/optional_idx.hpp"
 #include "duckdb/common/optional_ptr.hpp"
 #include "duckdb/common/types.hpp"
 #include "duckdb/common/types/data_chunk.hpp"
@@ -283,14 +284,22 @@ private:
 
 //! What one pull produced. ROWS: `chunk` is filled; an empty chunk ends the partition like DONE.
 //! DONE: the partition is exhausted. WAIT: nothing yet; Wake() the waker and pull again.
+//! `batch_index` places the rows in the scan's order, and is given exactly when the scan is
+//! `batch_indexed`.
 struct CrossingReadResult {
 	enum class Outcome : uint8_t { ROWS, DONE, WAIT };
 
 	Outcome outcome = Outcome::DONE;
+	optional_idx batch_index;
 
 	static CrossingReadResult Rows() {
 		CrossingReadResult result;
 		result.outcome = Outcome::ROWS;
+		return result;
+	}
+	static CrossingReadResult Rows(idx_t batch_index) {
+		auto result = Rows();
+		result.batch_index = batch_index;
 		return result;
 	}
 	static CrossingReadResult Done() {
@@ -306,9 +315,16 @@ struct CrossingReadResult {
 //! One partition's rows, pulled by one thread. Fills the chunk with the next rows.
 using CrossingReader = std::function<CrossingReadResult(ClientContext &context, DataChunk &chunk, CrossingWaker waker)>;
 
-//! One Read. Each partition is opened once, by whichever thread takes it.
+//! One Read. Each partition is opened once, by whichever thread claims it; partitions are claimed
+//! in increasing order and a thread drains several in turn. An ordered scan must be one partition
+//! unless `batch_indexed`. Unindexed, a partition's rows are ordered by its number.
+//! `batch_indexed`: every ROWS carries a batch index, and DuckDB keeps rows in batch-index order
+//! wherever order matters. Across the scan no index is handed out after a larger one, as from one
+//! counter taken in stream order; indexes interleaved across partitions break this. One batch may
+//! span several pulls of the same reader; no two readers share one.
 struct CrossingScan {
 	idx_t partitions = 1;
+	bool batch_indexed = false;
 	std::function<CrossingReader(ClientContext &context, idx_t partition)> open;
 };
 

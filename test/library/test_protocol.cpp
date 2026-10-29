@@ -39,6 +39,81 @@ TEST_CASE("a source that partitions an ordered read is refused, not trusted", "[
 	twin.Same("SELECT id FROM far.orders");
 }
 
+TEST_CASE("an ordered read comes back in order across batch-indexed partitions", "[protocol]") {
+	auto [partitions, threads] = GENERATE(std::make_pair<idx_t, idx_t>(3, 4), std::make_pair<idx_t, idx_t>(8, 2));
+	INFO(partitions << " partitions on " << threads << " threads");
+	Twin twin(Transport::NATIVE);
+	twin.store->read_partitions = partitions;
+	twin.store->batch_block_rows = 7;
+	twin.Seed();
+	twin.Far("CREATE TABLE big AS SELECT (i * 7919) % 10007 AS id, i AS seq FROM range(10007) t(i)");
+	twin.Query("SET threads = " + to_string(threads));
+
+	auto opened = twin.store->readers_open;
+	twin.Same("SELECT id, seq FROM far.big ORDER BY id");
+	REQUIRE(twin.LastRead().ordered);
+	REQUIRE(twin.store->readers_open - opened == partitions);
+
+	twin.Query("SET preserve_insertion_order = false");
+	twin.Same("SELECT id, seq FROM far.big ORDER BY id DESC");
+	twin.Same("SELECT id FROM far.big ORDER BY id LIMIT 5");
+}
+
+TEST_CASE("batch-indexed partitions keep insertion order through CTAS", "[protocol]") {
+	auto [partitions, threads] = GENERATE(std::make_pair<idx_t, idx_t>(3, 4), std::make_pair<idx_t, idx_t>(8, 2));
+	INFO(partitions << " partitions on " << threads << " threads");
+	Twin twin(Transport::NATIVE);
+	twin.store->read_partitions = partitions;
+	twin.store->batch_block_rows = 5;
+	twin.Seed();
+	twin.Far("CREATE TABLE big AS SELECT i AS seq FROM range(10000) t(i)");
+	twin.Query("SET threads = " + to_string(threads));
+
+	auto opened = twin.store->readers_open;
+	twin.Query("CREATE TABLE near_copy AS SELECT seq FROM far.big");
+	REQUIRE(twin.store->readers_open - opened == partitions);
+	auto copied = twin.Query("SELECT seq FROM near_copy");
+	REQUIRE(copied->RowCount() == 10000);
+	for (idx_t r = 0; r < copied->RowCount(); r++) {
+		INFO("row " << r);
+		REQUIRE(copied->GetValue(0, r) == Value::BIGINT(NumericCast<int64_t>(r)));
+	}
+}
+
+TEST_CASE("batch indexes that go down on a thread are refused", "[protocol]") {
+	Twin twin(Transport::NATIVE);
+	twin.store->read_partitions = 3;
+	twin.store->round_robin_batch_rows = 5;
+	twin.Seed();
+	twin.Far("CREATE TABLE big AS SELECT i AS seq FROM range(100) t(i)");
+	twin.Query("SET threads = 1");
+
+	auto error = twin.Error("SELECT seq FROM far.big ORDER BY seq");
+
+	REQUIRE_THAT(error, Catch::Contains("batch indexes must never go down on a thread"));
+}
+
+TEST_CASE("a batch-indexed scan whose rows carry no index is refused", "[protocol]") {
+	Twin twin(Transport::NATIVE);
+	twin.store->batch_block_rows = 5;
+	twin.store->drop_batch_index = true;
+	twin.Seed();
+
+	auto error = twin.Error("SELECT id FROM far.orders");
+
+	REQUIRE_THAT(error, Catch::Contains("is batch indexed but a pull returned rows without one"));
+}
+
+TEST_CASE("an unindexed scan whose rows carry an index is refused", "[protocol]") {
+	Twin twin(Transport::NATIVE);
+	twin.store->stray_batch_index = true;
+	twin.Seed();
+
+	auto error = twin.Error("SELECT id FROM far.orders");
+
+	REQUIRE_THAT(error, Catch::Contains("is not batch indexed but a pull returned rows with batch index 0"));
+}
+
 TEST_CASE("a partitioned reader feeds a keyed write", "[protocol]") {
 	Twin twin(Transport::NATIVE);
 	twin.store->read_partitions = 2;

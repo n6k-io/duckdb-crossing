@@ -106,6 +106,8 @@ struct CrossingReadGlobalState : public GlobalSourceState {
 struct CrossingReadLocalState : public LocalSourceState {
 	DataChunk source_chunk;
 	CrossingReader reader;
+	idx_t partition = 0;
+	optional_idx batch_index;
 };
 
 class CrossingRead : public PhysicalOperator {
@@ -124,12 +126,21 @@ public:
 	SourceResultType GetDataInternal(ExecutionContext &context, DataChunk &chunk,
 	                                 OperatorSourceInput &input) const override;
 	ProgressData GetProgress(ClientContext &context, GlobalSourceState &gstate) const override;
+	OperatorPartitionData GetPartitionData(ExecutionContext &context, DataChunk &chunk, GlobalSourceState &gstate,
+	                                       LocalSourceState &lstate,
+	                                       const OperatorPartitionInfo &partition_info) const override;
 	bool IsSource() const override {
 		return true;
 	}
 	bool ParallelSource() const override {
 		return true;
 	}
+	//! Asked while planning, before the source says how it partitions: a reader's batch index or its
+	//! partition number always gives one.
+	bool SupportsPartitioning(const OperatorPartitionInfo &partition_info) const override {
+		return !partition_info.RequiresPartitionColumns();
+	}
+	OrderPreservationType SourceOrder() const override;
 
 	string GetName() const override;
 	InsertionOrderPreservingMap<string> ParamsToString() const override;
