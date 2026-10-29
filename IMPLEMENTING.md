@@ -219,7 +219,7 @@ prints it; `SerializeCrossingPlan(plan)` gives bytes.
   `Rows()` with an empty chunk ends the partition.
 - `partitions` > 1 lets DuckDB pull with that many threads; each thread opens
   and drains one partition at a time. Together partitions produce every row
-  once. A query with `ordered` set must have one partition.
+  once. Ordering and batch indexes: see `CrossingScan` in `include/crossing.hpp`.
 - A reader with nothing yet returns `Wait()` and calls `waker.Wake()` later from
   any thread. Wake is idempotent, safe before the pull returns and after the
   statement ended. Each pull gets its own waker.

@@ -123,12 +123,25 @@ struct ReaderHandle {
 	shared_ptr<FarStore> store;
 };
 
+void CopyBlock(const vector<vector<Value>> &rows, idx_t first, idx_t count, DataChunk &chunk) {
+	for (idx_t r = 0; r < count; r++) {
+		for (idx_t c = 0; c < chunk.ColumnCount(); c++) {
+			chunk.SetValue(c, r, rows[first + r][c]);
+		}
+	}
+	chunk.SetCardinality(count);
+}
+
+CrossingReadResult IndexedRows(const FarStore &store, idx_t batch_index) {
+	return store.drop_batch_index ? CrossingReadResult::Rows() : CrossingReadResult::Rows(batch_index);
+}
+
 CrossingReader FarReader(shared_ptr<const vector<vector<Value>>> rows, idx_t partitions, idx_t partition,
-                         shared_ptr<FarStore> store) {
+                         shared_ptr<FarStore> store, shared_ptr<idx_t> next_block) {
 	idx_t cursor = 0;
 	auto handle = make_shared_ptr<ReaderHandle>(store);
-	return [rows, partitions, partition, store, cursor, handle](ClientContext &, DataChunk &chunk,
-	                                                            CrossingWaker waker) mutable {
+	return [rows, partitions, partition, store, next_block, cursor, handle](ClientContext &, DataChunk &chunk,
+	                                                                        CrossingWaker waker) mutable {
 		{
 			lock_guard<mutex> guard(store->lock);
 			if (store->wait_before_chunks && store->arrived.erase(partition) == 0) {
@@ -139,6 +152,35 @@ CrossingReader FarReader(shared_ptr<const vector<vector<Value>>> rows, idx_t par
 				});
 				return CrossingReadResult::Wait();
 			}
+		}
+		if (store->batch_block_rows > 0) {
+			auto block_rows = MinValue<idx_t>(store->batch_block_rows, STANDARD_VECTOR_SIZE);
+			lock_guard<mutex> guard(store->lock);
+			idx_t block = *next_block;
+			idx_t first = block * block_rows;
+			if (first >= rows->size()) {
+				return CrossingReadResult::Done();
+			}
+			(*next_block)++;
+			CopyBlock(*rows, first, MinValue<idx_t>(block_rows, rows->size() - first), chunk);
+			store->partitions_read.insert(partition);
+			return IndexedRows(*store, block);
+		}
+		if (store->round_robin_batch_rows > 0) {
+			auto block_rows = MinValue<idx_t>(store->round_robin_batch_rows, STANDARD_VECTOR_SIZE);
+			idx_t block = cursor;
+			while (block % partitions != partition) {
+				block++;
+			}
+			idx_t first = block * block_rows;
+			if (first >= rows->size()) {
+				return CrossingReadResult::Done();
+			}
+			CopyBlock(*rows, first, MinValue<idx_t>(block_rows, rows->size() - first), chunk);
+			cursor = block + 1;
+			lock_guard<mutex> guard(store->lock);
+			store->partitions_read.insert(partition);
+			return IndexedRows(*store, block);
 		}
 		idx_t count = 0;
 		while (cursor < rows->size() && count < STANDARD_VECTOR_SIZE) {
@@ -156,7 +198,7 @@ CrossingReader FarReader(shared_ptr<const vector<vector<Value>>> rows, idx_t par
 		}
 		lock_guard<mutex> guard(store->lock);
 		store->partitions_read.insert(partition);
-		return CrossingReadResult::Rows();
+		return store->stray_batch_index ? CrossingReadResult::Rows(0) : CrossingReadResult::Rows();
 	};
 }
 
@@ -575,12 +617,15 @@ CrossingScan FarSession::Read(ClientContext &, const CrossingQuery &query) {
 	call.rows = *rows;
 	lock_guard<mutex> guard(store->lock);
 	store->reads.push_back(std::move(call));
-	auto partitions = query.ordered && !store->partition_ordered_reads ? 1 : store->read_partitions;
+	auto batch_indexed = store->batch_block_rows > 0 || store->round_robin_batch_rows > 0;
+	auto partitions = query.ordered && !store->partition_ordered_reads && !batch_indexed ? 1 : store->read_partitions;
 	auto store_ref = store;
+	auto next_block = make_shared_ptr<idx_t>(0);
 	CrossingScan scan;
 	scan.partitions = partitions;
+	scan.batch_indexed = batch_indexed;
 	scan.open = [=](ClientContext &, idx_t partition) {
-		return FarReader(rows, partitions, partition, store_ref);
+		return FarReader(rows, partitions, partition, store_ref, next_block);
 	};
 	return scan;
 }
