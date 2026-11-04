@@ -11,7 +11,7 @@ Value Scalar(Twin &twin, const string &far_sql) {
 	if (result->HasError()) {
 		FAIL(result->GetError());
 	}
-	return result->GetValue(0, 0);
+	return Collected(std::move(result))->GetValue(0, 0);
 }
 
 } // namespace
@@ -326,12 +326,42 @@ TEST_CASE("a merge on a key the source vouches for does not count what it sent",
 	Twin twin(transport);
 	twin.Seed();
 
-	auto result = twin.Query("MERGE INTO far.orders t USING (SELECT 2 AS id UNION ALL SELECT 2) s ON t.id = s.id "
+	auto result = twin.Query("MERGE INTO far.orders t USING (SELECT 2 AS id UNION ALL SELECT 3) s ON t.id = s.id "
 	                         "WHEN MATCHED THEN UPDATE SET amt = 0");
 
 	REQUIRE(result->GetValue(0, 0) == Value::BIGINT(2));
 	REQUIRE(twin.LastWrite().rows.size() == 2);
 	REQUIRE(Scalar(twin, "SELECT amt FROM orders WHERE id = 2") == Value::INTEGER(0));
+}
+
+TEST_CASE("a merge matching one target row twice is refused and changes nothing", "[writes]") {
+	auto transport = EACH_TRANSPORT();
+	INFO(TransportName(transport));
+	Twin twin(transport);
+	twin.Seed();
+
+	auto error = twin.Error("MERGE INTO far.orders t USING (SELECT 2 AS id UNION ALL SELECT 2) s ON t.id = s.id "
+	                        "WHEN MATCHED THEN UPDATE SET amt = 0");
+
+	REQUIRE_THAT(error, Catch::Contains("more than once"));
+	REQUIRE(Scalar(twin, "SELECT amt FROM orders WHERE id = 2") == Value::INTEGER(150));
+}
+
+TEST_CASE("a merge matching two rows that share a key the source does not vouch for is refused", "[writes]") {
+	auto transport = EACH_TRANSPORT();
+	INFO(TransportName(transport));
+	Twin twin(transport);
+	twin.store->keys["dup"] = {"k"};
+	twin.store->key_unique["dup"] = false;
+	twin.Far("CREATE TABLE dup(k INTEGER, v INTEGER)");
+	twin.Far("INSERT INTO dup VALUES (1, 10), (1, 20), (2, 30)");
+	twin.Attach();
+
+	auto error =
+	    twin.Error("MERGE INTO far.dup t USING (SELECT 1 AS k) s ON t.k = s.k WHEN MATCHED THEN UPDATE SET v = 0");
+
+	REQUIRE_THAT(error, Catch::Contains("more than once"));
+	REQUIRE(Scalar(twin, "SELECT count(*) FROM dup WHERE v = 0") == Value::BIGINT(0));
 }
 
 TEST_CASE("a merge lands its inserts and updates on the source", "[writes]") {

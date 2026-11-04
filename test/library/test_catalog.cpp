@@ -14,7 +14,7 @@ namespace {
 
 CrossingAttach &AttachedAs(Twin &twin, const string &alias) {
 	twin.con.BeginTransaction();
-	auto &attached = *twin.near.instance->GetDatabaseManager().GetDatabase(*twin.con.context, alias);
+	auto &attached = *twin.near.instance->GetDatabaseManager().GetDatabase(*twin.con.context, Identifier(alias));
 	twin.con.Commit();
 	return CrossingAttach::Of(attached.GetCatalog());
 }

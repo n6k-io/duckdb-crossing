@@ -37,7 +37,8 @@ TEST_CASE("a fragment with no plan has no seam slot", "[seam]") {
 
 TEST_CASE("writing through the slot puts another node in the seam's place", "[seam]") {
 	auto fragment = FragmentOverSeam(TwoIntegers());
-	auto replacement = make_uniq<LogicalProjection>(STUB_ABOVE_INDEX + 1, vector<unique_ptr<Expression>>());
+	auto replacement =
+	    make_uniq<LogicalProjection>(TableIndex(STUB_ABOVE_INDEX.index + 1), vector<unique_ptr<Expression>>());
 	auto *expected = replacement.get();
 
 	*fragment->SeamSlot() = std::move(replacement);

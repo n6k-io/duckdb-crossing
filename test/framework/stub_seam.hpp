@@ -17,16 +17,16 @@ namespace duckdb {
 inline FreshTableIndex TestIndices() {
 	auto next = make_shared_ptr<idx_t>(1000);
 	return [next]() {
-		return (*next)++;
+		return TableIndex((*next)++);
 	};
 }
 
-constexpr idx_t STUB_SEAM_INDEX = 30;
-constexpr idx_t STUB_ABOVE_INDEX = 31;
-constexpr idx_t STUB_ROWS_INDEX = 32;
+const TableIndex STUB_SEAM_INDEX = TableIndex(30);
+const TableIndex STUB_ABOVE_INDEX = TableIndex(31);
+const TableIndex STUB_ROWS_INDEX = TableIndex(32);
 
 inline unique_ptr<LogicalOperator> SeamNode(vector<LogicalType> types) {
-	return MakeSeamNode(STUB_SEAM_INDEX, std::move(types));
+	return MakeSeamNode(STUB_SEAM_INDEX.index, std::move(types));
 }
 
 inline unique_ptr<LogicalOperator> Rows(vector<LogicalType> types = {LogicalType::INTEGER, LogicalType::INTEGER}) {
@@ -34,9 +34,9 @@ inline unique_ptr<LogicalOperator> Rows(vector<LogicalType> types = {LogicalType
 	DataChunk chunk;
 	chunk.Initialize(Allocator::DefaultAllocator(), types);
 	for (idx_t i = 0; i < types.size(); i++) {
-		chunk.SetValue(i, 0, Value(types[i]));
+		chunk.data[i].SetValue(0, Value(types[i]));
 	}
-	chunk.SetCardinality(1);
+	chunk.SetChildCardinality(1);
 	collection->Append(chunk);
 	return make_uniq<LogicalColumnDataGet>(STUB_ROWS_INDEX, std::move(types), std::move(collection));
 }

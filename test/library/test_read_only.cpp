@@ -16,7 +16,7 @@ TEST_CASE("a source whose session has no Write reads and refuses writes", "[read
 
 	auto count = con.Query("SELECT count(*) FROM ro.t");
 	REQUIRE(!count->HasError());
-	REQUIRE(count->GetValue(0, 0) == Value::BIGINT(0));
+	REQUIRE(count->Collection().GetValue(0, 0) == Value::BIGINT(0));
 
 	auto insert = con.Query("INSERT INTO ro.t VALUES (1)");
 	REQUIRE(insert->HasError());

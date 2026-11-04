@@ -280,9 +280,9 @@ CatalogEntry &CrossingAttach::GetOrDescribe(SchemaState &state, const string &sc
 
 	// `name`, not described.name: a source that renames a table under us would otherwise produce
 	// an entry nothing can resolve.
-	auto create_info = make_uniq<CreateTableInfo>(owner, name);
+	auto create_info = make_uniq<CreateTableInfo>(owner, Identifier(name));
 	for (idx_t c = 0; c < column_names.size(); c++) {
-		create_info->columns.AddColumn(ColumnDefinition(column_names[c], column_types[c]));
+		create_info->columns.AddColumn(ColumnDefinition(Identifier(column_names[c]), column_types[c]));
 	}
 	for (auto &constraint : described.constraints) {
 		create_info->constraints.push_back(constraint->Copy());
@@ -365,7 +365,7 @@ void CrossingAttach::Authorize(SchemaCatalogEntry &owner, const CrossingDdl &ddl
 	}
 	auto described = Described(ddl.schema, owner, ddl.table, transaction);
 	if (!described) {
-		throw CatalogException::MissingEntry(CatalogType::TABLE_ENTRY, ddl.table, string());
+		throw CatalogException::MissingEntry(CatalogType::TABLE_ENTRY, Identifier(ddl.table), string());
 	}
 	if (!described->Allows(ddl.verb)) {
 		throw PermissionException("crossing: '%s' does not have '%s' permission", ddl.table,
@@ -400,9 +400,10 @@ void CrossingAttach::Ddl(ClientContext &context, Transaction &transaction, Schem
 
 optional_ptr<CatalogEntry> CrossingAttach::CreateView(ClientContext &context, Transaction &transaction,
                                                       SchemaCatalogEntry &owner, CreateViewInfo &info) {
-	if (info.on_conflict == OnCreateConflict::IGNORE_ON_CONFLICT &&
-	    ServesTable(owner.name, info.view_name, &transaction)) {
-		return LookupTable(owner.name, owner, info.view_name, &transaction);
+	auto &schema_name = owner.name.GetIdentifierName();
+	auto &view_name = info.GetViewName().GetIdentifierName();
+	if (info.on_conflict == OnCreateConflict::IGNORE_ON_CONFLICT && ServesTable(schema_name, view_name, &transaction)) {
+		return LookupTable(schema_name, owner, view_name, &transaction);
 	}
 	auto binder = Binder::CreateBinder(context);
 	binder->SetSearchPath(owner.ParentCatalog(), owner.name);
@@ -418,21 +419,21 @@ optional_ptr<CatalogEntry> CrossingAttach::CreateView(ClientContext &context, Tr
 	FoldCrossableWorkIntoFragments(bound.plan, fresh, identity);
 	auto fragment = CrossingReadFragmentOf(*bound.plan, identity);
 	if (!fragment || fragment->frozen || CrossingSourceOf(*bound.plan, identity)->Group() != source->Group()) {
-		throw BinderException("crossing: the body of view '%s' does not run wholly on the source", info.view_name);
+		throw BinderException("crossing: the body of view '%s' does not run wholly on the source", view_name);
 	}
 	if (fragment->plan->types.size() != info.names.size()) {
-		throw InternalException("crossing: view '%s' plans %llu columns but names %llu", info.view_name,
+		throw InternalException("crossing: view '%s' plans %llu columns but names %llu", view_name,
 		                        fragment->plan->types.size(), info.names.size());
 	}
 
 	CrossingDdl ddl;
 	ddl.verb = CrossingVerb::CREATE;
-	ddl.schema = owner.name;
-	ddl.table = info.view_name;
+	ddl.schema = schema_name;
+	ddl.table = view_name;
 	ddl.create = &info;
 	ddl.plan = fragment->plan.get();
 	Ddl(context, transaction, owner, ddl);
-	return LookupTable(owner.name, owner, info.view_name, &transaction);
+	return LookupTable(schema_name, owner, view_name, &transaction);
 }
 
 CrossingAttach::Slot &CrossingAttach::SlotOf(Transaction &transaction) {

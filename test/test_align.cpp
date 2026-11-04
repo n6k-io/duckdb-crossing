@@ -40,13 +40,13 @@ TEST_CASE("a scan naming nothing the source has falls back to counting", "[align
 
 TEST_CASE("the fragment takes the scan's table index", "[align]") {
 	auto scan = Scan();
-	scan->Cast<LogicalGet>().table_index = 41;
+	scan->Cast<LogicalGet>().table_index = TableIndex(41);
 
 	Align(scan);
 
 	auto fragment = CrossingReadFragmentOf(*scan, MemoryIdentity());
-	REQUIRE(fragment->table_index == 41);
-	REQUIRE(fragment->crossing_projection->table_index == 41);
+	REQUIRE(fragment->table_index.index == 41);
+	REQUIRE(fragment->crossing_projection->table_index.index == 41);
 }
 
 TEST_CASE("aligning again follows the scan", "[align]") {

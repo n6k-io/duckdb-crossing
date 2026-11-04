@@ -8,7 +8,7 @@ if(NOT CMAKE_SOURCE_DIR STREQUAL CMAKE_CURRENT_SOURCE_DIR)
   return()
 endif()
 
-set(CMAKE_CXX_STANDARD 14)
+set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
 set(DUCKDB_SOURCE_DIR
@@ -19,13 +19,10 @@ set(DUCKDB_BUILD_DIR
     CACHE PATH "Directory of a configured duckdb build, for libduckdb_static.a")
 
 set(DUCKDB_STATIC_LIB ${DUCKDB_BUILD_DIR}/src/libduckdb_static.a)
-set(DUCKDB_LOADER_LIB
-    ${DUCKDB_BUILD_DIR}/extension/libduckdb_generated_extension_loader.a)
 set(DUCKDB_CORE_FUNCTIONS_LIB
     ${DUCKDB_BUILD_DIR}/extension/core_functions/libcore_functions_extension.a)
 
-foreach(lib ${DUCKDB_STATIC_LIB} ${DUCKDB_LOADER_LIB}
-            ${DUCKDB_CORE_FUNCTIONS_LIB})
+foreach(lib ${DUCKDB_STATIC_LIB} ${DUCKDB_CORE_FUNCTIONS_LIB})
   if(NOT EXISTS ${lib})
     message(
       FATAL_ERROR "missing ${lib} -- set DUCKDB_BUILD_DIR to a built duckdb")
@@ -38,21 +35,40 @@ crossing_includes(CROSSING_INCLUDES)
 
 find_package(Threads REQUIRED)
 
+set(LINK_EXTENSION_LIST core_functions)
+set(DESCRIBE_DECLARATIONS
+    "int32_t duckdb_extension_core_functions_describe(duckdb_extension_descriptor *descriptor);"
+)
+set(DESCRIBE_REGISTRATIONS
+    "\tif (duckdb_register_static_extension(duckdb_extension_core_functions_describe) != 0) {\n\t\tresult = 1;\n\t}"
+)
+set(CROSSING_EXTENSION_LOADER
+    ${CMAKE_CURRENT_BINARY_DIR}/crossing_static_extension_loader.c)
+configure_file(
+  ${DUCKDB_SOURCE_DIR}/extension/loader/static_extension_loader.c.in
+  ${CROSSING_EXTENSION_LOADER} @ONLY)
+
 function(crossing_test_target target)
-  add_executable(${target} test/unittest_main.cpp ${ARGN})
+  add_executable(
+    ${target}
+    test/unittest_main.cpp ${CROSSING_EXTENSION_LOADER}
+    ${DUCKDB_SOURCE_DIR}/extension/loader/static_extension_autoregister.cpp
+    ${ARGN})
   target_include_directories(
     ${target}
     PRIVATE ${DUCKDB_SOURCE_DIR}/src/include
-            ${DUCKDB_SOURCE_DIR}/third_party/catch ${CMAKE_CURRENT_SOURCE_DIR}
+            ${DUCKDB_SOURCE_DIR}/third_party/catch
+            ${DUCKDB_SOURCE_DIR}/third_party/fmt/include
+            ${CMAKE_CURRENT_SOURCE_DIR}
             ${CROSSING_INCLUDES} ${CMAKE_CURRENT_SOURCE_DIR}/test)
   if(APPLE)
     target_link_libraries(
-      ${target} ${DUCKDB_LOADER_LIB} ${DUCKDB_CORE_FUNCTIONS_LIB}
-      ${DUCKDB_STATIC_LIB} Threads::Threads)
+      ${target} ${DUCKDB_CORE_FUNCTIONS_LIB} ${DUCKDB_STATIC_LIB}
+      Threads::Threads)
   else()
     target_link_libraries(
-      ${target} -Wl,--start-group ${DUCKDB_LOADER_LIB}
-      ${DUCKDB_CORE_FUNCTIONS_LIB} ${DUCKDB_STATIC_LIB} -Wl,--end-group
+      ${target} -Wl,--start-group ${DUCKDB_CORE_FUNCTIONS_LIB}
+      ${DUCKDB_STATIC_LIB} -Wl,--end-group
       Threads::Threads ${CMAKE_DL_LIBS})
   endif()
 endfunction()
@@ -85,6 +101,7 @@ function(crossing_contract_case name)
               test/contract/${name}.cpp)
   target_include_directories(
     contract_${name} PRIVATE ${DUCKDB_SOURCE_DIR}/src/include
+                             ${DUCKDB_SOURCE_DIR}/third_party/fmt/include
                              ${CROSSING_INCLUDES})
 endfunction()
 

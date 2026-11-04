@@ -43,7 +43,7 @@ TEST_CASE("what fills the seam answers to the seam's index", "[split]") {
 
 	REQUIRE(!fragment->SeamSlot());
 	auto &above = fragment->plan->Cast<LogicalProjection>().expressions[0]->Cast<BoundColumnRefExpression>();
-	REQUIRE(fragment->plan->children[0]->GetColumnBindings()[0].table_index == above.binding.table_index);
+	REQUIRE(fragment->plan->children[0]->GetColumnBindings()[0].table_index == above.Binding().table_index);
 	REQUIRE_NOTHROW(fragment->VerifyInvariants());
 }
 
@@ -126,7 +126,7 @@ TEST_CASE("the crossed prefix reads the new seam", "[split]") {
 	auto seam_index = seam.Cast<LogicalGet>().table_index;
 	auto &above = *fragment->plan->children[0]->children[0];
 	for (auto &expr : above.expressions) {
-		REQUIRE(expr->Cast<BoundColumnRefExpression>().binding.table_index == seam_index);
+		REQUIRE(expr->Cast<BoundColumnRefExpression>().Binding().table_index == seam_index);
 	}
 }
 

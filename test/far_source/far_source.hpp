@@ -18,6 +18,47 @@ enum class Transport { NATIVE, SUBSTRAIT };
 
 const char *TransportName(Transport transport);
 
+class TestResult {
+public:
+	explicit TestResult(unique_ptr<QueryResult> result_p) : result(std::move(result_p)) {
+		if (!result->HasError()) {
+			types = result->GetTypes();
+			for (auto &name : result->GetNames()) {
+				names.push_back(name.GetIdentifierName());
+			}
+		}
+	}
+
+	bool HasError() const {
+		return result->HasError();
+	}
+	const string &GetError() const {
+		return result->GetError();
+	}
+	void ThrowError() const {
+		result->ThrowError();
+	}
+	idx_t ColumnCount() const {
+		return types.size();
+	}
+	idx_t RowCount() {
+		return result->RowCount();
+	}
+	Value GetValue(idx_t column, idx_t row) {
+		return result->Collection().GetValue(column, row);
+	}
+
+	vector<LogicalType> types;
+	vector<string> names;
+
+private:
+	unique_ptr<QueryResult> result;
+};
+
+inline unique_ptr<TestResult> Collected(unique_ptr<QueryResult> result) {
+	return make_uniq<TestResult>(std::move(result));
+}
+
 struct FarCall {
 	CrossingVerb kind;
 	string plan_text;
@@ -52,6 +93,7 @@ struct FarStore {
 	mutex lock;
 
 	case_insensitive_set_t refused_functions;
+	vector<string> calls_asked;
 	vector<LogicalTypeId> refused_types;
 	vector<LogicalOperatorType> refused_operators;
 	case_insensitive_map_t<vector<string>> keys;
@@ -79,9 +121,7 @@ struct FarStore {
 	//! Non-zero: block b goes to partition b % partitions with batch index b, which breaks the
 	//! contract once a thread drains a second partition.
 	idx_t round_robin_batch_rows = 0;
-	//! A batch-indexed scan whose pulls carry no index.
 	bool drop_batch_index = false;
-	//! An unindexed scan whose pulls carry an index.
 	bool stray_batch_index = false;
 	set<idx_t> partitions_read;
 	bool wait_before_chunks = false;

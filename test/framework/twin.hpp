@@ -64,8 +64,8 @@ struct Twin {
 		Attach();
 	}
 
-	unique_ptr<MaterializedQueryResult> Query(const string &sql) {
-		auto result = con.Query(sql);
+	unique_ptr<TestResult> Query(const string &sql) {
+		auto result = Collected(con.Query(sql));
 		store->JoinArrivals();
 		if (result->HasError()) {
 			FAIL(sql + "\n" + result->GetError());
@@ -93,7 +93,7 @@ struct Twin {
 	void Same(const string &near_sql, const string &far_sql) {
 		INFO("near: " << near_sql);
 		INFO("far:  " << far_sql);
-		auto expected = store->con.Query(far_sql);
+		auto expected = Collected(store->con.Query(far_sql));
 		if (expected->HasError()) {
 			FAIL(expected->GetError());
 		}
@@ -129,7 +129,7 @@ struct Twin {
 	}
 
 private:
-	static vector<vector<Value>> Rows(MaterializedQueryResult &result) {
+	static vector<vector<Value>> Rows(TestResult &result) {
 		vector<vector<Value>> out;
 		for (idx_t r = 0; r < result.RowCount(); r++) {
 			vector<Value> row;
@@ -186,8 +186,8 @@ struct Pair {
 		Query("ATTACH 'other.example.com' AS other (TYPE otherdb)");
 	}
 
-	unique_ptr<MaterializedQueryResult> Query(const string &sql) {
-		auto result = con.Query(sql);
+	unique_ptr<TestResult> Query(const string &sql) {
+		auto result = Collected(con.Query(sql));
 		far->JoinArrivals();
 		other->JoinArrivals();
 		if (result->HasError()) {
@@ -197,7 +197,7 @@ struct Pair {
 	}
 
 	static Value Scalar(FarStore &store, const string &sql) {
-		auto result = store.con.Query(sql);
+		auto result = Collected(store.con.Query(sql));
 		if (result->HasError()) {
 			FAIL(result->GetError());
 		}

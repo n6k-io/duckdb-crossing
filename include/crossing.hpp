@@ -30,6 +30,7 @@
 #include "duckdb/common/optional_ptr.hpp"
 #include "duckdb/common/types.hpp"
 #include "duckdb/common/types/data_chunk.hpp"
+#include "duckdb/planner/logical_operator.hpp"
 #include "duckdb/common/vector.hpp"
 #include "duckdb/common/string.hpp"
 #include "duckdb/common/unique_ptr.hpp"
@@ -51,7 +52,7 @@ class ColumnDataCollection;
 class DatabaseInstance;
 class TableRef;
 class SQLStatement;
-class PendingQueryResult;
+class QueryResult;
 struct AttachInfo;
 struct CreateInfo;
 struct CreateViewInfo;
@@ -61,7 +62,7 @@ struct DropInfo;
 //! DELETE_ trails an underscore: DELETE is a macro in some Windows SDK headers.
 enum class CrossingVerb : uint8_t { SELECT = 0, INSERT = 1, UPDATE = 2, DELETE_ = 3, CREATE = 4, ALTER = 5, DROP = 6 };
 
-//! Lowercase wire spelling, as reported by the permissions function.
+//! Lowercase, and `delete` for DELETE_.
 const char *CrossingVerbName(CrossingVerb verb);
 
 const vector<CrossingVerb> &CrossingVerbs();
@@ -224,10 +225,9 @@ void BindFloors(ClientContext &context, unique_ptr<LogicalOperator> &plan, const
                 const CrossingFloorResolver &resolver = nullptr);
 
 //! Runs a bound plan on `context` as a query. Use this rather than LogicalPlanStatement: DuckDB
-//! copies a statement before planning it when an extension can ask for a rebind, and a plan
-//! holding a source's own scan cannot be copied.
-unique_ptr<PendingQueryResult> PendingCrossingPlan(ClientContext &context, unique_ptr<LogicalOperator> plan,
-                                                   bool stream);
+//! copies a statement before planning it when a ClientContextState can request a rebind, and that
+//! statement cannot be copied.
+unique_ptr<QueryResult> SubmitCrossingPlan(ClientContext &context, unique_ptr<LogicalOperator> plan);
 
 struct CrossingWriteTarget {
 	string catalog;
@@ -283,7 +283,8 @@ private:
 };
 
 //! What one pull produced. ROWS: `chunk` is filled; an empty chunk ends the partition like DONE.
-//! DONE: the partition is exhausted. WAIT: nothing yet; Wake() the waker and pull again.
+//! DONE: the partition is exhausted. WAIT: nothing yet; call the waker's Wake() when there is and
+//! DuckDB pulls again. A reader that never wakes stalls the scan.
 //! `batch_index` places the rows in the scan's order, and is given exactly when the scan is
 //! `batch_indexed`.
 struct CrossingReadResult {

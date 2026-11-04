@@ -5,7 +5,7 @@ using namespace duckdb;
 namespace {
 
 Value FarScalar(Twin &twin, const string &sql) {
-	auto result = twin.store->con.Query(sql);
+	auto result = Collected(twin.store->con.Query(sql));
 	if (result->HasError()) {
 		FAIL(result->GetError());
 	}
@@ -233,11 +233,12 @@ TEST_CASE("concurrent ddl transactions do not see each other's pending schema", 
 
 	twin.Query("DROP TABLE far.orders");
 
-	REQUIRE(other_query("SELECT count(*) FROM far.orders")->GetValue(0, 0) == Value::BIGINT(5));
-	REQUIRE(other_query("SELECT count(*) FROM duckdb_tables() WHERE database_name = 'far' AND table_name IN "
-	                    "('orders', 'theirs')")
+	REQUIRE(Collected(other_query("SELECT count(*) FROM far.orders"))->GetValue(0, 0) == Value::BIGINT(5));
+	REQUIRE(Collected(other_query("SELECT count(*) FROM duckdb_tables() WHERE database_name = 'far' AND table_name IN "
+	                              "('orders', 'theirs')"))
 	            ->GetValue(0, 0) == Value::BIGINT(2));
-	REQUIRE(other_query("SELECT count(*) FROM duckdb_tables() WHERE database_name = 'far' AND table_name = 'mine'")
+	REQUIRE(Collected(
+	            other_query("SELECT count(*) FROM duckdb_tables() WHERE database_name = 'far' AND table_name = 'mine'"))
 	            ->GetValue(0, 0) == Value::BIGINT(0));
 	REQUIRE(twin.Query("SELECT count(*) FROM duckdb_tables() WHERE database_name = 'far' AND table_name = 'theirs'")
 	            ->GetValue(0, 0) == Value::BIGINT(0));
@@ -251,7 +252,7 @@ TEST_CASE("uncommitted ddl is invisible to other transactions", "[ddl]") {
 	twin.Seed();
 	Connection other(twin.near);
 	auto other_scalar = [&](const string &sql) {
-		auto result = other.Query(sql);
+		auto result = Collected(other.Query(sql));
 		if (result->HasError()) {
 			FAIL(sql + "\n" + result->GetError());
 		}

@@ -19,13 +19,13 @@ CrossingTableCatalogEntry::CrossingTableCatalogEntry(Catalog &catalog, SchemaCat
                                                      CreateTableInfo &info, CrossingSource &source_p,
                                                      string source_schema_p, CrossingTable described_p)
     : TableCatalogEntry(catalog, schema, info), source(source_p), source_schema(std::move(source_schema_p)),
-      described(std::move(described_p)) {
+      described(std::move(described_p)), columns(info.columns.Copy()) {
 }
 
 vector<column_t> CrossingTableCatalogEntry::KeyColumnIndexes() const {
 	vector<column_t> out;
 	for (auto &key : described.key) {
-		out.push_back(GetColumns().GetColumn(key).Logical().index);
+		out.push_back(GetColumns().GetColumn(Identifier(key)).Logical().index);
 	}
 	return out;
 }

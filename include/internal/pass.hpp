@@ -7,7 +7,7 @@
 
 namespace duckdb {
 
-//! Moves everything that can cross to the source: every subtree that runs wholly on one source folds
+//! Moves everything that can cross to the source: every subtree that runs wholly on one group folds
 //! into a crossing scan.
 //!
 //! Wire into the optimizer's pre hook. Running before duckdb's optimizers means the plan is still

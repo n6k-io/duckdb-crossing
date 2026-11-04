@@ -4,8 +4,7 @@
 #include "duckdb/common/types/column/column_data_collection.hpp"
 #include "duckdb/main/appender.hpp"
 #include "duckdb/main/extension/extension_loader.hpp"
-#include "duckdb/main/materialized_query_result.hpp"
-#include "duckdb/main/pending_query_result.hpp"
+#include "duckdb/main/query_result.hpp"
 #include "duckdb/main/query_parameters.hpp"
 #include "duckdb/main/relation.hpp"
 #include "duckdb/parser/parsed_data/alter_info.hpp"
@@ -35,12 +34,12 @@ vector<vector<Value>> RowsOf(QueryResult &result) {
 	if (result.HasError()) {
 		result.ThrowError();
 	}
-	auto &materialized = result.Cast<MaterializedQueryResult>();
+	auto &rows = result.Collection();
 	vector<vector<Value>> out;
-	for (idx_t r = 0; r < materialized.RowCount(); r++) {
+	for (idx_t r = 0; r < rows.Count(); r++) {
 		vector<Value> row;
-		for (idx_t c = 0; c < materialized.ColumnCount(); c++) {
-			row.push_back(materialized.GetValue(c, r));
+		for (idx_t c = 0; c < rows.ColumnCount(); c++) {
+			row.push_back(rows.GetValue(c, r));
 		}
 		out.push_back(std::move(row));
 	}
@@ -81,14 +80,8 @@ void CollectOperators(const LogicalOperator &op, vector<LogicalOperatorType> &ou
 }
 
 unique_ptr<QueryResult> RunPlan(Connection &con, unique_ptr<LogicalOperator> plan) {
-	auto pending = PendingCrossingPlan(*con.context, std::move(plan), false);
-	if (pending->HasError()) {
-		pending->ThrowError();
-	}
-	auto result = pending->Execute();
-	if (result->HasError()) {
-		result->ThrowError();
-	}
+	auto result = SubmitCrossingPlan(*con.context, std::move(plan));
+	result->ThrowIfError();
 	return result;
 }
 
@@ -126,10 +119,10 @@ struct ReaderHandle {
 void CopyBlock(const vector<vector<Value>> &rows, idx_t first, idx_t count, DataChunk &chunk) {
 	for (idx_t r = 0; r < count; r++) {
 		for (idx_t c = 0; c < chunk.ColumnCount(); c++) {
-			chunk.SetValue(c, r, rows[first + r][c]);
+			chunk.data[c].SetValue(r, rows[first + r][c]);
 		}
 	}
-	chunk.SetCardinality(count);
+	chunk.SetChildCardinality(count);
 }
 
 CrossingReadResult IndexedRows(const FarStore &store, idx_t batch_index) {
@@ -186,13 +179,13 @@ CrossingReader FarReader(shared_ptr<const vector<vector<Value>>> rows, idx_t par
 		while (cursor < rows->size() && count < STANDARD_VECTOR_SIZE) {
 			if (cursor % partitions == partition) {
 				for (idx_t c = 0; c < chunk.ColumnCount(); c++) {
-					chunk.SetValue(c, count, (*rows)[cursor][c]);
+					chunk.data[c].SetValue(count, (*rows)[cursor][c]);
 				}
 				count++;
 			}
 			cursor++;
 		}
-		chunk.SetCardinality(count);
+		chunk.SetChildCardinality(count);
 		if (count == 0) {
 			return CrossingReadResult::Done();
 		}
@@ -287,7 +280,7 @@ vector<string> FarSource::TablesOn(Connection &con, const string &catalog, const
 	                            "UNION ALL SELECT view_name FROM duckdb_views() WHERE database_name = ? AND "
 	                            "schema_name = ? AND NOT internal ORDER BY 1");
 	vector<Value> args {Value(catalog), Value(schema), Value(catalog), Value(schema)};
-	auto result = prepared->Execute(args, false);
+	auto result = prepared->Execute(args);
 	vector<string> names;
 	for (auto &row : RowsOf(*result)) {
 		names.push_back(row[0].GetValue<string>());
@@ -305,7 +298,7 @@ bool FarSource::IsView(Connection &con, const string &catalog, const string &sch
 	auto prepared = con.Prepare(
 	    "SELECT count(*) FROM duckdb_views() WHERE database_name = ? AND schema_name = ? AND view_name = ?");
 	vector<Value> args {Value(catalog), Value(schema), Value(name)};
-	return RowsOf(*prepared->Execute(args, false))[0][0].GetValue<int64_t>() > 0;
+	return RowsOf(*prepared->Execute(args))[0][0].GetValue<int64_t>() > 0;
 }
 
 CrossingTable FarSource::DescribeOn(FarStore &store, Connection &con, const string &catalog, const string &schema,
@@ -320,19 +313,19 @@ CrossingTable FarSource::DescribeOn(FarStore &store, Connection &con, const stri
 			result->ThrowError();
 		}
 		for (idx_t c = 0; c < result->ColumnCount(); c++) {
-			table.Column(result->names[c], result->types[c]);
+			table.Column(result->GetNames()[c].GetIdentifierName(), result->GetTypes()[c]);
 		}
 		auto verbs = store.verbs.find(name);
 		table.verbs = verbs != store.verbs.end() ? verbs->second
 		                                         : vector<CrossingVerb> {CrossingVerb::SELECT, CrossingVerb::DROP};
 		return table;
 	}
-	auto description = con.TableInfo(catalog, schema, name);
+	auto description = con.TableInfo(Identifier(catalog), Identifier(schema), Identifier(name));
 	if (!description) {
 		throw CatalogException("far: no table '%s.%s'", schema, name);
 	}
 	for (auto &column : description->columns) {
-		table.Column(column.Name(), column.Type());
+		table.Column(column.Name().GetIdentifierName(), column.Type());
 	}
 	auto key = store.keys.find(name);
 	if (key != store.keys.end()) {
@@ -341,7 +334,7 @@ CrossingTable FarSource::DescribeOn(FarStore &store, Connection &con, const stri
 		auto prepared = con.Prepare("SELECT constraint_column_names FROM duckdb_constraints() WHERE database_name "
 		                            "= ? AND schema_name = ? AND table_name = ? AND constraint_type = 'PRIMARY KEY'");
 		vector<Value> args {Value(catalog), Value(schema), Value(name)};
-		auto rows = RowsOf(*prepared->Execute(args, false));
+		auto rows = RowsOf(*prepared->Execute(args));
 		if (!rows.empty()) {
 			for (auto &column : ListValue::GetChildren(rows[0][0])) {
 				table.key.push_back(column.GetValue<string>());
@@ -400,21 +393,22 @@ CrossingVerdict FarSource::AcceptsCall(const Expression &expr) {
 	string name;
 	switch (expr.GetExpressionClass()) {
 	case ExpressionClass::BOUND_FUNCTION:
-		name = expr.Cast<BoundFunctionExpression>().function.name;
+		name = expr.Cast<BoundFunctionExpression>().Function().GetName().GetIdentifierName();
 		break;
 	case ExpressionClass::BOUND_AGGREGATE:
-		name = expr.Cast<BoundAggregateExpression>().function.name;
+		name = expr.Cast<BoundAggregateExpression>().Function().GetName().GetIdentifierName();
 		break;
 	case ExpressionClass::BOUND_WINDOW: {
 		auto &window = expr.Cast<BoundWindowExpression>();
-		name = window.aggregate ? window.aggregate->name
-		                        : StringUtil::Lower(ExpressionTypeToString(expr.GetExpressionType()));
+		name = window.AggregateFunction() ? window.AggregateFunction()->GetName().GetIdentifierName()
+		                                  : StringUtil::Lower(ExpressionTypeToString(expr.GetExpressionType()));
 		break;
 	}
 	default:
 		return CrossingVerdict::Yes();
 	}
 	lock_guard<mutex> guard(store->lock);
+	store->calls_asked.push_back(name);
 	if (store->refused_functions.find(name) != store->refused_functions.end()) {
 		return CrossingVerdict::No("far refuses " + name);
 	}
@@ -504,7 +498,7 @@ void FarSession::Ddl(ClientContext &, const CrossingDdl &ddl) {
 			create->info = ReceiveView(ddl.create->Cast<CreateViewInfo>(), *ddl.plan);
 		} else {
 			create->info = ddl.create->Copy();
-			create->info->catalog = catalog;
+			create->info->SetCatalog(Identifier(catalog));
 		}
 		statement = std::move(create);
 		break;
@@ -512,14 +506,15 @@ void FarSession::Ddl(ClientContext &, const CrossingDdl &ddl) {
 	case CrossingVerb::ALTER: {
 		auto alter = make_uniq<AlterStatement>();
 		alter->info = ddl.alter->Copy();
-		alter->info->catalog = catalog;
+		auto &altered = alter->info->GetQualifiedName();
+		alter->info->SetQualifiedName(Identifier(catalog), altered.Schema(), altered.Name());
 		statement = std::move(alter);
 		break;
 	}
 	case CrossingVerb::DROP: {
 		auto drop = make_uniq<DropStatement>();
 		drop->info = ddl.drop->Copy();
-		drop->info->catalog = catalog;
+		drop->info->SetCatalog(Identifier(catalog));
 		statement = std::move(drop);
 		break;
 	}
@@ -527,14 +522,7 @@ void FarSession::Ddl(ClientContext &, const CrossingDdl &ddl) {
 		throw InternalException("far: '%s' is not a DDL verb", CrossingVerbName(ddl.verb));
 	}
 	lock_guard<mutex> guard(far_lock);
-	auto pending = far.context->PendingQuery(std::move(statement), QueryParameters(false));
-	if (pending->HasError()) {
-		pending->ThrowError();
-	}
-	auto result = pending->Execute();
-	if (result->HasError()) {
-		result->ThrowError();
-	}
+	far.context->Query(std::move(statement), QueryParameters())->ThrowIfError();
 	lock_guard<mutex> store_guard(store->lock);
 	store->ddls.push_back(FarDdl {ddl.verb, ddl.schema, ddl.table});
 }
@@ -542,7 +530,8 @@ void FarSession::Ddl(ClientContext &, const CrossingDdl &ddl) {
 // Over Substrait whatever the transport: a native plan cannot be turned back into a SelectStatement.
 unique_ptr<CreateViewInfo> FarSession::ReceiveView(const CreateViewInfo &view, const LogicalOperator &plan) {
 	lock_guard<mutex> guard(far_lock);
-	auto received = make_uniq<CreateViewInfo>(catalog, view.schema, view.view_name);
+	auto received = make_uniq<CreateViewInfo>(
+	    QualifiedName(Identifier(catalog), view.GetQualifiedName().Schema(), view.GetViewName()));
 	received->query = DecodeSubstraitView(far, catalog, RenderSubstraitJson(plan), CrossingViewColumnNames(view),
 	                                      store->catalog_check);
 	received->on_conflict = view.on_conflict;
@@ -585,7 +574,7 @@ string FarSession::StageSeamRows(const LogicalOperator &plan) {
 	if (created->HasError()) {
 		created->ThrowError();
 	}
-	Appender appender(far, "temp", "main", seam_view);
+	Appender appender(far, "temp", "main", Identifier(seam_view));
 	for (auto &chunk : rows->Chunks()) {
 		appender.AppendDataChunk(chunk);
 	}

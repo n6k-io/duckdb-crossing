@@ -8,7 +8,7 @@
 
 namespace duckdb {
 
-//! Folds a subtree that can run wholly on one source into the fragment of the crossing scan inside
+//! Folds a subtree that can run wholly on one group into the fragment of the crossing scan inside
 //! it, and hands back that scan to stand in the subtree's place.
 //!
 //! The caller decides the subtree is crossable -- see LabelSubtrees. This only moves it.
@@ -21,7 +21,7 @@ unique_ptr<LogicalOperator> FoldSubtreeIntoItsFragment(unique_ptr<LogicalOperato
                                                        const CrossingIdentity &identity, const FreshTableIndex &fresh,
                                                        vector<ReplacementBinding> &rewired);
 
-void AdoptSeamIndex(LogicalOperator &feed, idx_t seam_index);
+void AdoptSeamIndex(LogicalOperator &feed, TableIndex seam_index);
 
 bool SubtreeHoldsFrozenScan(LogicalOperator &node, const CrossingIdentity &identity);
 

@@ -7,8 +7,8 @@
 
 namespace duckdb {
 
-using FreshTableIndex = std::function<idx_t()>;
+using FreshTableIndex = std::function<TableIndex()>;
 
-unordered_map<idx_t, idx_t> RemapTableIndices(LogicalOperator &op, const FreshTableIndex &fresh);
+unordered_map<TableIndex, TableIndex> RemapTableIndices(LogicalOperator &op, const FreshTableIndex &fresh);
 
 } // namespace duckdb

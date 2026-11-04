@@ -23,6 +23,9 @@ public:
 	//! The key column a virtual id stands for, or invalid for any other id.
 	optional_idx KeyColumnOfAlias(column_t virtual_id) const;
 
+	const ColumnList &GetColumns() const override {
+		return columns;
+	}
 	unique_ptr<BaseStatistics> GetStatistics(ClientContext &context, column_t column_id) override;
 	TableFunction GetScanFunction(ClientContext &context, unique_ptr<FunctionData> &bind_data) override;
 	TableStorageInfo GetStorageInfo(ClientContext &context) override;
@@ -32,6 +35,9 @@ public:
 	//! the aliases back into the real columns before anything crosses.
 	virtual_column_map_t GetVirtualColumns() const override;
 	vector<column_t> GetRowIdColumns() const override;
+
+private:
+	ColumnList columns;
 };
 
 optional_ptr<CrossingTableCatalogEntry> CrossingTableOf(TableCatalogEntry &table, const CrossingIdentity &identity);

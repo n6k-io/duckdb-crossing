@@ -60,13 +60,13 @@ default when absent:
 
 Members must be public. Neither type may be `final`. A member with the right name
 and the wrong signature fails to compile with the member, the signature wanted
-and the return type found. `test/contract/` holds one wrong source per message.
+and the return type found. `test/contract/` holds wrong sources and their messages.
 
 A source may instead derive from `CrossingSource` and `CrossingSession` directly.
 
 ## Describe
 
-Asked once per table, on first use, cached for the life of the attach.
+Asked once per table, on first use, and kept until the attach or schema is refreshed.
 
 ```cpp
 CrossingTable ToyDB::Describe(const string &schema, const string &name) {
@@ -82,9 +82,10 @@ CrossingTable ToyDB::Describe(const string &schema, const string &name) {
 
 - `column_names` / `column_types` — in order. Every column position in a query
   means this order.
-- `key` — columns that identify a row. Required for a table allowing `UPDATE`
-  or `DELETE_`. `key_unique = true` vouches uniqueness; only then may a keyed
-  write run wholly on the source.
+- `key` — columns that identify a row. Without one, an update or delete that
+  reads its rows, or a `MERGE` that updates or deletes, is a `BinderException`.
+  `key_unique = true` vouches uniqueness; only then may a keyed write run wholly
+  on the source.
 - `verbs` — a verb absent here is refused before the statement runs. The only
   source of what a table allows. `DELETE_` has a trailing underscore. `ALTER`
   and `DROP` go through `Session::Ddl`.
@@ -153,8 +154,8 @@ CrossingPlan ToyDB::Plan(const CrossingPlanRequest &request) {
 - Write — a seam node: where the rows go. `request.seam.key_columns` then
   `set_columns` are the seam's column order: insert = row image in `Describe`
   order; update = key then set columns; delete = key. An update that reads
-  nothing of its rows (`request.seam.reads_rows` false) names no key: its seam
-  is its set columns. A delete that reads nothing is never planned.
+  nothing of its rows has empty `request.seam.key_columns`: its seam is its set
+  columns. A delete that reads nothing is never planned.
 - `CrossingPlan::Declined(reason)` refuses; the reason is in the error.
 - The plan names tables; it never scans them. A `LogicalGet` of your own storage
   is bound to the connection that made it and cannot travel, so crossing refuses
@@ -230,19 +231,16 @@ prints it; `SerializeCrossingPlan(plan)` gives bytes.
 ```cpp
 auto plan = DeserializeCrossingPlan(context, SerializeCrossingPlan(query.plan));
 BindFloors(context, plan, "mycatalog");
-auto pending = PendingCrossingPlan(context, std::move(plan), true);
-if (pending->HasError()) {
-	pending->ThrowError();
-}
-auto result = pending->Execute();
-if (result->HasError()) {
-	result->ThrowError();
-}
+auto result = SubmitCrossingPlan(context, std::move(plan));
+result->ThrowIfError();
+QueryResultStream<ChunkFormat> stream(std::move(result));
 ```
 
-`PendingCrossingPlan` runs a bound plan as a query. Do not go through
-`LogicalPlanStatement`: DuckDB copies a statement before planning it whenever
-an extension can ask for a rebind, and a plan holding your scan cannot be copied.
+`SubmitCrossingPlan` runs a bound plan as a query. Do not go through
+`LogicalPlanStatement`: DuckDB copies a statement before planning it whenever a
+`ClientContextState` can request a rebind, and that statement cannot be copied.
+Calling `Fetch` on the result itself collects every row first; move it into a
+`QueryResultStream` to stream.
 
 `BindFloors` replaces each floor with the table it names, bound on `context`,
 which must have a transaction open. The floor keeps its table index and column
@@ -337,7 +335,7 @@ each other and themselves.
 |---|---|
 | `Schemas`, `Tables`, `Describe` | once per attach (again after `Refresh`), cached; not serialized |
 | `Plan`, `Accepts*` | binding and optimization, concurrent across statements |
-| `Begin` | once per transaction, on a worker thread; different transactions may overlap; must not re-enter crossing |
+| `Begin` | once per transaction, on the thread that first needs the session (the binding thread for `Ddl`); different transactions may overlap; must not re-enter crossing |
 | `Detach` | once, DETACH thread |
 | `Session::Read` | once per scan operator; two scans of one statement may overlap on one session |
 | `CrossingScan::open` | once per partition, by the claiming thread; opens overlap |
@@ -362,7 +360,7 @@ void ToyExtension::Load(ExtensionLoader &loader) {
 `"toydb"` is `ATTACH ... (TYPE toydb)`. `info.path` and `info.options` are
 passed through; the path is never opened as a file. The factory runs once per
 `ATTACH`. Registering installs the storage extension, transaction manager and,
-once per instance, the optimizer pass. The catalog holds the source's tables
+once per `Crossing<S>` per instance, the optimizer pass. The catalog holds the source's tables
 only; `CREATE TABLE`, `ALTER TABLE`, `DROP TABLE`, `CREATE VIEW` and `DROP VIEW`
 go to the source when the verb is declared, and everything else is refused.
 
@@ -389,10 +387,11 @@ class MyCatalog : public DuckCatalog, public CrossingAttachOwner {
 };
 ```
 
-- `LookupTable(schema, owner, name)`, `ScanTables`, `Described` — entries and
+- `LookupTable(schema, owner, name, transaction)`, `ScanTables`, `Described` — entries and
   descriptions, cached; `Refresh()` / `Refresh(schema)` forget them.
-- `Ddl(context, transaction, owner, ddl)` — checks the verb, runs it in the
-  transaction's session, forgets the schema. `DescribedSchema(schema)` is what
+- `Ddl(context, transaction, owner, ddl)` — checks the verb and runs it in the
+  transaction's session. That transaction reads the schema through its session;
+  the schema is forgotten once it resolves. `DescribedSchema(schema)` is what
   the schema declares. `PlanCreateTableAs(...)` is what a catalog's own
   `PlanCreateTableAs` forwards to; `CreateView(context, transaction, owner,
   info)` what its schema's `CreateView` forwards to.
@@ -414,4 +413,7 @@ crossing_add_to_target(toy_extension)
 ```
 
 Adds sources and include path. `crossing_sources` and `crossing_includes` give
-the lists. `crossing.hpp` is the only header to include.
+the lists. A source includes `crossing.hpp`. Its own catalog also needs
+`crossing_attach.hpp`. Substrait needs `crossing_substrait.hpp`, whose sources and
+include path come from `crossing_substrait_sources` and `crossing_substrait_includes`.
+Streaming a result needs DuckDB's `duckdb/main/query_result_stream.hpp`.

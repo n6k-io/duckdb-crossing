@@ -34,9 +34,9 @@ optional_ptr<CrossingTableCatalogEntry> CrossingTableOfWrite(LogicalOperator &op
 	}
 }
 
-unique_ptr<LogicalOperator> MakeFence(idx_t table_index, unique_ptr<CrossingBindData> write) {
-	auto get = make_uniq<LogicalGet>(table_index, CrossingWriteFunction(), std::move(write),
-	                                 vector<LogicalType> {LogicalType::BIGINT}, vector<string> {"Count"});
+unique_ptr<LogicalOperator> MakeFence(TableIndex table_index, unique_ptr<CrossingBindData> write) {
+	auto get = make_uniq<LogicalGet>(table_index, BoundTableFunction(CrossingWriteFunction()), std::move(write),
+	                                 vector<LogicalType> {LogicalType::BIGINT}, vector<Identifier> {"Count"});
 	get->SetColumnIds({ColumnIndex(0)});
 	return std::move(get);
 }
@@ -56,16 +56,16 @@ unique_ptr<LogicalOperator> InSeamOrder(unique_ptr<LogicalOperator> rows, const 
 	return std::move(projection);
 }
 
-unique_ptr<LogicalOperator> SeamInsert(ClientContext &context, idx_t table_index, unique_ptr<CrossingBindData> write,
-                                       bool returning, vector<idx_t> key_positions, SeamFill fill,
-                                       const FreshTableIndex &fresh) {
+unique_ptr<LogicalOperator> SeamInsert(ClientContext &context, TableIndex table_index,
+                                       unique_ptr<CrossingBindData> write, bool returning, vector<idx_t> key_positions,
+                                       SeamFill fill, const FreshTableIndex &fresh) {
 	auto &table = write->table;
 	CreateTableInfo info(table.schema, table.name);
 	if (returning) {
 		info.columns = table.GetColumns().Copy();
 	} else {
 		for (idx_t c = 0; c < fill.seam_types.size(); c++) {
-			info.columns.AddColumn(ColumnDefinition("c" + to_string(c), fill.seam_types[c]));
+			info.columns.AddColumn(ColumnDefinition(Identifier("c" + to_string(c)), fill.seam_types[c]));
 		}
 	}
 	auto entry = make_shared_ptr<CrossingSeamEntry>(table.catalog, table.schema, info, std::move(write),
@@ -142,7 +142,7 @@ optional_ptr<LogicalGet> OwnScan(LogicalOperator &op, CrossingTableCatalogEntry 
 	}
 	auto &get = op.Cast<LogicalGet>();
 	auto data = CrossingBindDataOf(get, identity);
-	if (!data || &data->table != &table || !get.table_filters.filters.empty()) {
+	if (!data || &data->table != &table || get.table_filters.HasFilters()) {
 		return nullptr;
 	}
 	return &get;
@@ -165,7 +165,7 @@ vector<unique_ptr<Expression>> ValuesReadingNoRow(LogicalUpdate &update, Crossin
 		if (expr.GetExpressionType() == ExpressionType::VALUE_DEFAULT) {
 			value = update.bound_defaults[update.columns[i].index]->Copy();
 		} else if (expr.GetExpressionClass() == ExpressionClass::BOUND_COLUMN_REF) {
-			auto &binding = expr.Cast<BoundColumnRefExpression>().binding;
+			auto &binding = expr.Cast<BoundColumnRefExpression>().Binding();
 			if (binding.table_index != projection.table_index) {
 				return {};
 			}
@@ -184,7 +184,7 @@ vector<unique_ptr<Expression>> ValuesReadingNoRow(LogicalUpdate &update, Crossin
 unique_ptr<LogicalOperator> OneRowOf(ClientContext &context, vector<unique_ptr<Expression>> values,
                                      const vector<LogicalType> &types, const FreshTableIndex &fresh) {
 	for (idx_t i = 0; i < values.size(); i++) {
-		if (values[i]->return_type != types[i]) {
+		if (values[i]->GetReturnType() != types[i]) {
 			values[i] = BoundCastExpression::AddDefaultCastToType(std::move(values[i]), types[i]);
 		}
 	}
@@ -277,7 +277,7 @@ bool ReturnsRows(LogicalOperator &op) {
 	}
 }
 
-idx_t TableIndexOf(LogicalOperator &op) {
+TableIndex TableIndexOf(LogicalOperator &op) {
 	switch (op.type) {
 	case LogicalOperatorType::LOGICAL_DELETE:
 		return op.Cast<LogicalDelete>().table_index;
@@ -294,7 +294,7 @@ vector<string> SetColumnsOf(LogicalOperator &op, TableCatalogEntry &table) {
 		return out;
 	}
 	for (auto &column_index : op.Cast<LogicalUpdate>().columns) {
-		out.push_back(table.GetColumns().GetColumn(column_index).GetName());
+		out.push_back(table.GetColumns().GetColumn(column_index).GetName().GetIdentifierName());
 	}
 	return out;
 }

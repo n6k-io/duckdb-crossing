@@ -187,20 +187,20 @@ bool IsInnerJoin(LogicalOperator &op) {
 	}
 }
 
-set<idx_t> TableIndicesOf(LogicalOperator &op) {
-	set<idx_t> out;
+set<TableIndex> TableIndicesOf(LogicalOperator &op) {
+	set<TableIndex> out;
 	for (auto &binding : op.GetColumnBindings()) {
 		out.insert(binding.table_index);
 	}
 	return out;
 }
 
-bool BindsOnlyTo(const Expression &expr, const set<idx_t> &tables) {
+bool BindsOnlyTo(const Expression &expr, const set<TableIndex> &tables) {
 	bool within = true;
 	ExpressionIterator::EnumerateChildren(
 	    expr, [&](const Expression &child) { within = within && BindsOnlyTo(child, tables); });
 	if (expr.GetExpressionClass() == ExpressionClass::BOUND_COLUMN_REF) {
-		within = within && tables.count(expr.Cast<BoundColumnRefExpression>().binding.table_index) > 0;
+		within = within && tables.count(expr.Cast<BoundColumnRefExpression>().Binding().table_index) > 0;
 	}
 	return within;
 }

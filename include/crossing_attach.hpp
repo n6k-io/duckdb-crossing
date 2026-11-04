@@ -59,7 +59,8 @@ public:
 	//! The same for one schema. The schema list itself is kept.
 	void Refresh(const string &schema);
 
-	//! The entry for a served table, described on first use and cached for the life of the attach.
+	//! The entry for a served table, described on first use and cached until Refresh. A transaction
+	//! that ran Ddl on the schema keeps its own until it resolves.
 	//! `owner` is the schema entry the table hangs off; an entry cached under a different owner is
 	//! retired and rebuilt. Null when the source does not serve the name.
 	optional_ptr<CatalogEntry> LookupTable(const string &schema, SchemaCatalogEntry &owner, const string &name,
@@ -92,8 +93,8 @@ public:
 
 	void Detach(ClientContext &context);
 
-	//! The attach behind a catalog crossing built, or behind the catalog served entries name as
-	//! their parent.
+	//! The attach behind a CrossingAttachOwner catalog. Of throws for any other catalog; TryOf returns
+	//! null.
 	static CrossingAttach &Of(Catalog &catalog);
 	static optional_ptr<CrossingAttach> TryOf(Catalog &catalog);
 

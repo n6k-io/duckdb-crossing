@@ -81,7 +81,7 @@ TEST_CASE("SELECT amt FROM memory_source() WHERE amt > 100 AND amt + 1 > 2", "[b
 	FoldCrossableWorkIntoFragments(plan, TestIndices(), MemoryIdentity());
 
 	// `+` binds as a function call, and this source answers for no function, so that conjunct stays
-	// while the one beside it crosses. The split, on a plan the planner produced.
+	// while the one beside it crosses.
 	REQUIRE_PLAN(plan, "proj{amt} | filter{(amt + 1) > CAST(2 AS INTEGER)} | "
 	                   "crossing[filter{amt > CAST(100 AS INTEGER)} | proj{amt} | scan]");
 }

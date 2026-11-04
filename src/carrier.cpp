@@ -25,7 +25,7 @@ optional_ptr<CrossingFragment> CrossingReadFragmentOf(LogicalOperator &op, const
 		return nullptr;
 	}
 	auto &get = op.Cast<LogicalGet>();
-	if (!get.table_filters.filters.empty() || get.dynamic_filters || !get.projected_input.empty() ||
+	if (get.table_filters.HasFilters() || get.dynamic_filters || !get.projected_input.empty() ||
 	    get.ordinality_idx.IsValid()) {
 		return nullptr;
 	}

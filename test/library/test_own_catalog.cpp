@@ -29,8 +29,8 @@ struct Own {
 		}
 	}
 
-	unique_ptr<MaterializedQueryResult> Query(const string &sql) {
-		auto result = con.Query(sql);
+	unique_ptr<TestResult> Query(const string &sql) {
+		auto result = Collected(con.Query(sql));
 		store->JoinArrivals();
 		if (result->HasError()) {
 			FAIL(sql + "\n" + result->GetError());
@@ -56,7 +56,7 @@ TEST_CASE("a catalog of its own writes through the attach it holds and commits w
 
 	REQUIRE(own.store->writes.size() == 1);
 	REQUIRE(own.store->transaction_ends == vector<string> {"commit"});
-	REQUIRE(own.store->con.Query("SELECT v FROM t WHERE id = 1")->GetValue(0, 0) == Value::INTEGER(0));
+	REQUIRE(Collected(own.store->con.Query("SELECT v FROM t WHERE id = 1"))->GetValue(0, 0) == Value::INTEGER(0));
 }
 
 TEST_CASE("a catalog of its own reaches its source type through the attach", "[own_catalog]") {

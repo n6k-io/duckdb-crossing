@@ -28,13 +28,13 @@ namespace {
 string NameOfColumn(LogicalOperator &below, idx_t position) {
 	switch (below.type) {
 	case LogicalOperatorType::LOGICAL_PROJECTION:
-		return below.expressions[position]->GetName();
+		return below.expressions[position]->GetName().GetIdentifierName();
 	case LogicalOperatorType::LOGICAL_GET: {
 		auto &get = below.Cast<LogicalGet>();
 		auto &ids = get.GetColumnIds();
 		if (position < ids.size() && !ids[position].IsVirtualColumn() &&
 		    ids[position].GetPrimaryIndex() < get.names.size()) {
-			return get.names[ids[position].GetPrimaryIndex()];
+			return get.names[ids[position].GetPrimaryIndex()].GetIdentifierName();
 		}
 		return "c" + to_string(position);
 	}
@@ -49,17 +49,17 @@ string NameOfColumn(LogicalOperator &below, idx_t position) {
 }
 
 unique_ptr<Expression> RefTo(LogicalOperator &below, idx_t position) {
-	return make_uniq<BoundColumnRefExpression>(NameOfColumn(below, position), below.types[position],
+	return make_uniq<BoundColumnRefExpression>(Identifier(NameOfColumn(below, position)), below.types[position],
 	                                           below.GetColumnBindings()[position]);
 }
 
 unique_ptr<Expression> Named(unique_ptr<Expression> expr, LogicalOperator &feed) {
-	if (expr->GetExpressionClass() == ExpressionClass::BOUND_COLUMN_REF && expr->alias.empty()) {
+	if (expr->GetExpressionClass() == ExpressionClass::BOUND_COLUMN_REF && !expr->HasAlias()) {
 		auto &ref = expr->Cast<BoundColumnRefExpression>();
 		auto bindings = feed.GetColumnBindings();
 		for (idx_t i = 0; i < bindings.size(); i++) {
-			if (bindings[i] == ref.binding) {
-				ref.alias = NameOfColumn(feed, i);
+			if (bindings[i] == ref.Binding()) {
+				ref.SetAlias(Identifier(NameOfColumn(feed, i)));
 				break;
 			}
 		}
@@ -282,10 +282,10 @@ SeamFill FillSeamFromFeed(unique_ptr<LogicalOperator> feed, CrossingFragment &fr
 		auto bindings = boundary->GetColumnBindings();
 		auto seam2_index = fresh();
 		fill.remainder = std::move(boundary);
-		boundary = MakeSeamNode(seam2_index, fill.seam_types);
+		boundary = MakeSeamNode(seam2_index.index, fill.seam_types);
 		ColumnBindingReplacer replacer;
 		for (idx_t i = 0; i < bindings.size(); i++) {
-			replacer.replacement_bindings.emplace_back(bindings[i], ColumnBinding(seam2_index, i));
+			replacer.replacement_bindings.emplace_back(bindings[i], ColumnBinding(seam2_index, ProjectionIndex(i)));
 		}
 		replacer.VisitOperator(*feed);
 		RejoinAdjacentFiltersEverywhere(fill.remainder, identity);
@@ -321,9 +321,9 @@ void MaterialiseConstantRows(ClientContext &context, unique_ptr<LogicalOperator>
 			chunk.Reset();
 		}
 		for (idx_t c = 0; c < row.size(); c++) {
-			chunk.SetValue(c, chunk.size(), ExpressionExecutor::EvaluateScalar(context, *row[c]));
+			chunk.data[c].SetValue(chunk.size(), ExpressionExecutor::EvaluateScalar(context, *row[c]));
 		}
-		chunk.SetCardinality(chunk.size() + 1);
+		chunk.SetChildCardinality(chunk.size() + 1);
 	}
 	if (chunk.size() > 0) {
 		collection->Append(chunk);

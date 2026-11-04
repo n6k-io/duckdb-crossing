@@ -13,7 +13,8 @@ struct CrossingParking : public Task {
 
 	CrossingWaker Waker();
 
-	bool Park(StateWithBlockableTasks &state, const unique_lock<mutex> &guard);
+	//! Holds state.lock.
+	bool Park(StateWithBlockableTasks &state);
 	bool Park();
 
 	void Reschedule() override;

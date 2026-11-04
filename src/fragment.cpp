@@ -38,8 +38,8 @@ void CrossingFragment::RebuildPlanForColumns(const vector<column_t> &columns) {
 		if (column >= column_names.size()) {
 			throw InternalException("crossing: column %llu is not a column of the table", column);
 		}
-		select_list.push_back(
-		    make_uniq<BoundColumnRefExpression>(column_names[column], column_types[column], floor_bindings[column]));
+		select_list.push_back(make_uniq<BoundColumnRefExpression>(Identifier(column_names[column]),
+		                                                          column_types[column], floor_bindings[column]));
 		output_types.push_back(column_types[column]);
 	}
 
@@ -55,7 +55,7 @@ void CrossingFragment::RebuildPlanForColumns(const vector<column_t> &columns) {
 	VerifyInvariants();
 }
 
-void CrossingFragment::AdoptTableIndex(idx_t index) {
+void CrossingFragment::AdoptTableIndex(TableIndex index) {
 	if (!plan || !crossing_projection) {
 		return;
 	}
@@ -70,7 +70,7 @@ void CrossingFragment::RemapTableIndices(const FreshTableIndex &fresh) {
 		return;
 	}
 	auto moved = duckdb::RemapTableIndices(*plan, fresh);
-	auto at = [&](idx_t index) {
+	auto at = [&](TableIndex index) {
 		auto it = moved.find(index);
 		return it == moved.end() ? index : it->second;
 	};
@@ -113,7 +113,7 @@ void CrossingFragment::VerifyInvariants() {
 	}
 	if (crossing_projection->table_index != table_index) {
 		throw InternalException("crossing: the projection is on table index %llu, the scan on %llu",
-		                        crossing_projection->table_index, table_index);
+		                        crossing_projection->table_index.index, table_index.index);
 	}
 	auto &emitted = plan->types;
 	if (emitted.size() != output_types.size()) {

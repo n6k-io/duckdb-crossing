@@ -72,7 +72,7 @@ vector<string> SetColumnNames(TableCatalogEntry &table, const vector<PhysicalInd
 
 unique_ptr<Expression> RefAt(const LogicalType &type, idx_t position);
 
-optional_ptr<LogicalGet> FindGetWithIndex(LogicalOperator &op, idx_t table_index);
+optional_ptr<LogicalGet> FindGetWithIndex(LogicalOperator &op, TableIndex table_index);
 
 vector<unique_ptr<Expression>> RowImageFrom(LogicalGet &get, TableCatalogEntry &table);
 
@@ -105,9 +105,15 @@ public:
 	string obstacle;
 	vector<idx_t> key_positions;
 
+	const ColumnList &GetColumns() const override {
+		return columns;
+	}
 	unique_ptr<BaseStatistics> GetStatistics(ClientContext &context, column_t column_id) override;
 	TableFunction GetScanFunction(ClientContext &context, unique_ptr<FunctionData> &bind_data) override;
 	TableStorageInfo GetStorageInfo(ClientContext &context) override;
+
+private:
+	ColumnList columns;
 };
 
 const string &CrossingSeamEntriesKey();
@@ -124,7 +130,7 @@ public:
 				return held;
 			}
 		}
-		throw InternalException("crossing: the seam of '%s' outlived its statement", entry.name);
+		throw InternalException("crossing: the seam of '%s' outlived its statement", entry.name.GetIdentifierName());
 	}
 
 	void QueryEnd(ClientContext &context, optional_ptr<ErrorData> error) override {
@@ -160,14 +166,14 @@ private:
 
 class LogicalCrossingFence : public LogicalExtensionOperator {
 public:
-	LogicalCrossingFence(idx_t table_index, unique_ptr<CrossingBindData> bind_data);
+	LogicalCrossingFence(TableIndex table_index, unique_ptr<CrossingBindData> bind_data);
 
-	idx_t table_index;
+	TableIndex table_index;
 	unique_ptr<CrossingBindData> bind_data;
 
 	PhysicalOperator &CreatePlan(ClientContext &context, PhysicalPlanGenerator &planner) override;
 	vector<ColumnBinding> GetColumnBindings() override;
-	vector<idx_t> GetTableIndex() const override;
+	vector<TableIndex> GetTableIndex() const override;
 	string GetName() const override;
 	InsertionOrderPreservingMap<string> ParamsToString() const override;
 	string GetExtensionName() const override;

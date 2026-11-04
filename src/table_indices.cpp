@@ -8,13 +8,13 @@ namespace duckdb {
 
 namespace {
 
-void Shift(idx_t &field, const FreshTableIndex &fresh, unordered_map<idx_t, idx_t> &moved) {
+void Shift(TableIndex &field, const FreshTableIndex &fresh, unordered_map<TableIndex, TableIndex> &moved) {
 	auto from = field;
 	field = fresh();
 	moved[from] = field;
 }
 
-void ShiftIndicesOf(LogicalOperator &op, const FreshTableIndex &fresh, unordered_map<idx_t, idx_t> &moved) {
+void ShiftIndicesOf(LogicalOperator &op, const FreshTableIndex &fresh, unordered_map<TableIndex, TableIndex> &moved) {
 	for (auto &child : op.children) {
 		ShiftIndicesOf(*child, fresh, moved);
 	}
@@ -99,8 +99,8 @@ void ShiftIndicesOf(LogicalOperator &op, const FreshTableIndex &fresh, unordered
 
 } // namespace
 
-unordered_map<idx_t, idx_t> RemapTableIndices(LogicalOperator &op, const FreshTableIndex &fresh) {
-	unordered_map<idx_t, idx_t> moved;
+unordered_map<TableIndex, TableIndex> RemapTableIndices(LogicalOperator &op, const FreshTableIndex &fresh) {
+	unordered_map<TableIndex, TableIndex> moved;
 	ShiftIndicesOf(op, fresh, moved);
 	TableBindingReplacer replacer(moved, nullptr);
 	replacer.VisitOperator(op);

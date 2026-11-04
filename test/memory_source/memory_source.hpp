@@ -1,5 +1,7 @@
 #pragma once
 
+#include "internal/names.hpp"
+
 #include "catch.hpp"
 #include "internal/carrier.hpp"
 
@@ -16,9 +18,9 @@
 
 namespace duckdb {
 
-constexpr idx_t MEMORY_FLOOR_INDEX = 0;
-constexpr idx_t MEMORY_CROSSING_INDEX = 1;
-constexpr idx_t MEMORY_GET_INDEX = 2;
+const TableIndex MEMORY_FLOOR_INDEX = TableIndex(0);
+const TableIndex MEMORY_CROSSING_INDEX = TableIndex(1);
+const TableIndex MEMORY_GET_INDEX = TableIndex(2);
 
 inline const CrossingIdentity &MemoryIdentity() {
 	static const CrossingIdentity identity;
@@ -33,13 +35,13 @@ inline const CrossingIdentity &OtherIdentity() {
 inline string FunctionNameOf(const Expression &expr) {
 	switch (expr.GetExpressionClass()) {
 	case ExpressionClass::BOUND_FUNCTION:
-		return expr.Cast<BoundFunctionExpression>().function.name;
+		return expr.Cast<BoundFunctionExpression>().Function().GetName().GetIdentifierName();
 	case ExpressionClass::BOUND_AGGREGATE:
-		return expr.Cast<BoundAggregateExpression>().function.name;
+		return expr.Cast<BoundAggregateExpression>().Function().GetName().GetIdentifierName();
 	case ExpressionClass::BOUND_WINDOW: {
 		auto &window = expr.Cast<BoundWindowExpression>();
-		if (window.aggregate) {
-			return window.aggregate->name;
+		if (window.AggregateFunction()) {
+			return window.AggregateFunction()->GetName().GetIdentifierName();
 		}
 		return StringUtil::Lower(ExpressionTypeToString(expr.GetExpressionType()));
 	}
@@ -49,7 +51,8 @@ inline string FunctionNameOf(const Expression &expr) {
 }
 
 inline unique_ptr<Expression> BoundAmt() {
-	return make_uniq<BoundColumnRefExpression>("amt", LogicalType::INTEGER, ColumnBinding(MEMORY_GET_INDEX, 1));
+	return make_uniq<BoundColumnRefExpression>("amt", LogicalType::INTEGER,
+	                                           ColumnBinding(MEMORY_GET_INDEX, ProjectionIndex(1)));
 }
 
 inline unique_ptr<Expression> Int(int32_t value) {
@@ -59,9 +62,10 @@ inline unique_ptr<Expression> Int(int32_t value) {
 inline unique_ptr<Expression> Call(const string &name, FunctionStability stability = FunctionStability::CONSISTENT) {
 	vector<unique_ptr<Expression>> args;
 	args.push_back(BoundAmt());
-	ScalarFunction function(name, {LogicalType::INTEGER}, LogicalType::INTEGER, nullptr);
-	function.stability = stability;
-	return make_uniq<BoundFunctionExpression>(LogicalType::INTEGER, function, std::move(args), nullptr);
+	ScalarFunction function(Identifier(name), vector<LogicalType> {LogicalType::INTEGER}, LogicalType::INTEGER,
+	                        nullptr);
+	function.SetStability(stability);
+	return make_uniq<BoundFunctionExpression>(BoundScalarFunction(function), std::move(args), nullptr);
 }
 
 class MemorySource : public CrossingSource {
@@ -138,7 +142,8 @@ inline shared_ptr<CrossingFragment> MemoryFragment() {
 	auto fragment = make_shared_ptr<CrossingFragment>();
 	fragment->column_names = {"id", "amt"};
 	fragment->column_types = {LogicalType::INTEGER, LogicalType::INTEGER};
-	fragment->floor_bindings = {ColumnBinding(MEMORY_FLOOR_INDEX, 0), ColumnBinding(MEMORY_FLOOR_INDEX, 1)};
+	fragment->floor_bindings = {ColumnBinding(MEMORY_FLOOR_INDEX, ProjectionIndex(0)),
+	                            ColumnBinding(MEMORY_FLOOR_INDEX, ProjectionIndex(1))};
 	fragment->table_index = MEMORY_CROSSING_INDEX;
 
 	auto floor = make_uniq<LogicalDummyScan>(MEMORY_FLOOR_INDEX);
@@ -160,8 +165,8 @@ inline unique_ptr<LogicalOperator> MemorySourceScan(case_insensitive_set_t known
 	auto types = fragment->column_types;
 	auto names = fragment->column_names;
 	TableFunction function("memory_source_scan", {}, nullptr);
-	auto get =
-	    make_uniq<LogicalGet>(MEMORY_GET_INDEX, function, std::move(bind_data), std::move(types), std::move(names));
+	auto get = make_uniq<LogicalGet>(MEMORY_GET_INDEX, BoundTableFunction(function), std::move(bind_data),
+	                                 std::move(types), IdentifiersOf(names));
 	get->SetColumnIds({ColumnIndex(0), ColumnIndex(1)});
 	return std::move(get);
 }
