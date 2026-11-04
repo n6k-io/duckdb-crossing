@@ -44,7 +44,7 @@ void NarrowFragmentAndScanToRequestedColumns(LogicalGet &get, CrossingFragment &
 		}
 	}
 	// Bail unless every id mapped: dropping one renumbers the columns the scan emits while the plan
-	// above goes on naming the old positions. A window function over a dropped column catches it.
+	// above goes on naming the old positions.
 	if (wanted.size() != get.GetColumnIds().size()) {
 		return;
 	}

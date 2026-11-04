@@ -2,8 +2,8 @@
 
 #include "internal/names.hpp"
 
-// A crossing scan the planner produced, rather than one built by hand. Every other test asserts
-// against a hand-written shape; these assert against the shape duckdb actually builds.
+// A crossing scan the planner produced, rather than one built by hand: these assert against the
+// shape duckdb actually builds.
 
 #include "catch.hpp"
 #include "memory_source/memory_source.hpp"
@@ -40,7 +40,7 @@ unique_ptr<FunctionData> BoundMemorySourceBind(ClientContext &context, TableFunc
 }
 
 void BoundMemorySourceScan(ClientContext &context, TableFunctionInput &data, DataChunk &output) {
-	output.SetCardinality(0);
+	output.SetChildCardinality(0);
 }
 
 } // namespace

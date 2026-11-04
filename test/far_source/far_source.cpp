@@ -119,10 +119,10 @@ struct ReaderHandle {
 void CopyBlock(const vector<vector<Value>> &rows, idx_t first, idx_t count, DataChunk &chunk) {
 	for (idx_t r = 0; r < count; r++) {
 		for (idx_t c = 0; c < chunk.ColumnCount(); c++) {
-			chunk.SetValue(c, r, rows[first + r][c]);
+			chunk.data[c].SetValue(r, rows[first + r][c]);
 		}
 	}
-	chunk.SetCardinality(count);
+	chunk.SetChildCardinality(count);
 }
 
 CrossingReadResult IndexedRows(const FarStore &store, idx_t batch_index) {
@@ -179,13 +179,13 @@ CrossingReader FarReader(shared_ptr<const vector<vector<Value>>> rows, idx_t par
 		while (cursor < rows->size() && count < STANDARD_VECTOR_SIZE) {
 			if (cursor % partitions == partition) {
 				for (idx_t c = 0; c < chunk.ColumnCount(); c++) {
-					chunk.SetValue(c, count, (*rows)[cursor][c]);
+					chunk.data[c].SetValue(count, (*rows)[cursor][c]);
 				}
 				count++;
 			}
 			cursor++;
 		}
-		chunk.SetCardinality(count);
+		chunk.SetChildCardinality(count);
 		if (count == 0) {
 			return CrossingReadResult::Done();
 		}

@@ -34,9 +34,9 @@ inline unique_ptr<LogicalOperator> Rows(vector<LogicalType> types = {LogicalType
 	DataChunk chunk;
 	chunk.Initialize(Allocator::DefaultAllocator(), types);
 	for (idx_t i = 0; i < types.size(); i++) {
-		chunk.SetValue(i, 0, Value(types[i]));
+		chunk.data[i].SetValue(0, Value(types[i]));
 	}
-	chunk.SetCardinality(1);
+	chunk.SetChildCardinality(1);
 	collection->Append(chunk);
 	return make_uniq<LogicalColumnDataGet>(STUB_ROWS_INDEX, std::move(types), std::move(collection));
 }

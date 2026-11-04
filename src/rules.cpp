@@ -39,7 +39,7 @@ RuleKind RuleKindFor(LogicalOperatorType type) {
 	case LogicalOperatorType::LOGICAL_UNNEST:
 	case LogicalOperatorType::LOGICAL_PIVOT:
 	// Two branches are no obstacle either: the labelling asks each separately, and they cross
-	// together only if they name one source.
+	// together only if their sources share a group.
 	case LogicalOperatorType::LOGICAL_JOIN:
 	case LogicalOperatorType::LOGICAL_COMPARISON_JOIN:
 	case LogicalOperatorType::LOGICAL_ANY_JOIN:

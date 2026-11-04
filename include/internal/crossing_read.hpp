@@ -15,7 +15,6 @@ namespace duckdb {
 static constexpr const char *CROSSING_READ_FUNCTION = "crossing_read";
 static constexpr const char *CROSSING_WRITE_FUNCTION = "crossing_write";
 
-//! One shape for a read and a fence: what the table, the verb and the fragment say, nothing copied.
 struct CrossingBindData : public TableFunctionData, public CrossingCarrier {
 	CrossingBindData(CrossingTableCatalogEntry &table, CrossingVerb verb, CrossingSeam seam,
 	                 shared_ptr<CrossingFragment> fragment);

@@ -66,10 +66,10 @@ unique_ptr<ColumnDataCollection> Rows(const vector<LogicalType> &types, const ve
 	chunk.Initialize(Allocator::DefaultAllocator(), types);
 	for (idx_t r = 0; r < values.size(); r++) {
 		for (idx_t c = 0; c < types.size(); c++) {
-			chunk.SetValue(c, r, values[r][c]);
+			chunk.data[c].SetValue(r, values[r][c]);
 		}
 	}
-	chunk.SetCardinality(values.size());
+	chunk.SetChildCardinality(values.size());
 	rows->Append(chunk);
 	return rows;
 }

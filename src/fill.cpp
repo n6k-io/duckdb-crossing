@@ -321,9 +321,9 @@ void MaterialiseConstantRows(ClientContext &context, unique_ptr<LogicalOperator>
 			chunk.Reset();
 		}
 		for (idx_t c = 0; c < row.size(); c++) {
-			chunk.SetValue(c, chunk.size(), ExpressionExecutor::EvaluateScalar(context, *row[c]));
+			chunk.data[c].SetValue(chunk.size(), ExpressionExecutor::EvaluateScalar(context, *row[c]));
 		}
-		chunk.SetCardinality(chunk.size() + 1);
+		chunk.SetChildCardinality(chunk.size() + 1);
 	}
 	if (chunk.size() > 0) {
 		collection->Append(chunk);

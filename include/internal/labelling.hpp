@@ -8,7 +8,7 @@
 namespace duckdb {
 
 //! Per node, the source its whole subtree could run on. A node is absent when its subtree spans two
-//! sources, holds something that cannot cross, or reaches a leaf that is not a crossing scan.
+//! groups, holds something that cannot cross, or reaches a leaf that is not a crossing scan.
 //! A subtree of nothing but rows the target holds is labelled with no source at all: it can run
 //! wherever the subtree above it goes.
 struct SubtreeLabel {

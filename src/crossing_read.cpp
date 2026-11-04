@@ -47,7 +47,7 @@ bool PlanIsOrdered(const LogicalOperator &op) {
 }
 
 void EmitChunk(CrossingReadGlobalState &state, DataChunk &source_chunk, DataChunk &output) {
-	output.SetCardinality(source_chunk.size());
+	output.SetChildCardinality(source_chunk.size());
 	for (idx_t idx = 0; idx < state.column_ids.size(); idx++) {
 		if (state.column_ids[idx] == COLUMN_IDENTIFIER_ROW_ID) {
 			EmitRowIds(output.data[idx], source_chunk, state);
@@ -406,6 +406,8 @@ SourceResultType CrossingRead::GetDataInternal(ExecutionContext &context, DataCh
 			                            "query wants [%s]",
 			                            source_table, TypeList(produced), TypeList(expected));
 		}
+		// A reader may report its row count on the chunk alone; every vector read below needs it too.
+		local.source_chunk.SetChildCardinality(local.source_chunk.size());
 		CheckBatchIndex(state, local, pulled, source_table);
 		local.batch_index = pulled.batch_index;
 		EmitChunk(state, local.source_chunk, output);

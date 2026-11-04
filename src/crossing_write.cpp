@@ -503,8 +503,8 @@ SourceResultType CrossingFence::GetDataInternal(ExecutionContext &context, DataC
 		if (result.outcome == CrossingWriteResult::Outcome::DONE) {
 			state.write.reset();
 			state.done = true;
-			chunk.SetCardinality(1);
-			chunk.SetValue(0, 0, Value::BIGINT(NumericCast<int64_t>(result.affected_rows)));
+			chunk.SetChildCardinality(1);
+			chunk.data[0].SetValue(0, Value::BIGINT(NumericCast<int64_t>(result.affected_rows)));
 			return SourceResultType::HAVE_MORE_OUTPUT;
 		}
 		SourceResultType parked;
@@ -751,8 +751,8 @@ SourceResultType CrossingWrite::GetDataInternal(ExecutionContext &, DataChunk &c
 		return SourceResultType::HAVE_MORE_OUTPUT;
 	}
 	source_state.done = true;
-	chunk.SetCardinality(1);
-	chunk.SetValue(0, 0, Value::BIGINT(NumericCast<int64_t>(state.affected_rows)));
+	chunk.SetChildCardinality(1);
+	chunk.data[0].SetValue(0, Value::BIGINT(NumericCast<int64_t>(state.affected_rows)));
 	return SourceResultType::HAVE_MORE_OUTPUT;
 }
 
@@ -844,9 +844,9 @@ SourceResultType CrossingCreateTableAs::GetDataInternal(ExecutionContext &, Data
 		return SourceResultType::FINISHED;
 	}
 	source_state.done = true;
-	chunk.SetCardinality(1);
-	chunk.SetValue(0, 0,
-	               Value::BIGINT(NumericCast<int64_t>(sink_state->Cast<CrossingCreateTableAsState>().affected_rows)));
+	chunk.SetChildCardinality(1);
+	chunk.data[0].SetValue(
+	    0, Value::BIGINT(NumericCast<int64_t>(sink_state->Cast<CrossingCreateTableAsState>().affected_rows)));
 	return SourceResultType::HAVE_MORE_OUTPUT;
 }
 

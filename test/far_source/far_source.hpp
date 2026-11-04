@@ -18,7 +18,6 @@ enum class Transport { NATIVE, SUBSTRAIT };
 
 const char *TransportName(Transport transport);
 
-//! A fully collected result, read by position.
 class TestResult {
 public:
 	explicit TestResult(unique_ptr<QueryResult> result_p) : result(std::move(result_p)) {
@@ -122,9 +121,7 @@ struct FarStore {
 	//! Non-zero: block b goes to partition b % partitions with batch index b, which breaks the
 	//! contract once a thread drains a second partition.
 	idx_t round_robin_batch_rows = 0;
-	//! A batch-indexed scan whose pulls carry no index.
 	bool drop_batch_index = false;
-	//! An unindexed scan whose pulls carry an index.
 	bool stray_batch_index = false;
 	set<idx_t> partitions_read;
 	bool wait_before_chunks = false;

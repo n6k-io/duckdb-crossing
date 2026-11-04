@@ -25,7 +25,7 @@ LogicalOperator &FirstIndexedNodeBelow(LogicalOperator &root) {
 }
 
 //! Slots rather than scans, so each can be swapped for the plan it stands for without knowing what
-//! holds it. More than one means the subtree spans several scans of one source; all fold into the
+//! holds it. More than one means the subtree spans several scans of one group; all fold into the
 //! first.
 void CollectScanSlots(unique_ptr<LogicalOperator> &node, vector<unique_ptr<LogicalOperator> *> &out,
                       const CrossingIdentity &identity) {
