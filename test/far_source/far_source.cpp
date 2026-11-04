@@ -16,7 +16,7 @@
 #include "duckdb/parser/statement/create_statement.hpp"
 #include "duckdb/parser/statement/drop_statement.hpp"
 #include "duckdb/parser/statement/select_statement.hpp"
-#include "duckdb/parser/keyword_helper.hpp"
+#include "duckdb/common/sql_identifier.hpp"
 #include "duckdb/planner/expression/bound_aggregate_expression.hpp"
 #include "duckdb/planner/expression/bound_function_expression.hpp"
 #include "duckdb/planner/expression/bound_window_expression.hpp"
@@ -306,9 +306,8 @@ CrossingTable FarSource::DescribeOn(FarStore &store, Connection &con, const stri
 	CrossingTable table;
 	table.name = name;
 	if (IsView(con, catalog, schema, name)) {
-		auto result = con.Query("SELECT * FROM " + KeywordHelper::WriteOptionallyQuoted(catalog) + "." +
-		                        KeywordHelper::WriteOptionallyQuoted(schema) + "." +
-		                        KeywordHelper::WriteOptionallyQuoted(name) + " LIMIT 0");
+		auto result = con.Query("SELECT * FROM " + SQLIdentifier::ToString(catalog) + "." +
+		                        SQLIdentifier::ToString(schema) + "." + SQLIdentifier::ToString(name) + " LIMIT 0");
 		if (result->HasError()) {
 			result->ThrowError();
 		}

@@ -311,6 +311,9 @@ idx_t RunPlanned(ClientContext &context, const CrossingWriteTarget &target, uniq
 
 	auto result = SubmitCrossingPlan(context, std::move(plan));
 	result->ThrowIfError();
+	// Fetching a result that failed while running reports the failure as a fetch error, losing its type.
+	result->Complete();
+	result->ThrowIfError();
 	auto chunk = result->Fetch();
 	if (!chunk || chunk->size() == 0 || chunk->ColumnCount() == 0) {
 		return 0;

@@ -19,7 +19,7 @@ CrossingWaker CrossingParking::Waker() {
 	return CrossingWaker(shared_ptr_cast<Task, CrossingParking>(shared_from_this()));
 }
 
-bool CrossingParking::Park(StateWithBlockableTasks &state) {
+bool CrossingParking::Park(StateWithBlockableTasks &state) DUCKDB_REQUIRES(state.lock) {
 	lock_guard<mutex> mine(lock);
 	if (woken) {
 		return false;
