@@ -214,7 +214,7 @@ TEST_CASE("a write run wholly on the source waits the same way", "[protocol]") {
 
 	REQUIRE(result->GetValue(0, 0) == Value::BIGINT(4));
 	REQUIRE(twin.store->write_waits_served == 1);
-	REQUIRE(twin.store->con.Query("SELECT count(*) FROM orders")->GetValue(0, 0) == Value::BIGINT(1));
+	REQUIRE(Collected(twin.store->con.Query("SELECT count(*) FROM orders"))->GetValue(0, 0) == Value::BIGINT(1));
 }
 
 TEST_CASE("a merge whose write waits finishes", "[protocol]") {

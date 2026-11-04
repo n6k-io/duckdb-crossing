@@ -37,8 +37,8 @@ void CollectFloors(const LogicalOperator &op, vector<CrossingTableUse> &out) {
 			use.table = floor->table;
 			named = true;
 		} else if (auto table = get.GetTable()) {
-			use.schema = table->schema.name;
-			use.table = table->name;
+			use.schema = table->schema.name.GetIdentifierName();
+			use.table = table->name.GetIdentifierName();
 			named = true;
 		}
 		if (named) {

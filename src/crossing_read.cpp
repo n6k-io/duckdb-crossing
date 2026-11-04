@@ -25,7 +25,7 @@ string TypeList(const vector<LogicalType> &types) {
 }
 
 void EmitRowIds(Vector &rowid_vec, DataChunk &source_chunk, CrossingReadGlobalState &state) {
-	auto row_ids = FlatVector::GetData<row_t>(rowid_vec);
+	auto row_ids = FlatVector::GetDataMutable<row_t>(rowid_vec);
 	auto first = state.rows_emitted.fetch_add(source_chunk.size());
 	for (idx_t i = 0; i < source_chunk.size(); i++) {
 		row_ids[i] = static_cast<row_t>(first + i);
@@ -68,8 +68,8 @@ void CrossingReadFunc(ClientContext &, TableFunctionInput &data, DataChunk &) {
 	                        data.bind_data->Cast<CrossingBindData>().SourceTable());
 }
 
-BindInfo CrossingReadGetBindInfo(const optional_ptr<FunctionData> bind_data) {
-	return BindInfo(bind_data->Cast<CrossingBindData>().table);
+optional_ptr<TableCatalogEntry> CrossingReadGetTableEntry(optional_ptr<const FunctionData> bind_data) {
+	return &bind_data->Cast<CrossingBindData>().table;
 }
 
 InsertionOrderPreservingMap<string> CrossingReadToString(TableFunctionToStringInput &input) {
@@ -193,7 +193,7 @@ InsertionOrderPreservingMap<string> CrossingBindData::Params() const {
 	}
 	if (fragment) {
 		if (verb == CrossingVerb::SELECT) {
-			result["Table Index"] = to_string(fragment->table_index);
+			result["Table Index"] = to_string(fragment->table_index.index);
 			result["Plan Columns"] = to_string(fragment->output_types.size());
 		}
 		result["Plan"] = fragment->plan_text.empty() ? "(none)" : fragment->plan_text;
@@ -212,7 +212,7 @@ optional_ptr<CrossingBindData> CrossingBindDataOf(LogicalGet &get, const Crossin
 TableFunction CrossingReadFunction() {
 	TableFunction function(CROSSING_READ_FUNCTION, {}, CrossingReadFunc);
 	function.to_string = CrossingReadToString;
-	function.get_bind_info = CrossingReadGetBindInfo;
+	function.get_table_entry = CrossingReadGetTableEntry;
 	// Without this, column_ids is not the output-slot-to-source-column map the scan reads it as.
 	// Filters stay off: crossing wants them as operators to fold, not as a TableFilterSet.
 	function.projection_pushdown = true;
@@ -227,7 +227,7 @@ shared_ptr<CrossingFragment> BuildScanFragment(unique_ptr<LogicalOperator> floor
 
 	idx_t next_index = 0;
 	FreshTableIndex local = [&next_index]() {
-		return next_index++;
+		return TableIndex(next_index++);
 	};
 	RemapTableIndices(*floor, local);
 	fragment->table_index = local();
@@ -259,11 +259,11 @@ shared_ptr<CrossingFragment> BuildScanFragment(unique_ptr<LogicalOperator> floor
 void RequirePlaceholderScans(const LogicalOperator &op, CrossingVerb verb, const string &table) {
 	if (op.type == LogicalOperatorType::LOGICAL_GET) {
 		auto &get = op.Cast<LogicalGet>();
-		if (!FloorOf(get) && get.function.name != CROSSING_SEAM_FUNCTION) {
+		if (!FloorOf(get) && get.function.GetName() != CROSSING_SEAM_FUNCTION) {
 			throw InternalException("crossing: the source's %s of '%s' holds a %s scan; return MakeFloorNode or "
 			                        "MakeSeamNode and bind the table in Read or Write",
 			                        verb == CrossingVerb::SELECT ? "scan" : CrossingVerbName(verb), table,
-			                        get.function.name);
+			                        get.function.GetName().GetIdentifierName());
 		}
 	}
 	for (auto &child : op.children) {
@@ -294,7 +294,7 @@ unique_ptr<FunctionData> MakeReadBindData(CrossingTableCatalogEntry &entry) {
 	return make_uniq<CrossingBindData>(entry, CrossingVerb::SELECT, CrossingSeam(), std::move(fragment));
 }
 
-LogicalCrossingRead::LogicalCrossingRead(idx_t table_index_p, vector<ColumnIndex> column_ids_p,
+LogicalCrossingRead::LogicalCrossingRead(TableIndex table_index_p, vector<ColumnIndex> column_ids_p,
                                          vector<LogicalType> output_types_p, unique_ptr<CrossingBindData> bind_data_p)
     : table_index(table_index_p), column_ids(std::move(column_ids_p)), output_types(std::move(output_types_p)),
       bind_data(std::move(bind_data_p)) {
@@ -312,7 +312,7 @@ vector<ColumnBinding> LogicalCrossingRead::GetColumnBindings() {
 	return GenerateColumnBindings(table_index, column_ids.size());
 }
 
-vector<idx_t> LogicalCrossingRead::GetTableIndex() const {
+vector<TableIndex> LogicalCrossingRead::GetTableIndex() const {
 	return {table_index};
 }
 
@@ -451,12 +451,12 @@ InsertionOrderPreservingMap<string> CrossingRead::ParamsToString() const {
 }
 
 bool ParkSource(CrossingParking &parking, GlobalSourceState &state, SourceResultType &result) {
-	auto guard = state.Lock();
-	if (parking.Park(state, guard)) {
+	const annotated_lock_guard<annotated_mutex> guard {state.lock};
+	if (parking.Park(state)) {
 		result = SourceResultType::BLOCKED;
 		return true;
 	}
-	if (!state.CanBlock(guard)) {
+	if (!state.CanBlock()) {
 		result = SourceResultType::FINISHED;
 		return true;
 	}

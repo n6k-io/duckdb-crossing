@@ -9,6 +9,8 @@
 #include "duckdb/planner/expression/bound_comparison_expression.hpp"
 #include "duckdb/planner/expression/bound_constant_expression.hpp"
 #include "duckdb/planner/expression/bound_unnest_expression.hpp"
+#include "duckdb/function/window/rows_functions.hpp"
+#include "duckdb/function/window_function.hpp"
 #include "duckdb/planner/expression/bound_window_expression.hpp"
 #include "duckdb/planner/expression_iterator.hpp"
 #include "duckdb/planner/operator/logical_aggregate.hpp"
@@ -21,17 +23,17 @@
 
 namespace duckdb {
 
-constexpr idx_t BUILDER_LOCAL_INDEX = 14;
-constexpr idx_t BUILDER_WINDOW_INDEX = 15;
-constexpr idx_t BUILDER_UNNEST_INDEX = 16;
-constexpr idx_t BUILDER_PROJECTION_INDEX = 20;
+const TableIndex BUILDER_LOCAL_INDEX = TableIndex(14);
+const TableIndex BUILDER_WINDOW_INDEX = TableIndex(15);
+const TableIndex BUILDER_UNNEST_INDEX = TableIndex(16);
+const TableIndex BUILDER_PROJECTION_INDEX = TableIndex(20);
 
 inline ColumnBinding UnresolvedBinding() {
-	return ColumnBinding(DConstants::INVALID_INDEX, DConstants::INVALID_INDEX);
+	return ColumnBinding();
 }
 
 inline unique_ptr<Expression> Col(const string &name) {
-	return make_uniq<BoundColumnRefExpression>(name, LogicalType::SQLNULL, UnresolvedBinding());
+	return make_uniq<BoundColumnRefExpression>(Identifier(name), LogicalType::SQLNULL, UnresolvedBinding());
 }
 
 inline unique_ptr<Expression> Bool(bool value) {
@@ -39,24 +41,25 @@ inline unique_ptr<Expression> Bool(bool value) {
 }
 
 inline unique_ptr<Expression> Gt(unique_ptr<Expression> left, unique_ptr<Expression> right) {
-	return make_uniq<BoundComparisonExpression>(ExpressionType::COMPARE_GREATERTHAN, std::move(left), std::move(right));
+	return BoundComparisonExpression::Create(ExpressionType::COMPARE_GREATERTHAN, std::move(left), std::move(right));
 }
 
 inline unique_ptr<Expression> CaseWhen(unique_ptr<Expression> when, unique_ptr<Expression> then,
                                        unique_ptr<Expression> otherwise) {
-	auto result = make_uniq<BoundCaseExpression>(then->return_type);
-	result->case_checks.emplace_back();
-	result->case_checks[0].when_expr = std::move(when);
-	result->case_checks[0].then_expr = std::move(then);
-	result->else_expr = std::move(otherwise);
+	auto result = make_uniq<BoundCaseExpression>(then->GetReturnType());
+	result->CaseChecksMutable().emplace_back();
+	result->CaseChecksMutable()[0].when_expr = std::move(when);
+	result->CaseChecksMutable()[0].then_expr = std::move(then);
+	result->ElseMutable() = std::move(otherwise);
 	return std::move(result);
 }
 
 inline unique_ptr<Expression> UnknownFn(const string &name, unique_ptr<Expression> argument) {
-	ScalarFunction function(name, {argument->return_type}, LogicalType::BOOLEAN, nullptr);
+	ScalarFunction function(Identifier(name), vector<LogicalType> {argument->GetReturnType()}, LogicalType::BOOLEAN,
+	                        nullptr);
 	vector<unique_ptr<Expression>> arguments;
 	arguments.push_back(std::move(argument));
-	return make_uniq<BoundFunctionExpression>(LogicalType::BOOLEAN, std::move(function), std::move(arguments), nullptr);
+	return make_uniq<BoundFunctionExpression>(BoundScalarFunction(std::move(function)), std::move(arguments), nullptr);
 }
 
 struct BuilderColumn {
@@ -72,7 +75,7 @@ inline void BuilderColumnsOf(LogicalOperator &op, vector<BuilderColumn> &out) {
 		auto &ids = get.GetColumnIds();
 		for (idx_t i = 0; i < bindings.size() && i < ids.size(); i++) {
 			auto id = ids[i].GetPrimaryIndex();
-			out.push_back({get.names[id], bindings[i], get.returned_types[id]});
+			out.push_back({get.names[id].GetIdentifierName(), bindings[i], get.returned_types[id]});
 		}
 		return;
 	}
@@ -87,7 +90,8 @@ inline void BuilderColumnsOf(LogicalOperator &op, vector<BuilderColumn> &out) {
 		auto &projection = op.Cast<LogicalProjection>();
 		auto bindings = projection.GetColumnBindings();
 		for (idx_t i = 0; i < projection.expressions.size() && i < bindings.size(); i++) {
-			out.push_back({projection.expressions[i]->GetName(), bindings[i], projection.expressions[i]->return_type});
+			out.push_back({projection.expressions[i]->GetName().GetIdentifierName(), bindings[i],
+			               projection.expressions[i]->GetReturnType()});
 		}
 		return;
 	}
@@ -100,15 +104,15 @@ inline void BuilderResolveExpression(unique_ptr<Expression> &expr, const vector<
                                      const string &where) {
 	if (expr->GetExpressionClass() == ExpressionClass::BOUND_COLUMN_REF) {
 		auto &ref = expr->Cast<BoundColumnRefExpression>();
-		if (ref.binding.table_index != DConstants::INVALID_INDEX) {
+		if (ref.Binding().table_index.IsValid()) {
 			return;
 		}
 		for (auto &column : columns) {
-			if (!StringUtil::CIEquals(column.name, ref.GetName())) {
+			if (!StringUtil::CIEquals(column.name, ref.GetName().GetIdentifierName())) {
 				continue;
 			}
-			ref.binding = column.binding;
-			ref.return_type = column.type;
+			ref.BindingMutable() = column.binding;
+			ref.SetReturnType(column.type);
 			return;
 		}
 		vector<string> available;
@@ -155,8 +159,8 @@ inline void BuilderNumberProjections(LogicalOperator &op, idx_t &next) {
 		return;
 	}
 	auto &projection = op.Cast<LogicalProjection>();
-	if (projection.table_index == DConstants::INVALID_INDEX) {
-		projection.table_index = next++;
+	if (!projection.table_index.IsValid()) {
+		projection.table_index = TableIndex(next++);
 	}
 }
 
@@ -173,7 +177,7 @@ unique_ptr<LogicalOperator> Chain(unique_ptr<LogicalOperator> op, Rest &&...rest
 template <class... Nodes>
 unique_ptr<LogicalOperator> Build(Nodes &&...nodes) {
 	auto plan = Chain(std::forward<Nodes>(nodes)...);
-	idx_t next = BUILDER_PROJECTION_INDEX;
+	idx_t next = BUILDER_PROJECTION_INDEX.index;
 	BuilderNumberProjections(*plan, next);
 	BuilderResolve(*plan);
 	return plan;
@@ -227,7 +231,7 @@ template <class... Exprs>
 unique_ptr<LogicalOperator> Proj(Exprs &&...exprs) {
 	vector<unique_ptr<Expression>> expressions;
 	BuilderPush(expressions, std::forward<Exprs>(exprs)...);
-	return make_uniq<LogicalProjection>(DConstants::INVALID_INDEX, std::move(expressions));
+	return make_uniq<LogicalProjection>(TableIndex(), std::move(expressions));
 }
 
 inline unique_ptr<LogicalOperator> Limit(int64_t rows) {
@@ -246,11 +250,12 @@ unique_ptr<LogicalOperator> Order(Exprs &&...exprs) {
 }
 
 inline unique_ptr<LogicalOperator> RowNumberOver(unique_ptr<Expression> order_key) {
-	auto window =
-	    make_uniq<BoundWindowExpression>(ExpressionType::WINDOW_ROW_NUMBER, LogicalType::BIGINT, nullptr, nullptr);
-	window->orders.emplace_back(OrderType::ASCENDING, OrderByNullType::NULLS_LAST, std::move(order_key));
-	window->start = WindowBoundary::UNBOUNDED_PRECEDING;
-	window->end = WindowBoundary::CURRENT_ROW_RANGE;
+	auto window = make_uniq<BoundWindowExpression>(
+	    LogicalType::BIGINT, nullptr, make_uniq<BoundWindowFunction>(RowNumberFun::GetFunction()), nullptr);
+	window->SetExpressionTypeUnsafe(ExpressionType::WINDOW_ROW_NUMBER);
+	window->OrderByMutable().emplace_back(OrderType::ASCENDING, OrderByNullType::NULLS_LAST, std::move(order_key));
+	window->WindowStartMutable() = WindowBoundary::UNBOUNDED_PRECEDING;
+	window->WindowEndMutable() = WindowBoundary::CURRENT_ROW_RANGE;
 	auto op = make_uniq<LogicalWindow>(BUILDER_WINDOW_INDEX);
 	op->expressions.push_back(std::move(window));
 	return std::move(op);
@@ -258,7 +263,7 @@ inline unique_ptr<LogicalOperator> RowNumberOver(unique_ptr<Expression> order_ke
 
 inline unique_ptr<LogicalOperator> Unnest(unique_ptr<Expression> list) {
 	auto unnest = make_uniq<BoundUnnestExpression>(LogicalType::INTEGER);
-	unnest->child = std::move(list);
+	unnest->ChildMutable() = std::move(list);
 	auto op = make_uniq<LogicalUnnest>(BUILDER_UNNEST_INDEX);
 	op->expressions.push_back(std::move(unnest));
 	return std::move(op);
@@ -359,13 +364,13 @@ private:
 			return std::move(filter);
 		}
 		if (name == "proj") {
-			return make_uniq<LogicalProjection>(DConstants::INVALID_INDEX, std::move(args));
+			return make_uniq<LogicalProjection>(TableIndex(), std::move(args));
 		}
 		if (name == "limit") {
 			if (args.size() != 1 || args[0]->GetExpressionClass() != ExpressionClass::BOUND_CONSTANT) {
 				Fail("limit takes one integer");
 			}
-			return Limit(args[0]->Cast<BoundConstantExpression>().value.GetValue<int64_t>());
+			return Limit(args[0]->Cast<BoundConstantExpression>().GetValue().GetValue<int64_t>());
 		}
 		if (name == "order") {
 			vector<BoundOrderByNode> orders;
@@ -458,7 +463,7 @@ private:
 inline unique_ptr<LogicalOperator> PlanFromDSL(const string &text) {
 	DSLParser parser(text);
 	auto plan = parser.Plan();
-	idx_t next = BUILDER_PROJECTION_INDEX;
+	idx_t next = BUILDER_PROJECTION_INDEX.index;
 	BuilderNumberProjections(*plan, next);
 	BuilderResolve(*plan);
 	REQUIRE(PlanToTestDSL(plan) == text);

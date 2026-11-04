@@ -50,7 +50,7 @@ optional_ptr<CatalogEntry> CrossingCatalog::CreateSchema(CatalogTransaction, Cre
 }
 
 void CrossingCatalog::DropSchema(ClientContext &, DropInfo &info) {
-	attach.ThrowIfSchemaServed(info.name);
+	attach.ThrowIfSchemaServed(info.GetQualifiedName().Name().GetIdentifierName());
 	throw SchemasAreServed();
 }
 
@@ -71,8 +71,7 @@ optional_ptr<SchemaCatalogEntry> CrossingCatalog::SchemaNamed(const string &name
 		return nullptr;
 	}
 	CreateSchemaInfo info;
-	info.catalog = GetName();
-	info.schema = spelling;
+	info.SetQualifiedName(QualifiedName(GetName(), Identifier(spelling), Identifier()));
 	auto entry = make_uniq<CrossingSchemaEntry>(*this, info);
 	auto raw = entry.get();
 	schemas[spelling] = std::move(entry);
@@ -146,7 +145,7 @@ void CrossingSchemaEntry::Scan(CatalogType type, const std::function<void(Catalo
 		return;
 	}
 	case_insensitive_set_t seen;
-	attach.ScanTables(name, *this, seen, callback, transaction);
+	attach.ScanTables(name.GetIdentifierName(), *this, seen, callback, transaction);
 }
 
 optional_ptr<CatalogEntry> CrossingSchemaEntry::LookupEntry(CatalogTransaction transaction,
@@ -156,64 +155,68 @@ optional_ptr<CatalogEntry> CrossingSchemaEntry::LookupEntry(CatalogTransaction t
 	if (type != CatalogType::TABLE_ENTRY && type != CatalogType::VIEW_ENTRY) {
 		return nullptr;
 	}
-	return attach.LookupTable(name, *this, lookup_info.GetEntryName(), transaction.transaction);
+	return attach.LookupTable(name.GetIdentifierName(), *this, lookup_info.GetEntryName(), transaction.transaction);
 }
 
 void CrossingSchemaEntry::DropEntry(ClientContext &context, DropInfo &info) {
 	auto &transaction = Transaction::Get(context, catalog);
+	auto &schema_name = name.GetIdentifierName();
+	auto &entry_name = info.GetQualifiedName().Name();
 	if ((info.type == CatalogType::TABLE_ENTRY || info.type == CatalogType::VIEW_ENTRY) &&
-	    attach.ServesTable(name, info.name, &transaction)) {
+	    attach.ServesTable(schema_name, entry_name.GetIdentifierName(), &transaction)) {
 		CrossingDdl ddl;
 		ddl.verb = CrossingVerb::DROP;
-		ddl.schema = name;
-		ddl.table = info.name;
+		ddl.schema = schema_name;
+		ddl.table = entry_name.GetIdentifierName();
 		ddl.drop = &info;
 		attach.Ddl(context, transaction, *this, ddl);
 		return;
 	}
-	attach.ThrowIfServed(name, info.name, "DROP");
+	attach.ThrowIfServed(schema_name, entry_name.GetIdentifierName(), "DROP");
 	if (info.if_not_found == OnEntryNotFound::RETURN_NULL) {
 		return;
 	}
-	throw CatalogException::MissingEntry(info.type, info.name, string());
+	throw CatalogException::MissingEntry(info.type, entry_name, string());
 }
 
 void CrossingSchemaEntry::Alter(CatalogTransaction transaction, AlterInfo &info) {
+	auto &schema_name = name.GetIdentifierName();
+	auto &entry_name = info.GetQualifiedName().Name();
 	if (info.GetCatalogType() == CatalogType::TABLE_ENTRY &&
-	    attach.ServesTable(name, info.name, transaction.transaction)) {
+	    attach.ServesTable(schema_name, entry_name.GetIdentifierName(), transaction.transaction)) {
 		CrossingDdl ddl;
 		ddl.verb = CrossingVerb::ALTER;
-		ddl.schema = name;
-		ddl.table = info.name;
+		ddl.schema = schema_name;
+		ddl.table = entry_name.GetIdentifierName();
 		ddl.alter = &info;
 		attach.Ddl(transaction.GetContext(), *transaction.transaction, *this, ddl);
 		return;
 	}
-	attach.ThrowIfServed(name, info.name, "ALTER");
+	attach.ThrowIfServed(schema_name, entry_name.GetIdentifierName(), "ALTER");
 	if (info.if_not_found == OnEntryNotFound::RETURN_NULL) {
 		return;
 	}
-	throw CatalogException::MissingEntry(info.GetCatalogType(), info.name, string());
+	throw CatalogException::MissingEntry(info.GetCatalogType(), entry_name, string());
 }
 
 optional_ptr<CatalogEntry> CrossingSchemaEntry::CreateIndex(CatalogTransaction, CreateIndexInfo &,
                                                             TableCatalogEntry &) {
-	throw CreateNotSupported(name);
+	throw CreateNotSupported(name.GetIdentifierName());
 }
 
 optional_ptr<CatalogEntry> CrossingSchemaEntry::CreateFunction(CatalogTransaction, CreateFunctionInfo &) {
-	throw CreateNotSupported(name);
+	throw CreateNotSupported(name.GetIdentifierName());
 }
 
 optional_ptr<CatalogEntry> CrossingSchemaEntry::CreateTable(CatalogTransaction transaction,
                                                             BoundCreateTableInfo &info) {
 	CrossingDdl ddl;
 	ddl.verb = CrossingVerb::CREATE;
-	ddl.schema = name;
-	ddl.table = info.Base().table;
+	ddl.schema = name.GetIdentifierName();
+	ddl.table = info.Base().GetTableName().GetIdentifierName();
 	ddl.create = info.base.get();
 	attach.Ddl(transaction.GetContext(), *transaction.transaction, *this, ddl);
-	return attach.LookupTable(name, *this, ddl.table, transaction.transaction);
+	return attach.LookupTable(ddl.schema, *this, ddl.table, transaction.transaction);
 }
 
 optional_ptr<CatalogEntry> CrossingSchemaEntry::CreateView(CatalogTransaction transaction, CreateViewInfo &info) {
@@ -221,27 +224,27 @@ optional_ptr<CatalogEntry> CrossingSchemaEntry::CreateView(CatalogTransaction tr
 }
 
 optional_ptr<CatalogEntry> CrossingSchemaEntry::CreateSequence(CatalogTransaction, CreateSequenceInfo &) {
-	throw CreateNotSupported(name);
+	throw CreateNotSupported(name.GetIdentifierName());
 }
 
 optional_ptr<CatalogEntry> CrossingSchemaEntry::CreateTableFunction(CatalogTransaction, CreateTableFunctionInfo &) {
-	throw CreateNotSupported(name);
+	throw CreateNotSupported(name.GetIdentifierName());
 }
 
 optional_ptr<CatalogEntry> CrossingSchemaEntry::CreateCopyFunction(CatalogTransaction, CreateCopyFunctionInfo &) {
-	throw CreateNotSupported(name);
+	throw CreateNotSupported(name.GetIdentifierName());
 }
 
 optional_ptr<CatalogEntry> CrossingSchemaEntry::CreatePragmaFunction(CatalogTransaction, CreatePragmaFunctionInfo &) {
-	throw CreateNotSupported(name);
+	throw CreateNotSupported(name.GetIdentifierName());
 }
 
 optional_ptr<CatalogEntry> CrossingSchemaEntry::CreateCollation(CatalogTransaction, CreateCollationInfo &) {
-	throw CreateNotSupported(name);
+	throw CreateNotSupported(name.GetIdentifierName());
 }
 
 optional_ptr<CatalogEntry> CrossingSchemaEntry::CreateType(CatalogTransaction, CreateTypeInfo &) {
-	throw CreateNotSupported(name);
+	throw CreateNotSupported(name.GetIdentifierName());
 }
 
 } // namespace duckdb

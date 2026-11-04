@@ -1,5 +1,6 @@
 #include "crossing.hpp"
 #include "internal/floor.hpp"
+#include "internal/names.hpp"
 
 #include "duckdb/common/serializer/deserializer.hpp"
 #include "duckdb/common/serializer/serializer.hpp"
@@ -25,7 +26,7 @@ struct CrossingFloorBindData : public FunctionData {
 	}
 };
 
-void SerializeFloor(Serializer &serializer, const optional_ptr<FunctionData> bind_data, const TableFunction &) {
+void SerializeFloor(Serializer &serializer, const optional_ptr<FunctionData> bind_data, const BoundTableFunction &) {
 	auto &floor = bind_data->Cast<CrossingFloorBindData>().floor;
 	serializer.WriteProperty(100, "schema", floor.schema);
 	serializer.WriteProperty(101, "table", floor.table);
@@ -33,7 +34,7 @@ void SerializeFloor(Serializer &serializer, const optional_ptr<FunctionData> bin
 	serializer.WritePropertyWithDefault(103, "catalog", floor.catalog);
 }
 
-unique_ptr<FunctionData> DeserializeFloor(Deserializer &deserializer, TableFunction &) {
+unique_ptr<FunctionData> DeserializeFloor(Deserializer &deserializer, BoundTableFunction &) {
 	auto bind_data = make_uniq<CrossingFloorBindData>();
 	deserializer.ReadProperty(100, "schema", bind_data->floor.schema);
 	deserializer.ReadProperty(101, "table", bind_data->floor.table);
@@ -66,8 +67,8 @@ unique_ptr<LogicalOperator> MakeFloorNode(idx_t table_index, string schema, stri
 	for (idx_t i = 0; i < column_names.size(); i++) {
 		ids.push_back(ColumnIndex(i));
 	}
-	auto get = make_uniq<LogicalGet>(table_index, CrossingFloorFunction(), std::move(bind_data),
-	                                 std::move(column_types), std::move(column_names));
+	auto get = make_uniq<LogicalGet>(TableIndex(table_index), BoundTableFunction(CrossingFloorFunction()),
+	                                 std::move(bind_data), std::move(column_types), IdentifiersOf(column_names));
 	get->SetColumnIds(std::move(ids));
 	return std::move(get);
 }
@@ -83,7 +84,7 @@ optional_ptr<const CrossingFloor> FloorOf(const LogicalOperator &op) {
 		return nullptr;
 	}
 	auto &get = op.Cast<LogicalGet>();
-	if (get.function.name != CROSSING_FLOOR_FUNCTION || !get.bind_data) {
+	if (get.function.GetName() != CROSSING_FLOOR_FUNCTION || !get.bind_data) {
 		return nullptr;
 	}
 	auto bind_data = dynamic_cast<const CrossingFloorBindData *>(get.bind_data.get());

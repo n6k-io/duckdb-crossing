@@ -10,10 +10,10 @@ namespace duckdb {
 
 namespace {
 
-void SerializeSeam(Serializer &, const optional_ptr<FunctionData>, const TableFunction &) {
+void SerializeSeam(Serializer &, const optional_ptr<FunctionData>, const BoundTableFunction &) {
 }
 
-unique_ptr<FunctionData> DeserializeSeam(Deserializer &, TableFunction &) {
+unique_ptr<FunctionData> DeserializeSeam(Deserializer &, BoundTableFunction &) {
 	return nullptr;
 }
 
@@ -34,13 +34,14 @@ optional_ptr<const ColumnDataCollection> SeamRowsOf(const LogicalOperator &op) {
 }
 
 unique_ptr<LogicalOperator> MakeSeamNode(idx_t table_index, vector<LogicalType> types) {
-	vector<string> names;
+	vector<Identifier> names;
 	vector<ColumnIndex> ids;
 	for (idx_t i = 0; i < types.size(); i++) {
-		names.push_back("c" + to_string(i));
+		names.emplace_back("c" + to_string(i));
 		ids.push_back(ColumnIndex(i));
 	}
-	auto get = make_uniq<LogicalGet>(table_index, CrossingSeamFunction(), nullptr, std::move(types), std::move(names));
+	auto get = make_uniq<LogicalGet>(TableIndex(table_index), BoundTableFunction(CrossingSeamFunction()), nullptr,
+	                                 std::move(types), std::move(names));
 	get->SetColumnIds(std::move(ids));
 	return std::move(get);
 }
@@ -54,7 +55,7 @@ unique_ptr<LogicalOperator> *FindSeamSlot(unique_ptr<LogicalOperator> &plan) {
 		return nullptr;
 	}
 	if (plan->type == LogicalOperatorType::LOGICAL_GET &&
-	    plan->Cast<LogicalGet>().function.name == CROSSING_SEAM_FUNCTION) {
+	    plan->Cast<LogicalGet>().function.GetName() == CROSSING_SEAM_FUNCTION) {
 		return &plan;
 	}
 	for (auto &child : plan->children) {

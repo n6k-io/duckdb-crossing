@@ -23,8 +23,8 @@ bool RejoinOneFilter(LogicalOperator &op);
 
 bool IsInnerJoin(LogicalOperator &op);
 
-set<idx_t> TableIndicesOf(LogicalOperator &op);
+set<TableIndex> TableIndicesOf(LogicalOperator &op);
 
-bool BindsOnlyTo(const Expression &expr, const set<idx_t> &tables);
+bool BindsOnlyTo(const Expression &expr, const set<TableIndex> &tables);
 
 } // namespace duckdb

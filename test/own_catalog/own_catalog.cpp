@@ -49,8 +49,7 @@ OwnCatalog::~OwnCatalog() = default;
 
 void OwnCatalog::Initialize(bool) {
 	CreateSchemaInfo info;
-	info.catalog = GetName();
-	info.schema = "main";
+	info.SetQualifiedName(QualifiedName(GetName(), "main", Identifier()));
 	schema = make_uniq<OwnSchema>(*this, info);
 }
 
@@ -141,24 +140,24 @@ void OwnSchema::Scan(CatalogType type, const std::function<void(CatalogEntry &)>
 		return;
 	}
 	case_insensitive_set_t seen;
-	attach.ScanTables(name, *this, seen, callback, nullptr);
+	attach.ScanTables(name.GetIdentifierName(), *this, seen, callback, nullptr);
 }
 
 optional_ptr<CatalogEntry> OwnSchema::LookupEntry(CatalogTransaction transaction, const EntryLookupInfo &lookup_info) {
 	if (lookup_info.GetCatalogType() != CatalogType::TABLE_ENTRY) {
 		return nullptr;
 	}
-	return attach.LookupTable(name, *this, lookup_info.GetEntryName(), transaction.transaction);
+	return attach.LookupTable(name.GetIdentifierName(), *this, lookup_info.GetEntryName(), transaction.transaction);
 }
 
 void OwnSchema::DropEntry(ClientContext &, DropInfo &info) {
-	attach.ThrowIfServed(name, info.name, "DROP");
-	throw CatalogException::MissingEntry(info.type, info.name, string());
+	attach.ThrowIfServed(name.GetIdentifierName(), info.GetQualifiedName().Name().GetIdentifierName(), "DROP");
+	throw CatalogException::MissingEntry(info.type, info.GetQualifiedName().Name(), string());
 }
 
 void OwnSchema::Alter(CatalogTransaction, AlterInfo &info) {
-	attach.ThrowIfServed(name, info.name, "ALTER");
-	throw CatalogException::MissingEntry(info.GetCatalogType(), info.name, string());
+	attach.ThrowIfServed(name.GetIdentifierName(), info.GetQualifiedName().Name().GetIdentifierName(), "ALTER");
+	throw CatalogException::MissingEntry(info.GetCatalogType(), info.GetQualifiedName().Name(), string());
 }
 
 optional_ptr<CatalogEntry> OwnSchema::CreateIndex(CatalogTransaction, CreateIndexInfo &, TableCatalogEntry &) {

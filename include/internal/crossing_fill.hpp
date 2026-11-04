@@ -23,7 +23,7 @@ CrossingVerb VerbOf(LogicalOperator &op);
 
 bool ReturnsRows(LogicalOperator &op);
 
-idx_t TableIndexOf(LogicalOperator &op);
+TableIndex TableIndexOf(LogicalOperator &op);
 
 vector<string> SetColumnsOf(LogicalOperator &op, TableCatalogEntry &table);
 

@@ -28,7 +28,8 @@ InternalException NoSchemasHere() {
 }
 
 NotImplementedException PassDidNotRun(TableCatalogEntry &table) {
-	return NotImplementedException("crossing: the write to '%s' needs the crossing optimizer pass", table.name);
+	return NotImplementedException("crossing: the write to '%s' needs the crossing optimizer pass",
+	                               table.name.GetIdentifierName());
 }
 
 void AddRowImage(LogicalOperator &op, const CrossingIdentity &identity) {
@@ -39,7 +40,7 @@ void AddRowImage(LogicalOperator &op, const CrossingIdentity &identity) {
 			return;
 		}
 		auto &key = del.expressions[0]->Cast<BoundColumnRefExpression>();
-		auto get = FindGetWithIndex(*del.children[0], key.binding.table_index);
+		auto get = FindGetWithIndex(*del.children[0], key.Binding().table_index);
 		if (!get) {
 			return;
 		}
@@ -62,7 +63,7 @@ void AddRowImage(LogicalOperator &op, const CrossingIdentity &identity) {
 		return;
 	}
 	auto &key = projection.expressions[merge.row_id_start]->Cast<BoundColumnRefExpression>();
-	auto get = FindGetWithIndex(*projection.children[0], key.binding.table_index);
+	auto get = FindGetWithIndex(*projection.children[0], key.Binding().table_index);
 	if (!get) {
 		return;
 	}
@@ -188,7 +189,7 @@ unique_ptr<MergeIntoOperator> PlanCrossingMergeAction(ClientContext &context, Lo
 vector<LogicalType> ColumnTypesByName(TableCatalogEntry &table, const vector<string> &wanted) {
 	vector<LogicalType> out;
 	for (auto &want : wanted) {
-		out.push_back(table.GetColumns().GetColumn(want).GetType());
+		out.push_back(table.GetColumns().GetColumn(Identifier(want)).GetType());
 	}
 	return out;
 }
@@ -204,7 +205,7 @@ vector<LogicalType> TableRowTypes(TableCatalogEntry &table) {
 vector<string> TableColumnNames(TableCatalogEntry &table) {
 	vector<string> out;
 	for (auto &column : table.GetColumns().Logical()) {
-		out.push_back(column.GetName());
+		out.push_back(column.GetName().GetIdentifierName());
 	}
 	return out;
 }
@@ -212,7 +213,7 @@ vector<string> TableColumnNames(TableCatalogEntry &table) {
 vector<string> SetColumnNames(TableCatalogEntry &table, const vector<PhysicalIndex> &columns) {
 	vector<string> out;
 	for (auto &column_index : columns) {
-		out.push_back(table.GetColumns().GetColumn(column_index).GetName());
+		out.push_back(table.GetColumns().GetColumn(column_index).GetName().GetIdentifierName());
 	}
 	return out;
 }
@@ -221,7 +222,7 @@ unique_ptr<Expression> RefAt(const LogicalType &type, idx_t position) {
 	return make_uniq<BoundReferenceExpression>(type, position);
 }
 
-optional_ptr<LogicalGet> FindGetWithIndex(LogicalOperator &op, idx_t table_index) {
+optional_ptr<LogicalGet> FindGetWithIndex(LogicalOperator &op, TableIndex table_index) {
 	if (op.type == LogicalOperatorType::LOGICAL_GET && op.Cast<LogicalGet>().table_index == table_index) {
 		return &op.Cast<LogicalGet>();
 	}
@@ -249,7 +250,7 @@ vector<unique_ptr<Expression>> RowImageFrom(LogicalGet &get, TableCatalogEntry &
 			get.AddColumnId(wanted);
 		}
 		out.push_back(make_uniq<BoundColumnRefExpression>(column.Name(), column.Type(),
-		                                                  ColumnBinding(get.table_index, position)));
+		                                                  ColumnBinding(get.table_index, ProjectionIndex(position))));
 	}
 	return out;
 }
@@ -277,7 +278,8 @@ vector<unique_ptr<Expression>> ImageFromSetValues(TableCatalogEntry &table, cons
 			}
 		}
 		if (set == seam.set_columns.size()) {
-			throw BinderException("crossing: RETURNING on '%s' has no value for column '%s'", table.name, name);
+			throw BinderException("crossing: RETURNING on '%s' has no value for column '%s'",
+			                      table.name.GetIdentifierName(), name);
 		}
 		image.push_back(set_values[set]->Copy());
 	}
@@ -325,13 +327,15 @@ CrossingSeam SeamOf(TableCatalogEntry &table, const CrossingTable &described, Cr
 
 void RequireVerb(CrossingTableCatalogEntry &table, CrossingVerb verb) {
 	if (!table.described.Allows(verb)) {
-		throw PermissionException("crossing: '%s' does not have '%s' permission", table.name, CrossingVerbName(verb));
+		throw PermissionException("crossing: '%s' does not have '%s' permission", table.name.GetIdentifierName(),
+		                          CrossingVerbName(verb));
 	}
 }
 
 void RequireKey(TableCatalogEntry &table, const CrossingTable &described, const char *what) {
 	if (described.key.empty()) {
-		throw BinderException("crossing: '%s' has no key, so %s cannot address its rows", table.name, what);
+		throw BinderException("crossing: '%s' has no key, so %s cannot address its rows",
+		                      table.name.GetIdentifierName(), what);
 	}
 }
 
@@ -345,9 +349,10 @@ shared_ptr<CrossingFragment> PlanWriteFragment(CrossingTableCatalogEntry &table,
 	request.seam = seam;
 	auto fragment = make_shared_ptr<CrossingFragment>();
 	fragment->seam_types = seam.types;
-	fragment->plan = RequirePlan(table.source.Plan(request), verb, table.name);
+	fragment->plan = RequirePlan(table.source.Plan(request), verb, table.name.GetIdentifierName());
 	if (!fragment->HasSeam()) {
-		throw InternalException("crossing: the source's %s of '%s' holds no seam", CrossingVerbName(verb), table.name);
+		throw InternalException("crossing: the source's %s of '%s' holds no seam", CrossingVerbName(verb),
+		                        table.name.GetIdentifierName());
 	}
 	fragment->ResolveTypesAndText();
 	fragment->VerifyInvariants();
@@ -361,7 +366,8 @@ unique_ptr<CrossingBindData> MakeWriteBindData(CrossingTableCatalogEntry &table,
 
 CrossingSeamEntry::CrossingSeamEntry(Catalog &catalog, SchemaCatalogEntry &schema, CreateTableInfo &info,
                                      unique_ptr<CrossingBindData> write_p, string obstacle_p)
-    : TableCatalogEntry(catalog, schema, info), write(std::move(write_p)), obstacle(std::move(obstacle_p)) {
+    : TableCatalogEntry(catalog, schema, info), write(std::move(write_p)), obstacle(std::move(obstacle_p)),
+      columns(info.columns.Copy()) {
 }
 
 unique_ptr<BaseStatistics> CrossingSeamEntry::GetStatistics(ClientContext &, column_t) {
@@ -436,7 +442,7 @@ CrossingWriteResult CrossingSeamFilledWrite::Pull(ClientContext &context, Crossi
 	return writer(context, std::move(waker));
 }
 
-LogicalCrossingFence::LogicalCrossingFence(idx_t table_index_p, unique_ptr<CrossingBindData> bind_data_p)
+LogicalCrossingFence::LogicalCrossingFence(TableIndex table_index_p, unique_ptr<CrossingBindData> bind_data_p)
     : table_index(table_index_p), bind_data(std::move(bind_data_p)) {
 }
 
@@ -445,10 +451,10 @@ PhysicalOperator &LogicalCrossingFence::CreatePlan(ClientContext &, PhysicalPlan
 }
 
 vector<ColumnBinding> LogicalCrossingFence::GetColumnBindings() {
-	return {ColumnBinding(table_index, 0)};
+	return {ColumnBinding(table_index, ProjectionIndex(0))};
 }
 
-vector<idx_t> LogicalCrossingFence::GetTableIndex() const {
+vector<TableIndex> LogicalCrossingFence::GetTableIndex() const {
 	return {table_index};
 }
 
@@ -632,9 +638,8 @@ PhysicalOperator &CrossingWriteCatalog::PlanMergeInto(ClientContext &context, Ph
 		actions.emplace(entry.first, std::move(planned_actions));
 	}
 
-	auto &result = planner.Make<PhysicalMergeInto>(op.types, std::move(actions), op.row_id_start, op.source_marker,
-	                                               false, op.return_chunk);
-	result.children.push_back(plan);
+	auto &result = planner.Make<PhysicalMergeInto>(op.types, plan, std::move(actions), op.row_id_start,
+	                                               op.source_marker, false, op.return_chunk);
 	return result;
 }
 
@@ -788,16 +793,18 @@ SinkFinalizeType CrossingCreateTableAs::Finalize(Pipeline &, Event &, ClientCont
 		auto &create = info->Base();
 		CrossingDdl ddl;
 		ddl.verb = CrossingVerb::CREATE;
-		ddl.schema = owner.name;
-		ddl.table = create.table;
+		ddl.schema = owner.name.GetIdentifierName();
+		ddl.table = create.GetTableName().GetIdentifierName();
 		ddl.create = info->base.get();
 		auto &transaction = Transaction::Get(context, owner.ParentCatalog());
 		attach.Ddl(context, transaction, owner, ddl);
 		state.created = true;
 
-		auto entry = attach.LookupTable(owner.name, owner, create.table, &transaction);
+		auto entry = attach.LookupTable(owner.name.GetIdentifierName(), owner,
+		                                create.GetTableName().GetIdentifierName(), &transaction);
 		if (!entry) {
-			throw InternalException("crossing: '%s' was created but the source does not serve it", create.table);
+			throw InternalException("crossing: '%s' was created but the source does not serve it",
+			                        create.GetTableName().GetIdentifierName());
 		}
 		auto &table = entry->Cast<CrossingTableCatalogEntry>();
 		RequireVerb(table, CrossingVerb::INSERT);
@@ -805,7 +812,7 @@ SinkFinalizeType CrossingCreateTableAs::Finalize(Pipeline &, Event &, ClientCont
 		if (seam.types != row_types) {
 			throw BinderException("crossing: the source describes '%s' with columns other than the ones it was "
 			                      "created with",
-			                      create.table);
+			                      create.GetTableName().GetIdentifierName());
 		}
 		auto fragment = PlanWriteFragment(table, CrossingVerb::INSERT, seam);
 		state.bind_data = MakeWriteBindData(table, CrossingVerb::INSERT, std::move(seam), std::move(fragment));
@@ -852,8 +859,8 @@ PhysicalOperator &CrossingAttach::PlanCreateTableAs(ClientContext &context, Phys
 	auto &schema = op.schema;
 	CrossingDdl ddl;
 	ddl.verb = CrossingVerb::CREATE;
-	ddl.schema = schema.name;
-	ddl.table = op.info->Base().table;
+	ddl.schema = schema.name.GetIdentifierName();
+	ddl.table = op.info->Base().GetTableName().GetIdentifierName();
 	ddl.create = op.info->base.get();
 	Authorize(schema, ddl, &Transaction::Get(context, schema.ParentCatalog()));
 	auto &result =

@@ -30,6 +30,7 @@
 #include "duckdb/common/optional_ptr.hpp"
 #include "duckdb/common/types.hpp"
 #include "duckdb/common/types/data_chunk.hpp"
+#include "duckdb/planner/logical_operator.hpp"
 #include "duckdb/common/vector.hpp"
 #include "duckdb/common/string.hpp"
 #include "duckdb/common/unique_ptr.hpp"
@@ -51,7 +52,7 @@ class ColumnDataCollection;
 class DatabaseInstance;
 class TableRef;
 class SQLStatement;
-class PendingQueryResult;
+class QueryResult;
 struct AttachInfo;
 struct CreateInfo;
 struct CreateViewInfo;
@@ -226,8 +227,7 @@ void BindFloors(ClientContext &context, unique_ptr<LogicalOperator> &plan, const
 //! Runs a bound plan on `context` as a query. Use this rather than LogicalPlanStatement: DuckDB
 //! copies a statement before planning it when an extension can ask for a rebind, and a plan
 //! holding a source's own scan cannot be copied.
-unique_ptr<PendingQueryResult> PendingCrossingPlan(ClientContext &context, unique_ptr<LogicalOperator> plan,
-                                                   bool stream);
+unique_ptr<QueryResult> SubmitCrossingPlan(ClientContext &context, unique_ptr<LogicalOperator> plan);
 
 struct CrossingWriteTarget {
 	string catalog;

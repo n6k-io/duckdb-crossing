@@ -22,8 +22,8 @@ TEST_CASE("an operator that is not a crossing scan hands back nothing", "[source
 
 TEST_CASE("a GET with no bind data is not a crossing scan", "[source]") {
 	TableFunction function("plain_scan", {}, nullptr);
-	auto get = make_uniq<LogicalGet>(MEMORY_GET_INDEX, function, nullptr, vector<LogicalType> {LogicalType::INTEGER},
-	                                 vector<string> {"id"});
+	auto get = make_uniq<LogicalGet>(MEMORY_GET_INDEX, BoundTableFunction(function), nullptr,
+	                                 vector<LogicalType> {LogicalType::INTEGER}, vector<Identifier> {"id"});
 
 	REQUIRE(!CrossingReadFragmentOf(*get, MemoryIdentity()));
 }

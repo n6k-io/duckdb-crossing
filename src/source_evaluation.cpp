@@ -1,14 +1,27 @@
 #include "internal/source_evaluation.hpp"
 
+#include "duckdb/planner/expression/bound_cast_expression.hpp"
+#include "duckdb/planner/expression/bound_comparison_expression.hpp"
 #include "duckdb/planner/expression/bound_function_expression.hpp"
 #include "duckdb/planner/expression_iterator.hpp"
 #include "duckdb/planner/logical_operator_visitor.hpp"
 
 namespace duckdb {
 
+namespace {
+
+//! DuckDB binds these as functions. To a source they stay a cast, a comparison and a between, not calls it could lack.
+bool IsEngineForm(const Expression &expr) {
+	auto type = expr.GetExpressionType();
+	return BoundCastExpression::IsCast(expr) || BoundComparisonExpression::IsComparison(expr) ||
+	       type == ExpressionType::COMPARE_BETWEEN || type == ExpressionType::COMPARE_NOT_BETWEEN;
+}
+
+} // namespace
+
 CrossingVerdict VerdictOn(const Expression &expr, CrossingSource &source) {
 	if (expr.GetExpressionClass() != ExpressionClass::BOUND_COLUMN_REF) {
-		auto type = source.AcceptsType(expr.return_type);
+		auto type = source.AcceptsType(expr.GetReturnType());
 		if (!type.ok) {
 			return type;
 		}
@@ -16,18 +29,24 @@ CrossingVerdict VerdictOn(const Expression &expr, CrossingSource &source) {
 	switch (expr.GetExpressionClass()) {
 	case ExpressionClass::BOUND_COLUMN_REF:
 	case ExpressionClass::BOUND_CONSTANT:
-	case ExpressionClass::BOUND_COMPARISON:
 	case ExpressionClass::BOUND_CONJUNCTION:
-	case ExpressionClass::BOUND_CAST:
-	case ExpressionClass::BOUND_BETWEEN:
 	case ExpressionClass::BOUND_CASE:
 	case ExpressionClass::BOUND_UNNEST:
 		break;
-	case ExpressionClass::BOUND_FUNCTION:
-		if (expr.Cast<BoundFunctionExpression>().function.HasBindLambdaCallback()) {
+	case ExpressionClass::BOUND_FUNCTION: {
+		auto &bound = expr.Cast<BoundFunctionExpression>();
+		if (IsEngineForm(expr)) {
+			break;
+		}
+		if (bound.Function().HasBindLambdaCallback()) {
 			return CrossingVerdict::No("crossing does not move a lambda");
 		}
-		DUCKDB_EXPLICIT_FALLTHROUGH;
+		auto call = source.AcceptsCall(expr);
+		if (!call.ok) {
+			return call;
+		}
+		break;
+	}
 	case ExpressionClass::BOUND_OPERATOR:
 	case ExpressionClass::BOUND_AGGREGATE:
 	case ExpressionClass::BOUND_WINDOW: {

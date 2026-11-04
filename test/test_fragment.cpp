@@ -8,7 +8,7 @@ namespace {
 vector<string> EmittedColumns(const CrossingFragment &fragment) {
 	vector<string> out;
 	for (auto &expr : fragment.crossing_projection->expressions) {
-		out.push_back(expr->GetName());
+		out.push_back(expr->GetName().GetIdentifierName());
 	}
 	return out;
 }
@@ -74,10 +74,10 @@ TEST_CASE("adopting a table index moves the projection to it", "[fragment]") {
 	auto fragment = MemoryFragment();
 	fragment->RebuildPlanForColumns({0, 1});
 
-	fragment->AdoptTableIndex(7);
+	fragment->AdoptTableIndex(TableIndex(7));
 
-	REQUIRE(fragment->table_index == 7);
-	REQUIRE(fragment->crossing_projection->table_index == 7);
+	REQUIRE(fragment->table_index.index == 7);
+	REQUIRE(fragment->crossing_projection->table_index.index == 7);
 	REQUIRE_NOTHROW(fragment->VerifyInvariants());
 }
 

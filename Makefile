@@ -7,7 +7,6 @@ TEST_ARGS ?=
 JOBS ?= $(shell nproc 2>/dev/null || sysctl -n hw.ncpu 2>/dev/null || echo 2)
 
 DUCKDB_LIBS := $(DUCKDB_BUILD_DIR)/src/libduckdb_static.a \
-	$(DUCKDB_BUILD_DIR)/extension/libduckdb_generated_extension_loader.a \
 	$(DUCKDB_BUILD_DIR)/extension/core_functions/libcore_functions_extension.a
 
 DUCKDB_FIRST_LIB := $(firstword $(DUCKDB_LIBS))
@@ -20,7 +19,7 @@ $(DUCKDB_FIRST_LIB):
 		-DBUILD_UNITTESTS=OFF \
 		-DBUILD_SHELL=OFF \
 		-DSKIP_EXTENSIONS=parquet
-	@cmake --build "$(DUCKDB_BUILD_DIR)" -j$(JOBS) --target duckdb_static duckdb_generated_extension_loader core_functions_extension
+	@cmake --build "$(DUCKDB_BUILD_DIR)" -j$(JOBS) --target duckdb_static core_functions_extension
 
 $(filter-out $(DUCKDB_FIRST_LIB),$(DUCKDB_LIBS)): $(DUCKDB_FIRST_LIB)
 

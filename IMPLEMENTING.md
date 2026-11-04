@@ -230,19 +230,16 @@ prints it; `SerializeCrossingPlan(plan)` gives bytes.
 ```cpp
 auto plan = DeserializeCrossingPlan(context, SerializeCrossingPlan(query.plan));
 BindFloors(context, plan, "mycatalog");
-auto pending = PendingCrossingPlan(context, std::move(plan), true);
-if (pending->HasError()) {
-	pending->ThrowError();
-}
-auto result = pending->Execute();
-if (result->HasError()) {
-	result->ThrowError();
-}
+auto result = SubmitCrossingPlan(context, std::move(plan));
+result->ThrowIfError();
+QueryResultStream<ChunkFormat> stream(std::move(result));
 ```
 
-`PendingCrossingPlan` runs a bound plan as a query. Do not go through
+`SubmitCrossingPlan` runs a bound plan as a query. Do not go through
 `LogicalPlanStatement`: DuckDB copies a statement before planning it whenever
 an extension can ask for a rebind, and a plan holding your scan cannot be copied.
+Calling `Fetch` on the result itself collects every row first; move it into a
+`QueryResultStream` to stream.
 
 `BindFloors` replaces each floor with the table it names, bound on `context`,
 which must have a transaction open. The floor keeps its table index and column

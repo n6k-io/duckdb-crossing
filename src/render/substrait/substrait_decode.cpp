@@ -28,6 +28,7 @@
 #include "duckdb/parser/statement/select_statement.hpp"
 #include "duckdb/parser/tableref/basetableref.hpp"
 #include "duckdb/parser/tableref/subqueryref.hpp"
+#include "duckdb/planner/logical_operator.hpp"
 
 #include <functional>
 #include <unordered_map>
@@ -145,7 +146,7 @@ public:
 		vector<unique_ptr<ParsedExpression>> exprs;
 		vector<string> aliases;
 		for (idx_t i = 0; i < names.size(); i++) {
-			exprs.push_back(make_uniq<ColumnRefExpression>(ColumnName(i)));
+			exprs.push_back(make_uniq<ColumnRefExpression>(Identifier(ColumnName(i))));
 			aliases.push_back(names[i]);
 		}
 		return rel->Project(std::move(exprs), aliases);
@@ -201,34 +202,34 @@ private:
 		string key = yyjson_get_str(iter_key);
 		auto *body = yyjson_obj_iter_get_val(iter_key);
 		if (key == "null") {
-			return make_uniq<ConstantExpression>(Value(SubstraitTypeFromJson(*conn.context, body)));
+			return ConstantExpression::FromValue(Value(SubstraitTypeFromJson(*conn.context, body)));
 		}
 		if (key == "boolean") {
-			return make_uniq<ConstantExpression>(Value::BOOLEAN(yyjson_get_bool(body)));
+			return ConstantExpression::FromValue(Value::BOOLEAN(yyjson_get_bool(body)));
 		}
 		if (key == "i8") {
-			return make_uniq<ConstantExpression>(Value::TINYINT(NumericCast<int8_t>(Int64Of(body, 0))));
+			return ConstantExpression::FromValue(Value::TINYINT(NumericCast<int8_t>(Int64Of(body, 0))));
 		}
 		if (key == "i16") {
-			return make_uniq<ConstantExpression>(Value::SMALLINT(NumericCast<int16_t>(Int64Of(body, 0))));
+			return ConstantExpression::FromValue(Value::SMALLINT(NumericCast<int16_t>(Int64Of(body, 0))));
 		}
 		if (key == "i32") {
-			return make_uniq<ConstantExpression>(Value::INTEGER(NumericCast<int32_t>(Int64Of(body, 0))));
+			return ConstantExpression::FromValue(Value::INTEGER(NumericCast<int32_t>(Int64Of(body, 0))));
 		}
 		if (key == "i64") {
-			return make_uniq<ConstantExpression>(Value::BIGINT(Int64Of(body, 0)));
+			return ConstantExpression::FromValue(Value::BIGINT(Int64Of(body, 0)));
 		}
 		if (key == "fp32") {
-			return make_uniq<ConstantExpression>(Value::FLOAT(static_cast<float>(yyjson_get_num(body))));
+			return ConstantExpression::FromValue(Value::FLOAT(static_cast<float>(yyjson_get_num(body))));
 		}
 		if (key == "fp64") {
-			return make_uniq<ConstantExpression>(Value::DOUBLE(yyjson_get_num(body)));
+			return ConstantExpression::FromValue(Value::DOUBLE(yyjson_get_num(body)));
 		}
 		if (key == "string") {
-			return make_uniq<ConstantExpression>(Value(string(yyjson_get_str(body))));
+			return ConstantExpression::FromValue(Value(string(yyjson_get_str(body))));
 		}
 		if (key == "date") {
-			return make_uniq<ConstantExpression>(Value::DATE(date_t(NumericCast<int32_t>(Int64Of(body, 0)))));
+			return ConstantExpression::FromValue(Value::DATE(date_t(NumericCast<int32_t>(Int64Of(body, 0)))));
 		}
 		throw InvalidInputException("substrait: unsupported literal '%s'", key);
 	}
@@ -284,7 +285,7 @@ private:
 		if (name == "coalesce") {
 			return make_uniq<OperatorExpression>(ExpressionType::OPERATOR_COALESCE, std::move(args));
 		}
-		return make_uniq<FunctionExpression>(DuckDBFunctionName(name), std::move(args));
+		return make_uniq<FunctionExpression>(Identifier(DuckDBFunctionName(name)), std::move(args));
 	}
 
 	static bool ApplyBound(yyjson_val *bound, bool lower, bool range, WindowBoundary &out,
@@ -307,7 +308,7 @@ private:
 			return false;
 		}
 		auto offset = Int64Of(yyjson_obj_get(side, "offset"), 0);
-		offset_out = make_uniq<ConstantExpression>(Value::BIGINT(offset));
+		offset_out = ConstantExpression::FromValue(Value::BIGINT(offset));
 		if (preceding) {
 			out = range ? WindowBoundary::EXPR_PRECEDING_RANGE : WindowBoundary::EXPR_PRECEDING_ROWS;
 		} else {
@@ -318,28 +319,19 @@ private:
 
 	unique_ptr<ParsedExpression> WindowFunction(yyjson_val *node, const Scope &scope) {
 		auto name = DuckDBFunctionName(FunctionName(node));
-		auto type = WindowExpression::WindowToExpressionType(name);
-		auto window = make_uniq<WindowExpression>(type, "", "", name);
-		auto args = Arguments(node, scope);
-		if (type == ExpressionType::WINDOW_LEAD || type == ExpressionType::WINDOW_LAG) {
-			if (args.size() > 2) {
-				window->default_expr = std::move(args[2]);
-			}
-			if (args.size() > 1) {
-				window->offset_expr = std::move(args[1]);
-			}
-			args.resize(MinValue<idx_t>(args.size(), 1));
+		auto window = make_uniq<WindowExpression>("", "", name);
+		for (auto &arg : Arguments(node, scope)) {
+			window->GetArgumentsMutable().emplace_back(std::move(arg));
 		}
-		window->children = std::move(args);
 		if (auto *partitions = yyjson_obj_get(node, "partitions")) {
 			size_t idx, max;
 			yyjson_val *partition;
 			yyjson_arr_foreach(partitions, idx, max, partition) {
-				window->partitions.push_back(Expr(partition, scope));
+				window->PartitionsMutable().push_back(Expr(partition, scope));
 			}
 		}
-		window->orders = Orders(yyjson_obj_get(node, "sorts"), scope);
-		window->distinct = StrOf(node, "invocation") == "AGGREGATION_INVOCATION_DISTINCT";
+		window->OrderByMutable() = Orders(yyjson_obj_get(node, "sorts"), scope);
+		window->DistinctMutable() = StrOf(node, "invocation") == "AGGREGATION_INVOCATION_DISTINCT";
 		bool range = StrOf(node, "boundsType") == "BOUNDS_TYPE_RANGE";
 		WindowBoundary start = WindowBoundary::INVALID;
 		WindowBoundary end = WindowBoundary::INVALID;
@@ -347,10 +339,10 @@ private:
 		unique_ptr<ParsedExpression> end_expr;
 		if (ApplyBound(yyjson_obj_get(node, "lowerBound"), true, range, start, start_expr) &&
 		    ApplyBound(yyjson_obj_get(node, "upperBound"), false, range, end, end_expr)) {
-			window->start = start;
-			window->end = end;
-			window->start_expr = std::move(start_expr);
-			window->end_expr = std::move(end_expr);
+			window->WindowStartMutable() = start;
+			window->WindowEndMutable() = end;
+			window->StartExprMutable() = std::move(start_expr);
+			window->EndExprMutable() = std::move(end_expr);
 		}
 		return std::move(window);
 	}
@@ -384,11 +376,10 @@ private:
 				CaseCheck check;
 				check.when_expr = Expr(Require(clause, "if"), scope);
 				check.then_expr = Expr(Require(clause, "then"), scope);
-				result->case_checks.push_back(std::move(check));
+				result->CaseChecksMutable().push_back(std::move(check));
 			}
 			auto *else_node = yyjson_obj_get(if_then, "else");
-			result->else_expr =
-			    else_node ? Expr(else_node, scope) : make_uniq_base<ParsedExpression, ConstantExpression>(Value());
+			result->ElseMutable() = else_node ? Expr(else_node, scope) : ConstantExpression::FromValue(Value());
 			return std::move(result);
 		}
 		if (auto *in = yyjson_obj_get(node, "singularOrList")) {
@@ -406,7 +397,7 @@ private:
 
 	static Scope PositionalScope() {
 		return [](idx_t field) -> unique_ptr<ParsedExpression> {
-			return make_uniq<ColumnRefExpression>(ColumnName(field));
+			return make_uniq<ColumnRefExpression>(Identifier(ColumnName(field)));
 		};
 	}
 
@@ -436,15 +427,14 @@ private:
 			if (seam_view.empty()) {
 				throw InvalidInputException("substrait: the plan reads a seam but none was staged");
 			}
-			rel = conn.View(seam_view);
+			rel = conn.View(Identifier(seam_view));
 		} else if (names.size() == 2 || names.size() == 3) {
 			if (names.size() == 3 && check) {
 				check(names[0]);
 			}
 			auto ref = make_uniq<BaseTableRef>();
-			ref->catalog_name = names.size() == 3 ? names[0] : catalog;
-			ref->schema_name = names[names.size() - 2];
-			ref->table_name = names.back();
+			ref->SetQualifiedName(Identifier(names.size() == 3 ? names[0] : catalog),
+			                      Identifier(names[names.size() - 2]), Identifier(names.back()));
 			rel = make_shared_ptr<ViewRelation>(conn.context, std::move(ref), names.back());
 		} else {
 			throw InvalidInputException("substrait: a named table needs [schema, table]");
@@ -483,9 +473,9 @@ private:
 		auto right_width = right->Columns().size();
 		Scope scope = [left_width](idx_t field) -> unique_ptr<ParsedExpression> {
 			if (field < left_width) {
-				return make_uniq<ColumnRefExpression>(ColumnName(field), "l");
+				return make_uniq<ColumnRefExpression>(Identifier(ColumnName(field)), "l");
 			}
-			return make_uniq<ColumnRefExpression>(ColumnName(field - left_width), "r");
+			return make_uniq<ColumnRefExpression>(Identifier(ColumnName(field - left_width)), "r");
 		};
 		auto l = left->Alias("l");
 		auto r = right->Alias("r");
@@ -516,17 +506,17 @@ private:
 			if (expression) {
 				condition.push_back(Expr(expression, scope));
 			} else {
-				condition.push_back(make_uniq<ConstantExpression>(Value::BOOLEAN(true)));
+				condition.push_back(ConstantExpression::FromValue(Value::BOOLEAN(true)));
 			}
 			joined = l->Join(r, std::move(condition), type, ref_type);
 		}
 		vector<unique_ptr<ParsedExpression>> exprs;
 		for (idx_t i = 0; i < left_width; i++) {
-			exprs.push_back(make_uniq<ColumnRefExpression>(ColumnName(i), "l"));
+			exprs.push_back(make_uniq<ColumnRefExpression>(Identifier(ColumnName(i)), "l"));
 		}
 		if (!left_only) {
 			for (idx_t i = 0; i < right_width; i++) {
-				exprs.push_back(make_uniq<ColumnRefExpression>(ColumnName(i), "r"));
+				exprs.push_back(make_uniq<ColumnRefExpression>(Identifier(ColumnName(i)), "r"));
 			}
 		}
 		return Renumber(joined, std::move(exprs));
@@ -566,12 +556,12 @@ private:
 					filter = Expr(filter_node, scope);
 				}
 				bool distinct = StrOf(measure, "invocation") == "AGGREGATION_INVOCATION_DISTINCT";
-				select.push_back(
-				    make_uniq<FunctionExpression>(name, std::move(args), std::move(filter), nullptr, distinct));
+				select.push_back(make_uniq<FunctionExpression>(Identifier(name), std::move(args), std::move(filter),
+				                                               nullptr, distinct));
 			}
 		}
 		for (idx_t i = 0; i < select.size(); i++) {
-			select[i]->SetAlias(ColumnName(i));
+			select[i]->SetAlias(Identifier(ColumnName(i)));
 		}
 		return make_shared_ptr<AggregateRelation>(std::move(child), std::move(select), std::move(groups));
 	}
@@ -581,7 +571,7 @@ private:
 		auto width = child->Columns().size();
 		vector<unique_ptr<ParsedExpression>> all;
 		for (idx_t i = 0; i < width; i++) {
-			all.push_back(make_uniq<ColumnRefExpression>(ColumnName(i)));
+			all.push_back(make_uniq<ColumnRefExpression>(Identifier(ColumnName(i))));
 		}
 		if (auto *expressions = yyjson_obj_get(project, "expressions")) {
 			size_t idx, max;
@@ -688,7 +678,7 @@ private:
 			auto names_column = ColumnName(group_count + aggregate_count);
 			vector<unique_ptr<ParsedExpression>> exprs;
 			for (idx_t g = 0; g < group_count; g++) {
-				exprs.push_back(make_uniq<ColumnRefExpression>(ColumnName(g)));
+				exprs.push_back(make_uniq<ColumnRefExpression>(Identifier(ColumnName(g))));
 			}
 			vector<string> seen;
 			for (auto &value : values) {
@@ -702,10 +692,10 @@ private:
 				seen.push_back(value);
 				for (idx_t a = 0; a < aggregate_count; a++) {
 					vector<unique_ptr<ParsedExpression>> position_args;
-					position_args.push_back(make_uniq<ColumnRefExpression>(names_column));
-					position_args.push_back(make_uniq<ConstantExpression>(Value(value)));
+					position_args.push_back(make_uniq<ColumnRefExpression>(Identifier(names_column)));
+					position_args.push_back(ConstantExpression::FromValue(Value(value)));
 					vector<unique_ptr<ParsedExpression>> extract_args;
-					extract_args.push_back(make_uniq<ColumnRefExpression>(ColumnName(group_count + a)));
+					extract_args.push_back(make_uniq<ColumnRefExpression>(Identifier(ColumnName(group_count + a))));
 					extract_args.push_back(make_uniq<FunctionExpression>("list_position", std::move(position_args)));
 					vector<unique_ptr<ParsedExpression>> coalesce_args;
 					coalesce_args.push_back(make_uniq<FunctionExpression>("list_extract", std::move(extract_args)));
@@ -823,15 +813,15 @@ unique_ptr<SelectStatement> DecodeSubstraitView(Connection &conn, const string &
 	    [&catalog](TableRef &ref) {
 		    if (ref.type == TableReferenceType::BASE_TABLE) {
 			    auto &base = ref.Cast<BaseTableRef>();
-			    if (StringUtil::CIEquals(base.catalog_name, catalog)) {
-				    base.catalog_name.clear();
+			    if (base.GetQualifiedName().Catalog() == catalog) {
+				    base.GetQualifiedNameMutable() = base.GetQualifiedName().WithCatalog(Identifier());
 			    }
 		    }
 	    });
 	auto node = make_uniq<SelectNode>();
 	for (idx_t i = 0; i < columns.size(); i++) {
 		auto column = make_uniq<ColumnRefExpression>(columns[i].Name());
-		column->alias = names[i];
+		column->SetAlias(Identifier(names[i]));
 		node->select_list.push_back(std::move(column));
 	}
 	node->from_table = make_uniq<SubqueryRef>(std::move(body));

@@ -19,13 +19,13 @@ CrossingWaker CrossingParking::Waker() {
 	return CrossingWaker(shared_ptr_cast<Task, CrossingParking>(shared_from_this()));
 }
 
-bool CrossingParking::Park(StateWithBlockableTasks &state, const unique_lock<mutex> &guard) {
+bool CrossingParking::Park(StateWithBlockableTasks &state) {
 	lock_guard<mutex> mine(lock);
 	if (woken) {
 		return false;
 	}
 	weak_ptr<Task> self = shared_from_this();
-	if (!state.BlockTask(guard, InterruptState(self))) {
+	if (!state.BlockTask(InterruptState(self))) {
 		return false;
 	}
 	parked = true;

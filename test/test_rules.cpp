@@ -32,7 +32,7 @@ TEST_CASE("an operator with no rule does not cross", "[rules]") {
 TEST_CASE("a filter crosses when the source can compute its predicates", "[rules]") {
 	auto evaluable = make_uniq<LogicalFilter>();
 	evaluable->expressions.push_back(
-	    make_uniq<BoundComparisonExpression>(ExpressionType::COMPARE_GREATERTHAN, BoundAmt(), Int(100)));
+	    BoundComparisonExpression::Create(ExpressionType::COMPARE_GREATERTHAN, BoundAmt(), Int(100)));
 	REQUIRE(CanCross(*evaluable));
 
 	auto unevaluable = make_uniq<LogicalFilter>();

@@ -1,4 +1,5 @@
 #include "crossing.hpp"
+#include "internal/names.hpp"
 #include "internal/floor.hpp"
 #include "internal/seam.hpp"
 #include "internal/table_indices.hpp"
@@ -6,7 +7,7 @@
 #include "duckdb/catalog/catalog.hpp"
 #include "duckdb/common/types/column/column_data_collection.hpp"
 #include "duckdb/main/client_context.hpp"
-#include "duckdb/main/pending_query_result.hpp"
+#include "duckdb/main/query_result.hpp"
 #include "duckdb/main/query_parameters.hpp"
 #include "duckdb/main/relation.hpp"
 #include "duckdb/parser/expression/columnref_expression.hpp"
@@ -14,7 +15,10 @@
 #include "duckdb/parser/expression/conjunction_expression.hpp"
 #include "duckdb/parser/expression/positional_reference_expression.hpp"
 #include "duckdb/parser/expression/star_expression.hpp"
+#include "duckdb/parser/query_node/delete_query_node.hpp"
+#include "duckdb/parser/query_node/insert_query_node.hpp"
 #include "duckdb/parser/query_node/select_node.hpp"
+#include "duckdb/parser/query_node/update_query_node.hpp"
 #include "duckdb/parser/statement/delete_statement.hpp"
 #include "duckdb/parser/statement/insert_statement.hpp"
 #include "duckdb/parser/statement/select_statement.hpp"
@@ -58,7 +62,7 @@ idx_t MaxTableIndex(const LogicalOperator &op) {
 		result = MaxValue(result, MaxTableIndex(*child));
 	}
 	for (auto index : op.GetTableIndex()) {
-		result = MaxValue(result, index);
+		result = MaxValue(result, index.index);
 	}
 	return result;
 }
@@ -103,9 +107,8 @@ void BindFloorsBelow(Binder &binder, unique_ptr<LogicalOperator> &op, const stri
 			return ref;
 		}
 		auto base = make_uniq<BaseTableRef>();
-		base->catalog_name = floor->catalog.empty() ? catalog : floor->catalog;
-		base->schema_name = floor->schema;
-		base->table_name = floor->table;
+		base->SetQualifiedName(Identifier(floor->catalog.empty() ? catalog : floor->catalog), Identifier(floor->schema),
+		                       Identifier(floor->table));
 		return std::move(base);
 	};
 	auto ref = make_ref();
@@ -123,10 +126,10 @@ void BindFloorsBelow(Binder &binder, unique_ptr<LogicalOperator> &op, const stri
 	if (bound.names != floor_get.names || bound.types != floor_get.returned_types) {
 		throw CatalogException("crossing: '%s.%s' changed on the source: it now has [%s] as [%s], the floor expects "
 		                       "[%s] as [%s]; refresh the attach",
-		                       floor->schema, floor->table, NameList(bound.names), TypeList(bound.types),
-		                       NameList(floor_get.names), TypeList(floor_get.returned_types));
+		                       floor->schema, floor->table, NameList(NamesOf(bound.names)), TypeList(bound.types),
+		                       NameList(NamesOf(floor_get.names)), TypeList(floor_get.returned_types));
 	}
-	RemapTableIndices(*bound.plan, [&next_index]() { return next_index++; });
+	RemapTableIndices(*bound.plan, [&next_index]() { return TableIndex(next_index++); });
 	AdoptFloorIndex(*bound.plan, floor_get, *floor);
 	op = std::move(bound.plan);
 }
@@ -148,7 +151,7 @@ unique_ptr<TableRef> SeamNamed(unique_ptr<TableRef> seam, const vector<string> &
 	auto node = make_uniq<SelectNode>();
 	for (idx_t i = 0; i < columns.size(); i++) {
 		auto column = make_uniq<PositionalReferenceExpression>(i + 1);
-		column->alias = columns[i];
+		column->SetAlias(Identifier(columns[i]));
 		node->select_list.push_back(std::move(column));
 	}
 	node->from_table = std::move(seam);
@@ -159,17 +162,16 @@ unique_ptr<TableRef> SeamNamed(unique_ptr<TableRef> seam, const vector<string> &
 
 unique_ptr<BaseTableRef> TargetRef(const CrossingWriteTarget &target) {
 	auto ref = make_uniq<BaseTableRef>();
-	ref->catalog_name = target.catalog;
-	ref->schema_name = target.schema;
-	ref->table_name = target.table;
+	ref->SetQualifiedName(Identifier(target.catalog), Identifier(target.schema), Identifier(target.table));
 	return ref;
 }
 
 unique_ptr<ParsedExpression> KeysMatch(const CrossingWriteTarget &target, const vector<string> &seam_columns) {
 	unique_ptr<ParsedExpression> condition;
 	for (idx_t c = 0; c < target.key_columns.size(); c++) {
-		auto target_column = make_uniq<ColumnRefExpression>(target.key_columns[c], target.table);
-		auto seam_column = make_uniq<ColumnRefExpression>(seam_columns[c], SEAM_ALIAS);
+		auto target_column =
+		    make_uniq<ColumnRefExpression>(Identifier(target.key_columns[c]), Identifier(target.table));
+		auto seam_column = make_uniq<ColumnRefExpression>(Identifier(seam_columns[c]), SEAM_ALIAS);
 		auto same = make_uniq<ComparisonExpression>(ExpressionType::COMPARE_NOT_DISTINCT_FROM, std::move(target_column),
 		                                            std::move(seam_column));
 		condition = condition ? make_uniq_base<ParsedExpression, ConjunctionExpression>(
@@ -183,20 +185,20 @@ unique_ptr<SQLStatement> InsertOf(const CrossingWriteTarget &target, unique_ptr<
                                   const vector<string> &seam_columns) {
 	auto node = make_uniq<SelectNode>();
 	for (idx_t c = 0; c < target.set_columns.size(); c++) {
-		auto column = make_uniq<ColumnRefExpression>(seam_columns[c], SEAM_ALIAS);
-		column->alias = target.set_columns[c];
+		auto column = make_uniq<ColumnRefExpression>(Identifier(seam_columns[c]), SEAM_ALIAS);
+		column->SetAlias(Identifier(target.set_columns[c]));
 		node->select_list.push_back(std::move(column));
 	}
 	node->from_table = std::move(seam);
 	auto select = make_uniq<SelectStatement>();
 	select->node = std::move(node);
 
+	auto insert = make_uniq<InsertQueryNode>();
+	insert->SetQualifiedName(Identifier(target.catalog), Identifier(target.schema), Identifier(target.table));
+	insert->columns = IdentifiersOf(target.set_columns);
+	insert->select_statement = std::move(select);
 	auto statement = make_uniq<InsertStatement>();
-	statement->catalog = target.catalog;
-	statement->schema = target.schema;
-	statement->table = target.table;
-	statement->columns = target.set_columns;
-	statement->select_statement = std::move(select);
+	statement->node = std::move(insert);
 	return std::move(statement);
 }
 
@@ -206,24 +208,28 @@ unique_ptr<SQLStatement> UpdateOf(const CrossingWriteTarget &target, unique_ptr<
 	set_info->condition = KeysMatch(target, seam_columns);
 	auto keys = target.key_columns.size();
 	for (idx_t c = 0; c < target.set_columns.size(); c++) {
-		set_info->columns.push_back(target.set_columns[c]);
-		set_info->expressions.push_back(make_uniq<ColumnRefExpression>(seam_columns[keys + c], SEAM_ALIAS));
+		set_info->columns.emplace_back(target.set_columns[c]);
+		set_info->expressions.push_back(make_uniq<ColumnRefExpression>(Identifier(seam_columns[keys + c]), SEAM_ALIAS));
 	}
+	auto update = make_uniq<UpdateQueryNode>();
+	update->table = TargetRef(target);
+	update->from_table = std::move(seam);
+	update->set_info = std::move(set_info);
 	auto statement = make_uniq<UpdateStatement>();
-	statement->table = TargetRef(target);
-	statement->from_table = std::move(seam);
-	statement->set_info = std::move(set_info);
+	statement->node = std::move(update);
 	return std::move(statement);
 }
 
 unique_ptr<SQLStatement> DeleteOf(const CrossingWriteTarget &target, unique_ptr<TableRef> seam,
                                   const vector<string> &seam_columns) {
-	auto statement = make_uniq<DeleteStatement>();
-	statement->table = TargetRef(target);
+	auto del = make_uniq<DeleteQueryNode>();
+	del->table = TargetRef(target);
 	if (seam) {
-		statement->using_clauses.push_back(std::move(seam));
+		del->using_clauses.push_back(std::move(seam));
 	}
-	statement->condition = KeysMatch(target, seam_columns);
+	del->condition = KeysMatch(target, seam_columns);
+	auto statement = make_uniq<DeleteStatement>();
+	statement->node = std::move(del);
 	return std::move(statement);
 }
 
@@ -235,12 +241,12 @@ unique_ptr<TableRef> SeamRefOfPlan(Binder &top, unique_ptr<LogicalOperator> plan
 		throw InternalException("crossing: a seam plan produces no columns");
 	}
 	auto index = bindings[0].table_index;
-	vector<string> names;
+	vector<Identifier> names;
 	for (idx_t i = 0; i < bindings.size(); i++) {
 		if (bindings[i].table_index != index) {
 			throw InternalException("crossing: a seam plan answers to more than one table index");
 		}
-		names.push_back("c" + to_string(i));
+		names.emplace_back("c" + to_string(i));
 	}
 	auto binder = Binder::CreateBinder(top.context, &top);
 	binder->bind_context.AddGenericBinding(index, SEAM_SOURCE_ALIAS, names, plan->types);
@@ -261,7 +267,7 @@ public:
 	    : Relation(context, RelationType::QUERY_RELATION), plan(std::move(plan_p)) {
 		plan->ResolveOperatorTypes();
 		for (idx_t i = 0; i < plan->types.size(); i++) {
-			columns.emplace_back("col" + to_string(i), plan->types[i]);
+			columns.emplace_back(Identifier("col" + to_string(i)), plan->types[i]);
 		}
 	}
 
@@ -283,10 +289,8 @@ public:
 			throw InternalException("crossing: a plan can run once");
 		}
 		auto highest = MaxTableIndex(*plan);
-		while (binder.GenerateTableIndex() < highest) {
+		while (binder.GenerateTableIndex().index < highest) {
 		}
-		// The default is to materialize; a statement bound from SQL is marked streamable only by its binder.
-		binder.GetStatementProperties().output_type = QueryResultOutputType::ALLOW_STREAMING;
 		BoundStatement result;
 		result.types = plan->types;
 		for (auto &column : columns) {
@@ -302,17 +306,11 @@ private:
 };
 
 idx_t RunPlanned(ClientContext &context, const CrossingWriteTarget &target, unique_ptr<LogicalOperator> plan) {
-	auto &attached = Catalog::GetCatalog(context, target.catalog).GetAttached();
+	auto &attached = Catalog::GetCatalog(context, Identifier(target.catalog)).GetAttached();
 	MetaTransaction::Get(context).ModifyDatabase(attached, DatabaseModificationType::UPDATE_DATA);
 
-	auto pending = PendingCrossingPlan(context, std::move(plan), false);
-	if (pending->HasError()) {
-		pending->ThrowError();
-	}
-	auto result = pending->Execute();
-	if (result->HasError()) {
-		result->ThrowError();
-	}
+	auto result = SubmitCrossingPlan(context, std::move(plan));
+	result->ThrowIfError();
 	auto chunk = result->Fetch();
 	if (!chunk || chunk->size() == 0 || chunk->ColumnCount() == 0) {
 		return 0;
@@ -331,10 +329,9 @@ idx_t ExecuteBuilt(ClientContext &context, Planner &planner, const CrossingWrite
 
 } // namespace
 
-unique_ptr<PendingQueryResult> PendingCrossingPlan(ClientContext &context, unique_ptr<LogicalOperator> plan,
-                                                   bool stream) {
+unique_ptr<QueryResult> SubmitCrossingPlan(ClientContext &context, unique_ptr<LogicalOperator> plan) {
 	auto relation = make_shared_ptr<PlanRelation>(context.shared_from_this(), std::move(plan));
-	return context.PendingQuery(relation, QueryParameters(stream));
+	return context.Submit(relation, QueryParameters());
 }
 
 void BindFloors(ClientContext &context, unique_ptr<LogicalOperator> &plan, const string &catalog,

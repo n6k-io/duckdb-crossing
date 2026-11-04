@@ -1,4 +1,5 @@
 #include "crossing.hpp"
+#include "internal/names.hpp"
 
 #include "duckdb/common/exception.hpp"
 #include "duckdb/parser/parsed_data/create_view_info.hpp"
@@ -39,9 +40,9 @@ bool IsDdlVerb(CrossingVerb verb) {
 }
 
 vector<string> CrossingViewColumnNames(const CreateViewInfo &view) {
-	auto names = view.names;
+	auto names = NamesOf(view.names);
 	for (idx_t i = 0; i < view.aliases.size() && i < names.size(); i++) {
-		names[i] = view.aliases[i];
+		names[i] = view.aliases[i].GetIdentifierName();
 	}
 	return names;
 }

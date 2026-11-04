@@ -69,7 +69,7 @@ inline string DSLLabel(LogicalOperator &op, bool in_fragment) {
 	case LogicalOperatorType::LOGICAL_DUMMY_SCAN:
 		return in_fragment ? "scan" : "local";
 	case LogicalOperatorType::LOGICAL_GET:
-		if (op.Cast<LogicalGet>().function.name == CROSSING_SEAM_FUNCTION) {
+		if (op.Cast<LogicalGet>().function.GetName() == CROSSING_SEAM_FUNCTION) {
 			return "seam";
 		}
 		return in_fragment ? "scan" : "local";

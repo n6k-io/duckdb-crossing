@@ -69,7 +69,7 @@ void NarrowFragmentAndScanToRequestedColumns(LogicalGet &get, CrossingFragment &
 	get.returned_types = fragment.output_types;
 	get.names.clear();
 	for (idx_t i = 0; i < get.returned_types.size(); i++) {
-		get.names.push_back("c" + to_string(i));
+		get.names.emplace_back("c" + to_string(i));
 	}
 	get.projection_ids.clear();
 	vector<ColumnIndex> column_ids;

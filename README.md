@@ -4,7 +4,7 @@ DuckDB library that pushes plan fragments to a foreign source. `IMPLEMENTING.md`
 
 ## Build and test
 
-Needs cmake, a C++14 compiler, and `uv`.
+Needs cmake, a C++17 compiler, and `uv`.
 
 ```
 make test

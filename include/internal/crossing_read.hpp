@@ -63,17 +63,17 @@ shared_ptr<CrossingFragment> BuildScanFragment(unique_ptr<LogicalOperator> floor
 
 class LogicalCrossingRead : public LogicalExtensionOperator {
 public:
-	LogicalCrossingRead(idx_t table_index, vector<ColumnIndex> column_ids, vector<LogicalType> output_types,
+	LogicalCrossingRead(TableIndex table_index, vector<ColumnIndex> column_ids, vector<LogicalType> output_types,
 	                    unique_ptr<CrossingBindData> bind_data);
 
-	idx_t table_index;
+	TableIndex table_index;
 	vector<ColumnIndex> column_ids;
 	vector<LogicalType> output_types;
 	unique_ptr<CrossingBindData> bind_data;
 
 	PhysicalOperator &CreatePlan(ClientContext &context, PhysicalPlanGenerator &planner) override;
 	vector<ColumnBinding> GetColumnBindings() override;
-	vector<idx_t> GetTableIndex() const override;
+	vector<TableIndex> GetTableIndex() const override;
 	string GetName() const override;
 	InsertionOrderPreservingMap<string> ParamsToString() const override;
 	string GetExtensionName() const override;

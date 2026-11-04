@@ -280,7 +280,7 @@ TEST_CASE("an expression kind crossing never moves stays without asking the sour
 	Twin twin(transport);
 	twin.Seed();
 
-	twin.Same("SELECT list_transform(l, x -> x + 1) FROM far.types_t");
+	twin.Same("SELECT list_transform(l, lambda x: x + 1) FROM far.types_t");
 	REQUIRE(!twin.LastRead().Mentions("list_transform"));
 
 	twin.Same("SELECT id FROM far.orders o WHERE amt > (SELECT avg(amt) FROM far.orders) ORDER BY id");
@@ -374,9 +374,9 @@ TEST_CASE("a VALUES row calling a function only the target has stays on the targ
 	twin.Seed();
 	// Volatile, so the planner cannot fold the call away before crossing sees it.
 	ScalarFunction near_only(
-	    "near_only", {LogicalType::VARCHAR}, LogicalType::VARCHAR,
+	    "near_only", vector<LogicalType> {LogicalType::VARCHAR}, LogicalType::VARCHAR,
 	    [](DataChunk &args, ExpressionState &, Vector &result) { result.Reference(args.data[0]); });
-	near_only.stability = FunctionStability::VOLATILE;
+	near_only.SetStability(FunctionStability::VOLATILE);
 	ExtensionLoader loader(*twin.near.instance, "near_only");
 	loader.RegisterFunction(near_only);
 

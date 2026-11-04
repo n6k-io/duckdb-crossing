@@ -1,5 +1,7 @@
 #pragma once
 
+#include "internal/names.hpp"
+
 // A crossing scan the planner produced, rather than one built by hand. Every other test asserts
 // against a hand-written shape; these assert against the shape duckdb actually builds.
 
@@ -24,12 +26,12 @@ inline case_insensitive_set_t &BoundMemorySourceKnown() {
 }
 
 unique_ptr<FunctionData> BoundMemorySourceBind(ClientContext &context, TableFunctionBindInput &input,
-                                               vector<LogicalType> &return_types, vector<string> &names) {
+                                               vector<LogicalType> &return_types, vector<Identifier> &names) {
 	auto fragment = MemoryFragment();
 	fragment->RebuildPlanForColumns({0, 1});
 
 	return_types = fragment->column_types;
-	names = fragment->column_names;
+	names = IdentifiersOf(fragment->column_names);
 
 	auto bind_data = make_uniq<MemorySourceBindData>();
 	bind_data->fragment = fragment;
@@ -49,7 +51,7 @@ struct Bound {
 
 	explicit Bound(case_insensitive_set_t known = case_insensitive_set_t()) : db(nullptr), con(db) {
 		BoundMemorySourceKnown() = std::move(known);
-		TableFunction function("memory_source", {}, BoundMemorySourceScan, BoundMemorySourceBind);
+		TableFunction function("memory_source", vector<LogicalType> {}, BoundMemorySourceScan, BoundMemorySourceBind);
 		con.BeginTransaction();
 		auto &catalog = Catalog::GetSystemCatalog(*con.context);
 		CreateTableFunctionInfo info(function);
@@ -63,7 +65,7 @@ struct Bound {
 	//! The plan as the binder leaves it. Not ExtractPlan: that runs ColumnBindingResolver, which
 	//! rewrites every BoundColumnRef into a BoundReference and leaves nothing the rules recognise.
 	unique_ptr<LogicalOperator> Bind(const string &sql) {
-		auto statements = con.context->ParseStatements(sql);
+		auto statements = con.ExtractStatements(sql);
 		REQUIRE(statements.size() == 1);
 
 		con.BeginTransaction();

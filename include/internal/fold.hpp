@@ -21,7 +21,7 @@ unique_ptr<LogicalOperator> FoldSubtreeIntoItsFragment(unique_ptr<LogicalOperato
                                                        const CrossingIdentity &identity, const FreshTableIndex &fresh,
                                                        vector<ReplacementBinding> &rewired);
 
-void AdoptSeamIndex(LogicalOperator &feed, idx_t seam_index);
+void AdoptSeamIndex(LogicalOperator &feed, TableIndex seam_index);
 
 bool SubtreeHoldsFrozenScan(LogicalOperator &node, const CrossingIdentity &identity);
 

@@ -42,7 +42,7 @@ void CollectScanSlots(unique_ptr<LogicalOperator> &node, vector<unique_ptr<Logic
 
 //! Whatever fills the seam has to answer to the seam's index, since the plan above still reads the
 //! seam's bindings.
-void AdoptSeamIndex(LogicalOperator &feed, idx_t seam_index) {
+void AdoptSeamIndex(LogicalOperator &feed, TableIndex seam_index) {
 	auto &owner = FirstIndexedNodeBelow(feed);
 	switch (owner.type) {
 	case LogicalOperatorType::LOGICAL_PROJECTION:
@@ -57,7 +57,7 @@ void AdoptSeamIndex(LogicalOperator &feed, idx_t seam_index) {
 	for (auto &binding : feed.GetColumnBindings()) {
 		if (binding.table_index != seam_index) {
 			throw InternalException("crossing: the feed still answers to index %llu after adopting the seam's %llu",
-			                        binding.table_index, seam_index);
+			                        binding.table_index.index, seam_index.index);
 		}
 	}
 }
@@ -154,7 +154,7 @@ unique_ptr<LogicalOperator> Fold(unique_ptr<LogicalOperator> subtree, const Cros
 		vector<unique_ptr<Expression>> columns;
 		for (idx_t i = 0; i < bindings.size(); i++) {
 			columns.push_back(make_uniq<BoundColumnRefExpression>(types[i], bindings[i]));
-			rewired->emplace_back(bindings[i], ColumnBinding(root_index, i));
+			rewired->emplace_back(bindings[i], ColumnBinding(root_index, ProjectionIndex(i)));
 		}
 		auto projection = make_uniq<LogicalProjection>(root_index, std::move(columns));
 		projection->children.push_back(std::move(subtree));
@@ -175,7 +175,7 @@ unique_ptr<LogicalOperator> Fold(unique_ptr<LogicalOperator> subtree, const Cros
 	get.returned_types = types;
 	get.names.clear();
 	for (idx_t i = 0; i < get.returned_types.size(); i++) {
-		get.names.push_back("c" + to_string(i));
+		get.names.emplace_back("c" + to_string(i));
 	}
 	get.projection_ids.clear();
 	vector<ColumnIndex> column_ids;

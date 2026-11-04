@@ -6,6 +6,8 @@
 #include "duckdb/planner/expression/bound_case_expression.hpp"
 #include "duckdb/planner/expression/bound_cast_expression.hpp"
 #include "duckdb/planner/expression/bound_unnest_expression.hpp"
+#include "duckdb/function/window/rows_functions.hpp"
+#include "duckdb/function/window_function.hpp"
 #include "duckdb/planner/expression/bound_window_expression.hpp"
 #include "duckdb/planner/expression/bound_comparison_expression.hpp"
 #include "duckdb/planner/expression/bound_conjunction_expression.hpp"
@@ -21,11 +23,11 @@ TEST_CASE("an expression with no function call in it crosses", "[evaluation]") {
 
 	REQUIRE(CanEvaluate(*BoundAmt(), source));
 	REQUIRE(CanEvaluate(*Int(1), source));
-	REQUIRE(CanEvaluate(
-	    *make_uniq<BoundComparisonExpression>(ExpressionType::COMPARE_GREATERTHAN, BoundAmt(), Int(100)), source));
+	REQUIRE(CanEvaluate(*BoundComparisonExpression::Create(ExpressionType::COMPARE_GREATERTHAN, BoundAmt(), Int(100)),
+	                    source));
 	REQUIRE(CanEvaluate(*make_uniq<BoundConjunctionExpression>(ExpressionType::CONJUNCTION_AND, BoundAmt(), Int(1)),
 	                    source));
-	REQUIRE(CanEvaluate(*make_uniq<BoundBetweenExpression>(BoundAmt(), Int(1), Int(10), true, true), source));
+	REQUIRE(CanEvaluate(*BoundBetweenExpression::Create(BoundAmt(), Int(1), Int(10), true, true), source));
 }
 
 TEST_CASE("a cast crosses only if what it casts does", "[evaluation]") {
@@ -44,18 +46,18 @@ TEST_CASE("a case crosses only if every branch does", "[evaluation]") {
 	MemorySource source;
 
 	auto plain = make_uniq<BoundCaseExpression>(LogicalType::INTEGER);
-	plain->case_checks.emplace_back();
-	plain->case_checks[0].when_expr =
-	    make_uniq<BoundComparisonExpression>(ExpressionType::COMPARE_GREATERTHAN, BoundAmt(), Int(0));
-	plain->case_checks[0].then_expr = Int(1);
-	plain->else_expr = Int(0);
+	plain->CaseChecksMutable().emplace_back();
+	plain->CaseChecksMutable()[0].when_expr =
+	    BoundComparisonExpression::Create(ExpressionType::COMPARE_GREATERTHAN, BoundAmt(), Int(0));
+	plain->CaseChecksMutable()[0].then_expr = Int(1);
+	plain->ElseMutable() = Int(0);
 	REQUIRE(CanEvaluate(*plain, source));
 
 	auto over_call = make_uniq<BoundCaseExpression>(LogicalType::INTEGER);
-	over_call->case_checks.emplace_back();
-	over_call->case_checks[0].when_expr = make_uniq<BoundConstantExpression>(Value::BOOLEAN(true));
-	over_call->case_checks[0].then_expr = Call("target_only");
-	over_call->else_expr = Int(0);
+	over_call->CaseChecksMutable().emplace_back();
+	over_call->CaseChecksMutable()[0].when_expr = make_uniq<BoundConstantExpression>(Value::BOOLEAN(true));
+	over_call->CaseChecksMutable()[0].then_expr = Call("target_only");
+	over_call->ElseMutable() = Int(0);
 	REQUIRE(!CanEvaluate(*over_call, source));
 }
 
@@ -64,9 +66,10 @@ TEST_CASE("a window crosses when the source knows the function and every part of
 	MemorySource does_not;
 
 	auto row_number = [](unique_ptr<Expression> order_key) {
-		auto window =
-		    make_uniq<BoundWindowExpression>(ExpressionType::WINDOW_ROW_NUMBER, LogicalType::BIGINT, nullptr, nullptr);
-		window->orders.emplace_back(OrderType::ASCENDING, OrderByNullType::NULLS_LAST, std::move(order_key));
+		auto window = make_uniq<BoundWindowExpression>(
+		    LogicalType::BIGINT, nullptr, make_uniq<BoundWindowFunction>(RowNumberFun::GetFunction()), nullptr);
+		window->SetExpressionTypeUnsafe(ExpressionType::WINDOW_ROW_NUMBER);
+		window->OrderByMutable().emplace_back(OrderType::ASCENDING, OrderByNullType::NULLS_LAST, std::move(order_key));
 		return window;
 	};
 
@@ -81,11 +84,11 @@ TEST_CASE("an unnest crosses only if what it unnests does", "[evaluation]") {
 	MemorySource source;
 
 	auto plain = make_uniq<BoundUnnestExpression>(LogicalType::INTEGER);
-	plain->child = BoundAmt();
+	plain->ChildMutable() = BoundAmt();
 	REQUIRE(CanEvaluate(*plain, source));
 
 	auto over_call = make_uniq<BoundUnnestExpression>(LogicalType::INTEGER);
-	over_call->child = Call("target_only");
+	over_call->ChildMutable() = Call("target_only");
 	REQUIRE(!CanEvaluate(*over_call, source));
 }
 
@@ -130,13 +133,13 @@ TEST_CASE("a declared column is never asked about its type", "[evaluation]") {
 
 	REQUIRE(CanEvaluate(*BoundAmt(), source));
 	REQUIRE(!CanEvaluate(*Int(1), source));
-	REQUIRE(!CanEvaluate(*make_uniq<BoundComparisonExpression>(ExpressionType::COMPARE_EQUAL, BoundAmt(), BoundAmt()),
+	REQUIRE(!CanEvaluate(*BoundComparisonExpression::Create(ExpressionType::COMPARE_EQUAL, BoundAmt(), BoundAmt()),
 	                     source));
 }
 
 TEST_CASE("an expression stays if any part of it stays", "[evaluation]") {
 	MemorySource source;
-	auto comparison = make_uniq<BoundComparisonExpression>(ExpressionType::COMPARE_EQUAL, Call("target_only"), Int(1));
+	auto comparison = BoundComparisonExpression::Create(ExpressionType::COMPARE_EQUAL, Call("target_only"), Int(1));
 
 	REQUIRE(!CanEvaluate(*comparison, source));
 }
@@ -146,12 +149,12 @@ TEST_CASE("an operator crosses only when all of its expressions do", "[evaluatio
 
 	auto evaluable = make_uniq<LogicalFilter>();
 	evaluable->expressions.push_back(
-	    make_uniq<BoundComparisonExpression>(ExpressionType::COMPARE_GREATERTHAN, BoundAmt(), Int(100)));
+	    BoundComparisonExpression::Create(ExpressionType::COMPARE_GREATERTHAN, BoundAmt(), Int(100)));
 	REQUIRE(CanEvaluateAll(*evaluable, source));
 
 	auto mixed = make_uniq<LogicalFilter>();
 	mixed->expressions.push_back(
-	    make_uniq<BoundComparisonExpression>(ExpressionType::COMPARE_GREATERTHAN, BoundAmt(), Int(100)));
+	    BoundComparisonExpression::Create(ExpressionType::COMPARE_GREATERTHAN, BoundAmt(), Int(100)));
 	mixed->expressions.push_back(Call("target_only"));
 	REQUIRE(!CanEvaluateAll(*mixed, source));
 }
@@ -159,6 +162,6 @@ TEST_CASE("an operator crosses only when all of its expressions do", "[evaluatio
 TEST_CASE("an expression is column-free only if no part of it names a column", "[evaluation]") {
 	REQUIRE(IsColumnFreeExpression(*Int(5)));
 	REQUIRE(!IsColumnFreeExpression(*BoundAmt()));
-	REQUIRE(!IsColumnFreeExpression(
-	    *make_uniq<BoundComparisonExpression>(ExpressionType::COMPARE_EQUAL, BoundAmt(), Int(1))));
+	REQUIRE(
+	    !IsColumnFreeExpression(*BoundComparisonExpression::Create(ExpressionType::COMPARE_EQUAL, BoundAmt(), Int(1))));
 }

@@ -41,7 +41,7 @@ TEST_CASE("a window the source knows folds in", "[pass]") {
 	FoldCrossableWorkIntoFragments(plan, TestIndices(), MemoryIdentity());
 
 	REQUIRE_PLAN(plan,
-	             "crossing[proj{#[2.0], #[2.1], #[15.0]} | window{ROW_NUMBER() OVER (ORDER BY amt ASC NULLS LAST)} | "
+	             "crossing[proj{#[2.0], #[2.1], #[15.0]} | window{row_number() OVER (ORDER BY amt ASC NULLS LAST)} | "
 	             "proj{id, amt} | scan]");
 }
 
@@ -50,7 +50,7 @@ TEST_CASE("a window the source does not know stays", "[pass]") {
 
 	FoldCrossableWorkIntoFragments(plan, TestIndices(), MemoryIdentity());
 
-	REQUIRE_PLAN(plan, "window{ROW_NUMBER() OVER (ORDER BY amt ASC NULLS LAST)} | crossing[proj{id, amt} | scan]");
+	REQUIRE_PLAN(plan, "window{row_number() OVER (ORDER BY amt ASC NULLS LAST)} | crossing[proj{id, amt} | scan]");
 }
 
 TEST_CASE("an unnest folds in with what it unnests", "[pass]") {

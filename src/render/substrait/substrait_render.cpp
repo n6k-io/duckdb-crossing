@@ -167,17 +167,22 @@ bool IsRangeBoundary(WindowBoundary boundary) {
 	}
 }
 
+bool IsBetween(const Expression &expr) {
+	return expr.GetExpressionType() == ExpressionType::COMPARE_BETWEEN ||
+	       expr.GetExpressionType() == ExpressionType::COMPARE_NOT_BETWEEN;
+}
+
 bool TryConstantValue(const Expression &expr, Value &out) {
 	if (expr.GetExpressionClass() == ExpressionClass::BOUND_CONSTANT) {
-		out = expr.Cast<BoundConstantExpression>().value;
+		out = expr.Cast<BoundConstantExpression>().GetValue();
 		return true;
 	}
-	if (expr.GetExpressionClass() == ExpressionClass::BOUND_CAST) {
+	if (BoundCastExpression::IsCast(expr)) {
 		Value inner;
-		if (!TryConstantValue(*expr.Cast<BoundCastExpression>().child, inner)) {
+		if (!TryConstantValue(BoundCastExpression::Child(expr.Cast<BoundFunctionExpression>()), inner)) {
 			return false;
 		}
-		out = inner.DefaultCastAs(expr.return_type);
+		out = inner.DefaultCastAs(expr.GetReturnType());
 		return true;
 	}
 	return false;
@@ -189,35 +194,41 @@ bool IsConstantOrNull(const unique_ptr<Expression> &expr) {
 }
 
 bool IsIntegralOrNull(const unique_ptr<Expression> &expr) {
-	return !expr || expr->return_type.IsIntegral();
+	return !expr || expr->GetReturnType().IsIntegral();
 }
 
 string WindowObstacle(const BoundWindowExpression &window) {
-	if (window.filter_expr) {
+	if (window.Filter()) {
 		return "a window FILTER";
 	}
-	if (window.ignore_nulls) {
+	if (window.IgnoreNulls()) {
 		return "IGNORE NULLS";
 	}
-	if (window.exclude_clause != WindowExcludeMode::NO_OTHER) {
+	if (window.WindowExclude() != WindowExcludeMode::NO_OTHER) {
 		return "a window EXCLUDE clause";
 	}
-	if (!window.arg_orders.empty()) {
+	if (!window.ArgOrders().empty()) {
 		return "a window argument ORDER BY";
 	}
-	if (IsGroupsBoundary(window.start) || IsGroupsBoundary(window.end)) {
+	if (IsGroupsBoundary(window.WindowStart()) || IsGroupsBoundary(window.WindowEnd())) {
 		return "a GROUPS frame";
 	}
-	if (!IsConstantOrNull(window.start_expr) || !IsConstantOrNull(window.end_expr)) {
+	if (!IsConstantOrNull(window.StartExpr()) || !IsConstantOrNull(window.EndExpr())) {
 		return "a non-constant frame bound";
 	}
-	if (!IsIntegralOrNull(window.start_expr) || !IsIntegralOrNull(window.end_expr)) {
+	if (!IsIntegralOrNull(window.StartExpr()) || !IsIntegralOrNull(window.EndExpr())) {
 		return "a non-integer frame bound";
 	}
-	if (!IsConstantOrNull(window.offset_expr) || !IsConstantOrNull(window.default_expr)) {
-		return "a non-constant lead/lag offset or default";
+	if (window.GetExpressionType() == ExpressionType::WINDOW_LEAD ||
+	    window.GetExpressionType() == ExpressionType::WINDOW_LAG) {
+		auto &args = window.GetChildren();
+		for (idx_t i = 1; i < args.size(); i++) {
+			if (!IsConstantOrNull(args[i])) {
+				return "a non-constant lead/lag offset or default";
+			}
+		}
 	}
-	if (!window.aggregate && !WindowFunctionName(window.GetExpressionType())) {
+	if (!window.AggregateFunction() && !WindowFunctionName(window.GetExpressionType())) {
 		return string("window function ") + EnumUtil::ToChars(window.GetExpressionType());
 	}
 	return string();
@@ -227,11 +238,8 @@ bool IsRenderableExpressionClass(ExpressionClass cls) {
 	switch (cls) {
 	case ExpressionClass::BOUND_COLUMN_REF:
 	case ExpressionClass::BOUND_CONSTANT:
-	case ExpressionClass::BOUND_COMPARISON:
 	case ExpressionClass::BOUND_CONJUNCTION:
 	case ExpressionClass::BOUND_OPERATOR:
-	case ExpressionClass::BOUND_CAST:
-	case ExpressionClass::BOUND_BETWEEN:
 	case ExpressionClass::BOUND_CASE:
 	case ExpressionClass::BOUND_FUNCTION:
 	case ExpressionClass::BOUND_AGGREGATE:
@@ -244,13 +252,16 @@ bool IsRenderableExpressionClass(ExpressionClass cls) {
 }
 
 Value EmptyAggregateValue(BoundAggregateExpression &aggr) {
-	auto state = make_unsafe_uniq_array<data_t>(aggr.function.GetStateSizeCallback()(aggr.function));
-	aggr.function.GetStateInitCallback()(aggr.function, state.get());
-	Vector state_vector(Value::POINTER(CastPointerToValue(state.get())));
-	Vector result_vector(aggr.return_type);
+	auto &function = aggr.Function();
+	AggregateStateInput state_input(function, aggr.BindInfo().get());
+	auto state = make_unsafe_uniq_array<data_t>(function.GetStateSizeCallback()(state_input));
+	data_ptr_t state_ptr = state.get();
+	function.GetStateInitCallback()(state_input, &state_ptr, 1);
+	Vector state_vector(Value::POINTER(CastPointerToValue(state.get())), count_t(1));
+	Vector result_vector(aggr.GetReturnType());
 	ArenaAllocator arena(Allocator::DefaultAllocator());
-	AggregateInputData input(aggr.bind_info.get(), arena);
-	aggr.function.GetStateFinalizeCallback()(state_vector, input, result_vector, 1, 0);
+	AggregateFinalizeInputData input(aggr, arena, nullptr);
+	function.GetStateFinalizeCallback()(state_vector, input, result_vector, 1, 0);
 	return result_vector.GetValue(0);
 }
 
@@ -480,60 +491,51 @@ private:
 		if (!obstacle.empty()) {
 			throw NotImplementedException("substrait: %s", obstacle);
 		}
-		string name = window.aggregate ? window.aggregate->name : WindowFunctionName(window.GetExpressionType());
+		string name = window.AggregateFunction() ? window.AggregateFunction()->GetName().GetIdentifierName()
+		                                         : WindowFunctionName(window.GetExpressionType());
 		auto *fn = yyjson_mut_obj(doc);
 		yyjson_mut_obj_add_uint(doc, fn, "functionReference", FunctionAnchor(name));
 		vector<yyjson_mut_val *> args;
-		for (auto &child : window.children) {
+		for (auto &child : window.GetChildren()) {
 			args.push_back(Expr(*child, scope));
-		}
-		if (window.offset_expr) {
-			args.push_back(Expr(*window.offset_expr, scope));
-		}
-		if (window.default_expr) {
-			args.push_back(Expr(*window.default_expr, scope));
 		}
 		yyjson_mut_obj_add_val(doc, fn, "arguments", Arguments(args));
 		auto *partitions = yyjson_mut_arr(doc);
-		for (auto &partition : window.partitions) {
+		for (auto &partition : window.Partitions()) {
 			yyjson_mut_arr_add_val(partitions, Expr(*partition, scope));
 		}
 		yyjson_mut_obj_add_val(doc, fn, "partitions", partitions);
-		yyjson_mut_obj_add_val(doc, fn, "sorts", Sorts(window.orders, scope));
-		if (window.start != WindowBoundary::INVALID) {
-			bool range = IsRangeBoundary(window.start) || IsRangeBoundary(window.end);
+		yyjson_mut_obj_add_val(doc, fn, "sorts", Sorts(window.OrderBy(), scope));
+		if (window.WindowStart() != WindowBoundary::INVALID) {
+			bool range = IsRangeBoundary(window.WindowStart()) || IsRangeBoundary(window.WindowEnd());
 			yyjson_mut_obj_add_str(doc, fn, "boundsType", range ? "BOUNDS_TYPE_RANGE" : "BOUNDS_TYPE_ROWS");
-			yyjson_mut_obj_add_val(doc, fn, "lowerBound", Bound(window.start, window.start_expr));
-			yyjson_mut_obj_add_val(doc, fn, "upperBound", Bound(window.end, window.end_expr));
+			yyjson_mut_obj_add_val(doc, fn, "lowerBound", Bound(window.WindowStart(), window.StartExpr()));
+			yyjson_mut_obj_add_val(doc, fn, "upperBound", Bound(window.WindowEnd(), window.EndExpr()));
 		}
-		yyjson_mut_obj_add_val(doc, fn, "outputType", Type(window.return_type));
+		yyjson_mut_obj_add_val(doc, fn, "outputType", Type(window.GetReturnType()));
 		yyjson_mut_obj_add_str(doc, fn, "invocation",
-		                       window.distinct ? "AGGREGATION_INVOCATION_DISTINCT" : "AGGREGATION_INVOCATION_ALL");
+		                       window.Distinct() ? "AGGREGATION_INVOCATION_DISTINCT" : "AGGREGATION_INVOCATION_ALL");
 		return Wrap("windowFunction", fn);
 	}
 
 	yyjson_mut_val *Expr(const Expression &expr, const vector<ColumnBinding> &scope) {
 		switch (expr.GetExpressionClass()) {
 		case ExpressionClass::BOUND_COLUMN_REF: {
-			auto &binding = expr.Cast<BoundColumnRefExpression>().binding;
+			auto &binding = expr.Cast<BoundColumnRefExpression>().Binding();
 			for (idx_t i = 0; i < scope.size(); i++) {
 				if (scope[i] == binding) {
 					return Selection(i);
 				}
 			}
-			throw InternalException("substrait: column binding %llu.%llu is not in scope", binding.table_index,
-			                        binding.column_index);
+			throw InternalException("substrait: column binding %llu.%llu is not in scope", binding.table_index.index,
+			                        binding.column_index.GetIndex());
 		}
 		case ExpressionClass::BOUND_CONSTANT:
-			return Literal(expr.Cast<BoundConstantExpression>().value);
-		case ExpressionClass::BOUND_COMPARISON: {
-			auto &cmp = expr.Cast<BoundComparisonExpression>();
-			return Comparison(cmp.GetExpressionType(), *cmp.left, *cmp.right, scope);
-		}
+			return Literal(expr.Cast<BoundConstantExpression>().GetValue());
 		case ExpressionClass::BOUND_CONJUNCTION: {
 			auto &conj = expr.Cast<BoundConjunctionExpression>();
 			vector<yyjson_mut_val *> args;
-			for (auto &child : conj.children) {
+			for (auto &child : conj.GetChildren()) {
 				args.push_back(Expr(*child, scope));
 			}
 			auto name = conj.GetExpressionType() == ExpressionType::CONJUNCTION_AND ? "and" : "or";
@@ -542,7 +544,7 @@ private:
 		case ExpressionClass::BOUND_OPERATOR: {
 			auto &op = expr.Cast<BoundOperatorExpression>();
 			vector<yyjson_mut_val *> args;
-			for (auto &child : op.children) {
+			for (auto &child : op.GetChildren()) {
 				args.push_back(Expr(*child, scope));
 			}
 			switch (op.GetExpressionType()) {
@@ -553,7 +555,7 @@ private:
 			case ExpressionType::OPERATOR_IS_NOT_NULL:
 				return Call("is_not_null", LogicalType::BOOLEAN, args);
 			case ExpressionType::OPERATOR_COALESCE:
-				return Call("coalesce", op.return_type, args);
+				return Call("coalesce", op.GetReturnType(), args);
 			case ExpressionType::COMPARE_IN:
 			case ExpressionType::COMPARE_NOT_IN: {
 				auto *in = yyjson_mut_obj(doc);
@@ -573,49 +575,57 @@ private:
 				throw NotImplementedException("substrait: operator %s", EnumUtil::ToChars(op.GetExpressionType()));
 			}
 		}
-		case ExpressionClass::BOUND_CAST: {
-			auto &cast_expr = expr.Cast<BoundCastExpression>();
-			auto *cast = yyjson_mut_obj(doc);
-			yyjson_mut_obj_add_val(doc, cast, "type", Type(cast_expr.return_type));
-			yyjson_mut_obj_add_val(doc, cast, "input", Expr(*cast_expr.child, scope));
-			yyjson_mut_obj_add_str(doc, cast, "failureBehavior",
-			                       cast_expr.try_cast ? "FAILURE_BEHAVIOR_RETURN_NULL"
-			                                          : "FAILURE_BEHAVIOR_THROW_EXCEPTION");
-			return Wrap("cast", cast);
-		}
-		case ExpressionClass::BOUND_BETWEEN: {
-			auto &between = expr.Cast<BoundBetweenExpression>();
-			auto *lower = Comparison(between.LowerComparisonType(), *between.input, *between.lower, scope);
-			auto *upper = Comparison(between.UpperComparisonType(), *between.input, *between.upper, scope);
-			return Call("and", LogicalType::BOOLEAN, {lower, upper});
-		}
 		case ExpressionClass::BOUND_CASE: {
 			auto &case_expr = expr.Cast<BoundCaseExpression>();
 			auto *if_then = yyjson_mut_obj(doc);
 			auto *ifs = yyjson_mut_arr(doc);
-			for (auto &check : case_expr.case_checks) {
+			for (auto &check : case_expr.CaseChecks()) {
 				auto *clause = yyjson_mut_obj(doc);
 				yyjson_mut_obj_add_val(doc, clause, "if", Expr(*check.when_expr, scope));
 				yyjson_mut_obj_add_val(doc, clause, "then", Expr(*check.then_expr, scope));
 				yyjson_mut_arr_add_val(ifs, clause);
 			}
 			yyjson_mut_obj_add_val(doc, if_then, "ifs", ifs);
-			yyjson_mut_obj_add_val(doc, if_then, "else", Expr(*case_expr.else_expr, scope));
+			yyjson_mut_obj_add_val(doc, if_then, "else", Expr(case_expr.Else(), scope));
 			return Wrap("ifThen", if_then);
 		}
 		case ExpressionClass::BOUND_FUNCTION: {
 			auto &fn = expr.Cast<BoundFunctionExpression>();
+			if (BoundCastExpression::IsCast(fn)) {
+				auto *cast = yyjson_mut_obj(doc);
+				yyjson_mut_obj_add_val(doc, cast, "type", Type(BoundCastExpression::TargetType(fn)));
+				yyjson_mut_obj_add_val(doc, cast, "input", Expr(BoundCastExpression::Child(fn), scope));
+				yyjson_mut_obj_add_str(doc, cast, "failureBehavior",
+				                       BoundCastExpression::IsTryCast(fn) ? "FAILURE_BEHAVIOR_RETURN_NULL"
+				                                                          : "FAILURE_BEHAVIOR_THROW_EXCEPTION");
+				return Wrap("cast", cast);
+			}
+			if (BoundComparisonExpression::IsComparison(fn)) {
+				return Comparison(fn.GetExpressionType(), BoundComparisonExpression::Left(fn),
+				                  BoundComparisonExpression::Right(fn), scope);
+			}
+			if (IsBetween(fn)) {
+				auto &input = BoundBetweenExpression::Input(fn);
+				auto *lower = Comparison(BoundBetweenExpression::LowerComparisonType(fn), input,
+				                         BoundBetweenExpression::LowerBound(fn), scope);
+				auto *upper = Comparison(BoundBetweenExpression::UpperComparisonType(fn), input,
+				                         BoundBetweenExpression::UpperBound(fn), scope);
+				auto *between = Call("and", LogicalType::BOOLEAN, {lower, upper});
+				return fn.GetExpressionType() == ExpressionType::COMPARE_NOT_BETWEEN
+				           ? Call("not", LogicalType::BOOLEAN, {between})
+				           : between;
+			}
 			vector<yyjson_mut_val *> args;
-			for (auto &child : fn.children) {
+			for (auto &child : fn.GetChildren()) {
 				args.push_back(Expr(*child, scope));
 			}
-			return Call(fn.function.name, fn.return_type, args);
+			return Call(fn.Function().GetName().GetIdentifierName(), fn.GetReturnType(), args);
 		}
 		case ExpressionClass::BOUND_WINDOW:
 			return Window(expr.Cast<BoundWindowExpression>(), scope);
 		case ExpressionClass::BOUND_UNNEST: {
 			auto &unnest = expr.Cast<BoundUnnestExpression>();
-			return Call("unnest", unnest.return_type, {Expr(*unnest.child, scope)});
+			return Call("unnest", unnest.GetReturnType(), {Expr(*unnest.Child(), scope)});
 		}
 		default:
 			throw NotImplementedException("substrait: expression %s", EnumUtil::ToChars(expr.GetExpressionClass()));
@@ -623,24 +633,25 @@ private:
 	}
 
 	yyjson_mut_val *Measure(const BoundAggregateExpression &agg, const vector<ColumnBinding> &scope) {
-		if (agg.order_bys && !agg.order_bys->orders.empty()) {
+		if (agg.GetOrderBys() && !agg.GetOrderBys()->orders.empty()) {
 			throw NotImplementedException("substrait: an aggregate ORDER BY");
 		}
 		auto *measure = yyjson_mut_obj(doc);
 		auto *fn = yyjson_mut_obj(doc);
-		yyjson_mut_obj_add_uint(doc, fn, "functionReference", FunctionAnchor(agg.function.name));
-		yyjson_mut_obj_add_val(doc, fn, "outputType", Type(agg.return_type));
+		yyjson_mut_obj_add_uint(doc, fn, "functionReference",
+		                        FunctionAnchor(agg.Function().GetName().GetIdentifierName()));
+		yyjson_mut_obj_add_val(doc, fn, "outputType", Type(agg.GetReturnType()));
 		yyjson_mut_obj_add_str(doc, fn, "phase", "AGGREGATION_PHASE_INITIAL_TO_RESULT");
 		yyjson_mut_obj_add_str(doc, fn, "invocation",
 		                       agg.IsDistinct() ? "AGGREGATION_INVOCATION_DISTINCT" : "AGGREGATION_INVOCATION_ALL");
 		vector<yyjson_mut_val *> args;
-		for (auto &child : agg.children) {
+		for (auto &child : agg.GetChildren()) {
 			args.push_back(Expr(*child, scope));
 		}
 		yyjson_mut_obj_add_val(doc, fn, "arguments", Arguments(args));
 		yyjson_mut_obj_add_val(doc, measure, "measure", fn);
-		if (agg.filter) {
-			yyjson_mut_obj_add_val(doc, measure, "filter", Expr(*agg.filter, scope));
+		if (agg.GetFilter()) {
+			yyjson_mut_obj_add_val(doc, measure, "filter", Expr(*agg.GetFilter(), scope));
 		}
 		return measure;
 	}
@@ -663,7 +674,8 @@ private:
 			yyjson_mut_arr_add_strcpy(doc, table_names, table->schema.name.c_str());
 			yyjson_mut_arr_add_strcpy(doc, table_names, table->name.c_str());
 		} else {
-			throw NotImplementedException("substrait: scan of '%s' is not a floor", get.function.name);
+			throw NotImplementedException("substrait: scan of '%s' is not a floor",
+			                              get.function.GetName().GetIdentifierName());
 		}
 		for (idx_t i = 0; i < get.names.size(); i++) {
 			yyjson_mut_arr_add_strcpy(doc, names, get.names[i].c_str());
@@ -792,7 +804,8 @@ private:
 				throw NotImplementedException("substrait: duplicate eliminated join");
 			}
 			for (auto &condition : cmp.conditions) {
-				parts.push_back(Comparison(condition.comparison, *condition.left, *condition.right, scope));
+				parts.push_back(
+				    Comparison(condition.GetComparisonType(), condition.GetLHS(), condition.GetRHS(), scope));
 			}
 		} else if (op.type == LogicalOperatorType::LOGICAL_ANY_JOIN) {
 			parts.push_back(Expr(*op.Cast<LogicalAnyJoin>().condition, scope));
@@ -1081,18 +1094,18 @@ bool SubstraitCanRenderCall(const Expression &expr, string &reason) {
 		}
 	}
 	if (cls == ExpressionClass::BOUND_FUNCTION &&
-	    expr.Cast<BoundFunctionExpression>().function.HasBindLambdaCallback()) {
+	    expr.Cast<BoundFunctionExpression>().Function().HasBindLambdaCallback()) {
 		reason = "substrait cannot carry a lambda";
 		return false;
 	}
 	if (cls == ExpressionClass::BOUND_AGGREGATE) {
-		auto &order_bys = expr.Cast<BoundAggregateExpression>().order_bys;
+		auto &order_bys = expr.Cast<BoundAggregateExpression>().GetOrderBys();
 		if (order_bys && !order_bys->orders.empty()) {
 			reason = "substrait cannot carry an aggregate ORDER BY";
 			return false;
 		}
 	}
-	if (cls == ExpressionClass::BOUND_COMPARISON && !ComparisonName(expr.GetExpressionType())) {
+	if (BoundComparisonExpression::IsComparison(expr) && !ComparisonName(expr.GetExpressionType())) {
 		reason = string("substrait cannot carry comparison ") + EnumUtil::ToChars(expr.GetExpressionType());
 		return false;
 	}

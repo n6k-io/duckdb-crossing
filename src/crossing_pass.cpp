@@ -35,7 +35,7 @@ void SwapCrossingGetsForTheirNodes(ClientContext &context, unique_ptr<LogicalOpe
 		return;
 	}
 	if (data->verb == CrossingVerb::SELECT) {
-		if (!get.table_filters.filters.empty() || !get.projection_ids.empty() || !get.projected_input.empty()) {
+		if (get.table_filters.HasFilters() || !get.projection_ids.empty() || !get.projected_input.empty()) {
 			throw InternalException("crossing: the scan of '%s' was optimized in a way the read cannot carry",
 			                        data->SourceTable());
 		}

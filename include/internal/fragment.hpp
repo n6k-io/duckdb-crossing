@@ -30,7 +30,7 @@ struct CrossingFragment {
 	optional_ptr<LogicalProjection> crossing_projection;
 	vector<LogicalType> output_types;
 	vector<column_t> projected_columns;
-	idx_t table_index = 0;
+	TableIndex table_index = TableIndex(0);
 
 	bool frozen = false;
 
@@ -45,7 +45,7 @@ struct CrossingFragment {
 
 	void SealFloor(const LogicalOperator &node);
 	void RebuildPlanForColumns(const vector<column_t> &columns);
-	void AdoptTableIndex(idx_t index);
+	void AdoptTableIndex(TableIndex index);
 	void RemapTableIndices(const FreshTableIndex &fresh);
 
 	void ResolveTypesAndText();

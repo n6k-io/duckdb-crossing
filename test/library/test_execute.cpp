@@ -1,7 +1,8 @@
 #include "framework/twin.hpp"
 
 #include "duckdb/common/types/column/column_data_collection.hpp"
-#include "duckdb/main/pending_query_result.hpp"
+#include "duckdb/main/query_result.hpp"
+#include "duckdb/main/query_result_stream.hpp"
 #include "duckdb/main/query_parameters.hpp"
 #include "duckdb/main/relation.hpp"
 #include "duckdb/parser/expression/case_expression.hpp"
@@ -10,8 +11,10 @@
 #include "duckdb/parser/expression/conjunction_expression.hpp"
 #include "duckdb/parser/expression/constant_expression.hpp"
 #include "duckdb/parser/expression/function_expression.hpp"
+#include "duckdb/parser/parsed_data/attach_info.hpp"
 #include "duckdb/parser/parser.hpp"
 #include "duckdb/parser/statement/relation_statement.hpp"
+#include "duckdb/parser/query_node/update_query_node.hpp"
 #include "duckdb/parser/statement/update_statement.hpp"
 #include "duckdb/planner/operator/logical_get.hpp"
 #include "duckdb/planner/planner.hpp"
@@ -28,11 +31,11 @@ struct Described {
 };
 
 Described DescribeOn(Connection &con, const string &table) {
-	auto info = con.TableInfo(STORE_CATALOG, "main", table);
+	auto info = con.TableInfo(STORE_CATALOG, "main", Identifier(table));
 	REQUIRE(info);
 	Described described;
 	for (auto &column : info->columns) {
-		described.names.push_back(column.Name());
+		described.names.push_back(column.Name().GetIdentifierName());
 		described.types.push_back(column.Type());
 	}
 	return described;
@@ -44,23 +47,13 @@ unique_ptr<LogicalOperator> FloorOver(Connection &con, idx_t index, const string
 }
 
 idx_t RowsFrom(Connection &con, unique_ptr<LogicalOperator> plan) {
-	auto pending = PendingCrossingPlan(*con.context, std::move(plan), false);
-	if (pending->HasError()) {
-		pending->ThrowError();
-	}
-	auto result = pending->Execute();
-	if (result->HasError()) {
-		result->ThrowError();
-	}
-	idx_t rows = 0;
-	while (auto chunk = result->Fetch()) {
-		rows += chunk->size();
-	}
-	return rows;
+	auto result = SubmitCrossingPlan(*con.context, std::move(plan));
+	result->ThrowIfError();
+	return result->RowCount();
 }
 
 Value Scalar(Connection &con, const string &sql) {
-	auto result = con.Query(sql);
+	auto result = Collected(con.Query(sql));
 	if (result->HasError()) {
 		FAIL(result->GetError());
 	}
@@ -116,7 +109,8 @@ public:
 		lock_guard<mutex> guard(raw->lock);
 		InTransaction txn(raw->con);
 		Planner planner(*raw->con.context);
-		planner.CreatePlan(make_uniq<RelationStatement>(raw->con.Table(STORE_CATALOG, request.schema, request.table)));
+		planner.CreatePlan(make_uniq<RelationStatement>(
+		    raw->con.Table(STORE_CATALOG, Identifier(request.schema), Identifier(request.table))));
 		return CrossingPlan::Of(std::move(planner.plan));
 	}
 
@@ -144,7 +138,7 @@ TEST_CASE("BindFloors binds a floor to its table under the floor's index", "[exe
 	REQUIRE(plan->type == LogicalOperatorType::LOGICAL_GET);
 	auto &get = plan->Cast<LogicalGet>();
 	REQUIRE(!FloorOf(get));
-	REQUIRE(get.table_index == 7);
+	REQUIRE(get.table_index.index == 7);
 	REQUIRE(get.GetColumnBindings().size() == 6);
 	REQUIRE(RowsFrom(con, std::move(plan)) == 5);
 }
@@ -168,13 +162,15 @@ TEST_CASE("BindFloors lets a resolver stand a filtered subquery in for a floor",
 
 	auto plan = FloorOver(con, 3, "orders");
 	CrossingFloorResolver resolver = [&con](const CrossingFloor &floor) {
-		return con.Table(STORE_CATALOG, floor.schema, floor.table)->Filter("amt > 100")->GetTableRef();
+		return con.Table(STORE_CATALOG, Identifier(floor.schema), Identifier(floor.table))
+		    ->Filter("amt > 100")
+		    ->GetTableRef();
 	};
 	BindFloors(*con.context, plan, STORE_CATALOG, resolver);
 
 	REQUIRE(plan->type != LogicalOperatorType::LOGICAL_GET);
 	for (auto &binding : plan->GetColumnBindings()) {
-		REQUIRE(binding.table_index == 3);
+		REQUIRE(binding.table_index.index == 3);
 	}
 	REQUIRE(RowsFrom(con, std::move(plan)) == 4);
 }
@@ -189,26 +185,24 @@ TEST_CASE("BindFloors needs a transaction", "[execute]") {
 	REQUIRE_THROWS_WITH(BindFloors(*con.context, plan, STORE_CATALOG), Catch::Contains("transaction"));
 }
 
-TEST_CASE("PendingCrossingPlan streams when asked to", "[execute]") {
+TEST_CASE("SubmitCrossingPlan can be read as a stream", "[execute]") {
 	Twin twin(Transport::NATIVE);
 	auto &con = twin.store->con;
 	REQUIRE(!con.Query("SET threads = 1")->HasError());
 	con.BeginTransaction();
 
 	// Rows past the first five million raise, so only a plan that streams hands back its first chunk.
-	Parser parser;
-	parser.ParseQuery(
+	auto statements = con.ExtractStatements(
 	    "SELECT CASE WHEN i < 5000000 THEN i ELSE error('materialized')::BIGINT END FROM range(10000000) t(i)");
 	Planner planner(*con.context);
-	planner.CreatePlan(std::move(parser.statements[0]));
-	auto pending = PendingCrossingPlan(*con.context, std::move(planner.plan), true);
-	REQUIRE(!pending->HasError());
-	auto result = pending->Execute();
+	planner.CreatePlan(std::move(statements[0]));
+	auto result = SubmitCrossingPlan(*con.context, std::move(planner.plan));
 	REQUIRE(!result->HasError());
-	auto chunk = result->Fetch();
+	QueryResultStream<ChunkFormat> stream(std::move(result));
+	auto chunk = stream.Fetch();
 	REQUIRE(chunk);
 	REQUIRE(chunk->size() > 0);
-	result.reset();
+	stream.Close();
 	con.Rollback();
 }
 
@@ -294,11 +288,12 @@ TEST_CASE("ExecuteWrite lets a shaper narrow the statement before it binds", "[e
 	                 {{Value::INTEGER(1), Value::INTEGER(0)}, {Value::INTEGER(2), Value::INTEGER(0)}});
 	CrossingWriteShaper only_large = [](CrossingWriteStatement &built) {
 		auto &update = built.statement->Cast<UpdateStatement>();
+		auto &set_info = *update.node->set_info;
 		auto large = make_uniq<ComparisonExpression>(ExpressionType::COMPARE_GREATERTHAN,
 		                                             make_uniq<ColumnRefExpression>("amt", "orders"),
-		                                             make_uniq<ConstantExpression>(Value::INTEGER(100)));
-		update.set_info->condition = make_uniq<ConjunctionExpression>(
-		    ExpressionType::CONJUNCTION_AND, std::move(update.set_info->condition), std::move(large));
+		                                             make_uniq<ConstantExpression>(Literal::Integer(100)));
+		set_info.condition = make_uniq<ConjunctionExpression>(ExpressionType::CONJUNCTION_AND,
+		                                                      std::move(set_info.condition), std::move(large));
 	};
 	auto changed = ExecuteWrite(*con.context, TargetOf(CrossingVerb::UPDATE, "orders", {"id"}, {"amt"}),
 	                            SeamRefOfRows(*rows), only_large);
@@ -322,15 +317,15 @@ TEST_CASE("ExecuteWrite writes into a crossing table, as a middle hop does", "[e
 	};
 	// The guard a source puts on a written value, as a row policy's check does.
 	CrossingWriteShaper guarded = [](CrossingWriteStatement &built) {
-		auto &set_info = *built.statement->Cast<UpdateStatement>().set_info;
+		auto &set_info = *built.statement->Cast<UpdateStatement>().node->set_info;
 		vector<unique_ptr<ParsedExpression>> error_args;
-		error_args.push_back(make_uniq<ConstantExpression>(Value("violates the check")));
+		error_args.push_back(make_uniq<ConstantExpression>(Literal::String("violates the check")));
 		auto guard = make_uniq<CaseExpression>();
 		CaseCheck branch;
-		branch.when_expr = make_uniq<ConstantExpression>(Value::BOOLEAN(true));
+		branch.when_expr = make_uniq<ConstantExpression>(Literal::Boolean(true));
 		branch.then_expr = std::move(set_info.expressions[0]);
-		guard->case_checks.push_back(std::move(branch));
-		guard->else_expr = make_uniq<FunctionExpression>("error", std::move(error_args));
+		guard->CaseChecksMutable().push_back(std::move(branch));
+		guard->ElseMutable() = make_uniq<FunctionExpression>("error", std::move(error_args));
 		set_info.expressions[0] = std::move(guard);
 	};
 	auto update = Rows({LogicalType::INTEGER, LogicalType::INTEGER}, {{Value::INTEGER(2), Value::INTEGER(0)}});
