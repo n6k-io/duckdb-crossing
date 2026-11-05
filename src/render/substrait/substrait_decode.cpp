@@ -113,9 +113,9 @@ int64_t Int64Of(yyjson_val *val, int64_t fallback) {
 
 class Decoder {
 public:
-	Decoder(Connection &conn_p, const string &catalog_p, const string &seam_view_p,
+	Decoder(Connection &conn_p, const string &catalog_p, const SubstraitSeamViews &seam_views_p,
 	        const SubstraitCatalogCheck &check_p)
-	    : conn(conn_p), catalog(catalog_p), seam_view(seam_view_p), check(check_p) {
+	    : conn(conn_p), catalog(catalog_p), seam_views(seam_views_p), check(check_p) {
 	}
 
 	shared_ptr<Relation> Decode(yyjson_val *plan) {
@@ -423,11 +423,12 @@ private:
 		auto *named = Require(read, "namedTable");
 		auto names = StrArrayOf(named, "names");
 		shared_ptr<Relation> rel;
-		if (names.size() == 1 && names[0] == SUBSTRAIT_SEAM_TABLE) {
-			if (seam_view.empty()) {
-				throw InvalidInputException("substrait: the plan reads a seam but none was staged");
+		if (names.size() == 1) {
+			auto view = seam_views.find(names[0]);
+			if (view == seam_views.end()) {
+				throw InvalidInputException("substrait: the plan reads seam '%s' but it was not staged", names[0]);
 			}
-			rel = conn.View(Identifier(seam_view));
+			rel = conn.View(Identifier(view->second));
 		} else if (names.size() == 2 || names.size() == 3) {
 			if (names.size() == 3 && check) {
 				check(names[0]);
@@ -481,6 +482,7 @@ private:
 		auto r = right->Alias("r");
 		shared_ptr<Relation> joined;
 		bool left_only = false;
+		bool mark = false;
 		if (ref_type == JoinRefType::CROSS || ref_type == JoinRefType::POSITIONAL) {
 			joined = l->CrossProduct(r, ref_type);
 		} else {
@@ -499,6 +501,10 @@ private:
 			} else if (type_name == "JOIN_TYPE_LEFT_ANTI") {
 				type = JoinType::ANTI;
 				left_only = true;
+			} else if (type_name == "JOIN_TYPE_LEFT_MARK") {
+				type = JoinType::MARK;
+				left_only = true;
+				mark = true;
 			} else {
 				throw InvalidInputException("substrait: unsupported join type '%s'", type_name);
 			}
@@ -518,6 +524,9 @@ private:
 			for (idx_t i = 0; i < right_width; i++) {
 				exprs.push_back(make_uniq<ColumnRefExpression>(Identifier(ColumnName(i)), "r"));
 			}
+		}
+		if (mark) {
+			exprs.push_back(make_uniq<ColumnRefExpression>(Identifier("__mark_join_marker")));
 		}
 		return Renumber(joined, std::move(exprs));
 	}
@@ -773,7 +782,7 @@ private:
 
 	Connection &conn;
 	const string &catalog;
-	const string &seam_view;
+	const SubstraitSeamViews &seam_views;
 	const SubstraitCatalogCheck &check;
 	std::unordered_map<uint64_t, string> functions;
 };
@@ -781,13 +790,13 @@ private:
 } // namespace
 
 shared_ptr<Relation> DecodeSubstraitJson(Connection &conn, const string &catalog, const string &json,
-                                         const string &seam_view, const SubstraitCatalogCheck &check) {
+                                         const SubstraitSeamViews &seam_views, const SubstraitCatalogCheck &check) {
 	auto *doc = yyjson_read(json.data(), json.size(), 0);
 	if (!doc) {
 		throw InvalidInputException("substrait: the plan is not valid JSON");
 	}
 	try {
-		Decoder decoder(conn, catalog, seam_view, check);
+		Decoder decoder(conn, catalog, seam_views, check);
 		auto rel = decoder.Decode(yyjson_doc_get_root(doc));
 		yyjson_doc_free(doc);
 		return rel;
@@ -799,7 +808,7 @@ shared_ptr<Relation> DecodeSubstraitJson(Connection &conn, const string &catalog
 
 unique_ptr<SelectStatement> DecodeSubstraitView(Connection &conn, const string &catalog, const string &json,
                                                 const vector<string> &names, const SubstraitCatalogCheck &check) {
-	auto rel = DecodeSubstraitJson(conn, catalog, json, "", check);
+	auto rel = DecodeSubstraitJson(conn, catalog, json, {}, check);
 	auto &columns = rel->Columns();
 	if (columns.size() != names.size()) {
 		throw InvalidInputException("substrait: the view body has %llu columns but %llu names", columns.size(),

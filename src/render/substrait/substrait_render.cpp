@@ -84,6 +84,19 @@ const char *ComparisonName(ExpressionType type) {
 	}
 }
 
+string SeamTableName(const LogicalColumnDataGet &rows) {
+	return "seam_" + std::to_string(rows.table_index.index);
+}
+
+void CollectSeams(const LogicalOperator &op, vector<SubstraitSeam> &out) {
+	if (auto rows = SeamRowsOf(op)) {
+		out.push_back(SubstraitSeam {SeamTableName(op.Cast<LogicalColumnDataGet>()), *rows});
+	}
+	for (auto &child : op.children) {
+		CollectSeams(*child, out);
+	}
+}
+
 const char *JoinTypeName(JoinType type) {
 	switch (type) {
 	case JoinType::INNER:
@@ -102,6 +115,8 @@ const char *JoinTypeName(JoinType type) {
 		return "JOIN_TYPE_RIGHT_SEMI";
 	case JoinType::RIGHT_ANTI:
 		return "JOIN_TYPE_RIGHT_ANTI";
+	case JoinType::MARK:
+		return "JOIN_TYPE_LEFT_MARK";
 	default:
 		return nullptr;
 	}
@@ -714,7 +729,7 @@ private:
 		auto *named = yyjson_mut_obj(doc);
 		auto *table_names = yyjson_mut_arr(doc);
 
-		yyjson_mut_arr_add_strcpy(doc, table_names, SUBSTRAIT_SEAM_TABLE);
+		yyjson_mut_arr_add_strcpy(doc, table_names, SeamTableName(rows).c_str());
 		for (idx_t i = 0; i < rows.chunk_types.size(); i++) {
 			yyjson_mut_arr_add_strcpy(doc, names, ("c" + std::to_string(i)).c_str());
 			yyjson_mut_arr_add_val(types, Type(rows.chunk_types[i]));
@@ -1117,6 +1132,12 @@ bool SubstraitCanRenderCall(const Expression &expr, string &reason) {
 		}
 	}
 	return true;
+}
+
+vector<SubstraitSeam> SubstraitSeamsOf(const LogicalOperator &plan) {
+	vector<SubstraitSeam> out;
+	CollectSeams(plan, out);
+	return out;
 }
 
 bool SubstraitCanRenderOperator(const LogicalOperator &op, string &reason) {

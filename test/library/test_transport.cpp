@@ -60,7 +60,7 @@ TEST_CASE("a substrait write carrying rows reads them from the seam table", "[tr
 	twin.Query("INSERT INTO far.orders VALUES (6, 'zeta', 600, 3, 6.5, NULL)");
 
 	auto &call = twin.LastWrite();
-	REQUIRE(call.wire.find("\"namedTable\":{\"names\":[\"seam\"]}") != string::npos);
+	REQUIRE(call.wire.find("\"namedTable\":{\"names\":[\"seam_") != string::npos);
 	REQUIRE(call.rows.size() == 1);
 	twin.Same("SELECT * FROM far.orders ORDER BY id");
 }

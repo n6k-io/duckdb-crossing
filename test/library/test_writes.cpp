@@ -206,6 +206,67 @@ TEST_CASE("a delete of nothing hands the source nothing and reports zero", "[wri
 	REQUIRE(Scalar(twin, "SELECT count(*) FROM orders") == Value::BIGINT(5));
 }
 
+TEST_CASE("a delete whose WHERE holds an IN over one source runs wholly on the source", "[writes]") {
+	auto transport = EACH_TRANSPORT();
+	INFO(TransportName(transport));
+	Twin twin(transport);
+	twin.Seed();
+
+	auto result = twin.Query("DELETE FROM far.orders WHERE id IN (SELECT tenant FROM far.customers)");
+
+	REQUIRE(result->GetValue(0, 0) == Value::BIGINT(3));
+	auto &call = twin.LastWrite();
+	REQUIRE(call.Has(Op::LOGICAL_COMPARISON_JOIN));
+	REQUIRE(!call.Has(Op::LOGICAL_CHUNK_GET));
+	REQUIRE(twin.store->reads.empty());
+	REQUIRE(Scalar(twin, "SELECT count(*) FROM orders") == Value::BIGINT(2));
+}
+
+TEST_CASE("an update whose WHERE holds an IN over one source runs wholly on the source", "[writes]") {
+	auto transport = EACH_TRANSPORT();
+	INFO(TransportName(transport));
+	Twin twin(transport);
+	twin.Seed();
+
+	auto result = twin.Query("UPDATE far.orders SET amt = 0 WHERE id IN (SELECT tenant FROM far.customers)");
+
+	REQUIRE(result->GetValue(0, 0) == Value::BIGINT(3));
+	auto &call = twin.LastWrite();
+	REQUIRE(call.Has(Op::LOGICAL_COMPARISON_JOIN));
+	REQUIRE(!call.Has(Op::LOGICAL_CHUNK_GET));
+	REQUIRE(twin.store->reads.empty());
+	REQUIRE(Scalar(twin, "SELECT sum(amt) FROM orders") == Value::HUGEINT(700));
+}
+
+TEST_CASE("a delete with an IN returns the rows it deleted", "[writes]") {
+	auto transport = EACH_TRANSPORT();
+	INFO(TransportName(transport));
+	Twin twin(transport);
+	twin.Seed();
+
+	auto result = twin.Query("DELETE FROM far.orders WHERE id IN (SELECT tenant FROM far.customers) RETURNING id");
+
+	REQUIRE(result->RowCount() == 3);
+	REQUIRE(Scalar(twin, "SELECT count(*) FROM orders") == Value::BIGINT(2));
+}
+
+TEST_CASE("an insert fed through an IN over one source runs wholly on the source", "[writes]") {
+	auto transport = EACH_TRANSPORT();
+	INFO(TransportName(transport));
+	Twin twin(transport);
+	twin.Seed();
+
+	auto result = twin.Query(
+	    "INSERT INTO far.orders SELECT * FROM far.archive WHERE tenant NOT IN (SELECT tenant FROM far.customers)");
+
+	REQUIRE(result->GetValue(0, 0) == Value::BIGINT(1));
+	auto &call = twin.LastWrite();
+	REQUIRE(call.Has(Op::LOGICAL_COMPARISON_JOIN));
+	REQUIRE(!call.Has(Op::LOGICAL_CHUNK_GET));
+	REQUIRE(twin.store->reads.empty());
+	REQUIRE(Scalar(twin, "SELECT name FROM orders WHERE id = 9") == Value("zeta"));
+}
+
 TEST_CASE("a key that identifies more than one source row fails the write and rolls it back", "[writes]") {
 	auto transport = EACH_TRANSPORT();
 	INFO(TransportName(transport));

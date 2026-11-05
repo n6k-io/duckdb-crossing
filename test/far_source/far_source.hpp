@@ -164,7 +164,7 @@ private:
 	vector<vector<Value>> EvaluateNative(const LogicalOperator &plan, FarCall &call);
 	vector<vector<Value>> EvaluateSubstrait(const LogicalOperator &plan, FarCall &call);
 	idx_t Apply(const CrossingQuery &query);
-	string StageSeamRows(const LogicalOperator &plan);
+	SubstraitSeamViews StageSeamRows(const LogicalOperator &plan);
 	unique_ptr<CreateViewInfo> ReceiveView(const CreateViewInfo &view, const LogicalOperator &plan);
 	FarCall Record(const CrossingQuery &query);
 

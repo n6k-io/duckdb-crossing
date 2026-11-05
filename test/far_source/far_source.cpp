@@ -60,18 +60,6 @@ vector<vector<Value>> RowsOf(const ColumnDataCollection &collection) {
 	return out;
 }
 
-optional_ptr<const ColumnDataCollection> FindSeamRows(const LogicalOperator &op) {
-	if (auto rows = SeamRowsOf(op)) {
-		return rows;
-	}
-	for (auto &child : op.children) {
-		if (auto rows = FindSeamRows(*child)) {
-			return rows;
-		}
-	}
-	return nullptr;
-}
-
 void CollectOperators(const LogicalOperator &op, vector<LogicalOperatorType> &out) {
 	out.push_back(op.type);
 	for (auto &child : op.children) {
@@ -559,26 +547,26 @@ vector<vector<Value>> FarSession::EvaluateNative(const LogicalOperator &plan, Fa
 	return RowsOf(*RunPlan(far, std::move(received)));
 }
 
-string FarSession::StageSeamRows(const LogicalOperator &plan) {
-	auto rows = FindSeamRows(plan);
-	if (!rows) {
-		return "";
+SubstraitSeamViews FarSession::StageSeamRows(const LogicalOperator &plan) {
+	SubstraitSeamViews views;
+	for (auto &seam : SubstraitSeamsOf(plan)) {
+		auto view = "crossing_" + seam.table;
+		string columns;
+		for (idx_t c = 0; c < seam.rows.Types().size(); c++) {
+			columns += (c ? ", c" : "c") + to_string(c) + " " + seam.rows.Types()[c].ToString();
+		}
+		auto created = far.Query("CREATE OR REPLACE TEMP TABLE " + view + "(" + columns + ")");
+		if (created->HasError()) {
+			created->ThrowError();
+		}
+		Appender appender(far, "temp", "main", Identifier(view));
+		for (auto &chunk : seam.rows.Chunks()) {
+			appender.AppendDataChunk(chunk);
+		}
+		appender.Close();
+		views[seam.table] = view;
 	}
-	string seam_view = "crossing_seam_rows";
-	string columns;
-	for (idx_t c = 0; c < rows->Types().size(); c++) {
-		columns += (c ? ", c" : "c") + to_string(c) + " " + rows->Types()[c].ToString();
-	}
-	auto created = far.Query("CREATE OR REPLACE TEMP TABLE " + seam_view + "(" + columns + ")");
-	if (created->HasError()) {
-		created->ThrowError();
-	}
-	Appender appender(far, "temp", "main", Identifier(seam_view));
-	for (auto &chunk : rows->Chunks()) {
-		appender.AppendDataChunk(chunk);
-	}
-	appender.Close();
-	return seam_view;
+	return views;
 }
 
 vector<vector<Value>> FarSession::EvaluateSubstrait(const LogicalOperator &plan, FarCall &call) {

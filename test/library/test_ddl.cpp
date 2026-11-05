@@ -325,6 +325,12 @@ TEST_CASE("view bodies that run wholly on the source", "[ddl][view]") {
 		           "o.tenant = c.tenant");
 		twin.Same("SELECT id, cname FROM far.v ORDER BY id");
 	}
+	SECTION("IN over another served table") {
+		twin.Query("CREATE VIEW far.main.v AS SELECT id FROM far.orders WHERE tenant IN (SELECT tenant FROM "
+		           "far.customers)");
+		twin.Same("SELECT id FROM far.v ORDER BY id", "SELECT id FROM orders WHERE tenant IN (SELECT tenant FROM "
+		                                              "customers) ORDER BY id");
+	}
 	SECTION("aggregate") {
 		twin.Query("CREATE VIEW far.main.v AS SELECT tenant, sum(amt) AS total FROM far.orders GROUP BY tenant");
 		twin.Same("SELECT tenant, total FROM far.v ORDER BY tenant");
