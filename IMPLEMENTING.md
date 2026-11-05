@@ -168,11 +168,11 @@ carrying it on the target.
 - `AcceptsCall` — asked per call, operator, aggregate and window expression.
   Column refs, constants, comparisons, `AND`/`OR`, casts, `BETWEEN`, `CASE`,
   `UNNEST` pass without asking. Lambdas, volatile and inconsistent expressions
-  never cross. A subquery the planner turns into a join crosses as that join,
-  `MARK` included.
+  never cross.
 - `AcceptsType` — asked about the type of every expression that would move,
   except a bare reference to a described column.
-- `AcceptsOperator` — asked per operator after its expressions passed.
+- `AcceptsOperator` — asked per operator after its expressions passed. A subquery
+  planned as a comparison or any join is asked about as that join, `MARK` included.
 
 A yes claims the source computes the expression as DuckDB does.
 
@@ -292,8 +292,8 @@ The receiver is a DuckDB instance of the same commit with
 `RegisterCrossingPlanFunctions(db)` called; `context` has a transaction open.
 
 Rendered as Substrait, a plan can read several seams, each as its own one-part
-table, `seam_<table index>`. `SubstraitSeamsOf(plan)` lists each name with its
-rows. Stage them and pass `DecodeSubstraitJson` the view holding each one.
+table. `SubstraitSeamsOf(plan)` lists each name with its rows. Stage them and
+pass `DecodeSubstraitJson` the view holding each one.
 
 ## Transactions
 

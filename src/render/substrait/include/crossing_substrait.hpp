@@ -14,7 +14,7 @@ namespace duckdb {
 
 string RenderSubstraitJson(const LogicalOperator &plan);
 
-//! Rows a plan carries, and the one-part table name its render reads them under: seam_<table index>.
+//! Rows a plan carries, and the one-part table name its render reads them under.
 struct SubstraitSeam {
 	string table;
 	const ColumnDataCollection &rows;
