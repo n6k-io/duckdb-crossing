@@ -7,6 +7,7 @@
 #include "duckdb/main/query_result.hpp"
 #include "duckdb/main/query_parameters.hpp"
 #include "duckdb/main/relation.hpp"
+#include "duckdb/parser/constraints/unique_constraint.hpp"
 #include "duckdb/parser/parsed_data/alter_info.hpp"
 #include "duckdb/parser/parsed_data/attach_info.hpp"
 #include "duckdb/parser/parsed_data/create_info.hpp"
@@ -58,18 +59,6 @@ vector<vector<Value>> RowsOf(const ColumnDataCollection &collection) {
 		}
 	}
 	return out;
-}
-
-optional_ptr<const ColumnDataCollection> FindSeamRows(const LogicalOperator &op) {
-	if (auto rows = SeamRowsOf(op)) {
-		return rows;
-	}
-	for (auto &child : op.children) {
-		if (auto rows = FindSeamRows(*child)) {
-			return rows;
-		}
-	}
-	return nullptr;
 }
 
 void CollectOperators(const LogicalOperator &op, vector<LogicalOperatorType> &out) {
@@ -342,6 +331,13 @@ CrossingTable FarSource::DescribeOn(FarStore &store, Connection &con, const stri
 	}
 	auto unique = store.key_unique.find(name);
 	table.key_unique = unique != store.key_unique.end() ? unique->second : !table.key.empty();
+	if (store.declare_key_constraints && !table.key.empty()) {
+		vector<Identifier> key_columns;
+		for (auto &column : table.key) {
+			key_columns.emplace_back(column);
+		}
+		table.constraints.push_back(make_uniq<UniqueConstraint>(std::move(key_columns), true));
+	}
 	auto verbs = store.verbs.find(name);
 	if (verbs != store.verbs.end()) {
 		table.verbs = verbs->second;
@@ -559,26 +555,26 @@ vector<vector<Value>> FarSession::EvaluateNative(const LogicalOperator &plan, Fa
 	return RowsOf(*RunPlan(far, std::move(received)));
 }
 
-string FarSession::StageSeamRows(const LogicalOperator &plan) {
-	auto rows = FindSeamRows(plan);
-	if (!rows) {
-		return "";
+SubstraitSeamViews FarSession::StageSeamRows(const LogicalOperator &plan) {
+	SubstraitSeamViews views;
+	for (auto &seam : SubstraitSeamsOf(plan)) {
+		auto view = "crossing_" + seam.table;
+		string columns;
+		for (idx_t c = 0; c < seam.rows.Types().size(); c++) {
+			columns += (c ? ", c" : "c") + to_string(c) + " " + seam.rows.Types()[c].ToString();
+		}
+		auto created = far.Query("CREATE OR REPLACE TEMP TABLE " + view + "(" + columns + ")");
+		if (created->HasError()) {
+			created->ThrowError();
+		}
+		Appender appender(far, "temp", "main", Identifier(view));
+		for (auto &chunk : seam.rows.Chunks()) {
+			appender.AppendDataChunk(chunk);
+		}
+		appender.Close();
+		views[seam.table] = view;
 	}
-	string seam_view = "crossing_seam_rows";
-	string columns;
-	for (idx_t c = 0; c < rows->Types().size(); c++) {
-		columns += (c ? ", c" : "c") + to_string(c) + " " + rows->Types()[c].ToString();
-	}
-	auto created = far.Query("CREATE OR REPLACE TEMP TABLE " + seam_view + "(" + columns + ")");
-	if (created->HasError()) {
-		created->ThrowError();
-	}
-	Appender appender(far, "temp", "main", Identifier(seam_view));
-	for (auto &chunk : rows->Chunks()) {
-		appender.AppendDataChunk(chunk);
-	}
-	appender.Close();
-	return seam_view;
+	return views;
 }
 
 vector<vector<Value>> FarSession::EvaluateSubstrait(const LogicalOperator &plan, FarCall &call) {

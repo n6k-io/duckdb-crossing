@@ -4,6 +4,90 @@ using namespace duckdb;
 
 using Op = LogicalOperatorType;
 
+namespace {
+
+string WireForAllColumns(Twin &twin) {
+	twin.Far("CREATE TABLE t(a INTEGER, b INTEGER, c INTEGER)");
+	twin.Far("INSERT INTO t VALUES (1, 2, 3), (4, 5, 6)");
+	twin.Attach();
+	twin.Query("SELECT a, b, c FROM far.t");
+	REQUIRE(twin.LastRead().wire.find("baseSchema") != string::npos);
+	return twin.LastRead().wire;
+}
+
+string DecodeError(Twin &twin, const string &wire) {
+	auto &con = twin.store->con;
+	auto catalog = Collected(con.Query("SELECT current_database()"))->GetValue(0, 0).ToString();
+	try {
+		auto result = DecodeSubstraitJson(con, catalog, wire, {})->Execute();
+		return result->HasError() ? result->GetError() : "";
+	} catch (std::exception &ex) {
+		return ex.what();
+	}
+}
+
+} // namespace
+
+TEST_CASE("a substrait read decodes against the table it was planned for", "[transport][stale_schema]") {
+	Twin twin(Transport::SUBSTRAIT);
+	auto wire = WireForAllColumns(twin);
+
+	REQUIRE(DecodeError(twin, wire) == "");
+}
+
+TEST_CASE("a substrait read planned before a column was dropped reports the change", "[transport][stale_schema]") {
+	Twin twin(Transport::SUBSTRAIT);
+	auto wire = WireForAllColumns(twin);
+
+	twin.Far("ALTER TABLE t DROP COLUMN b");
+
+	REQUIRE_THAT(DecodeError(twin, wire), Catch::Contains("changed on the source"));
+}
+
+TEST_CASE("a substrait read planned before any other change to the table reports the change",
+          "[transport][stale_schema]") {
+	Twin twin(Transport::SUBSTRAIT);
+	auto wire = WireForAllColumns(twin);
+
+	SECTION("a column renamed") {
+		twin.Far("ALTER TABLE t RENAME COLUMN b TO z");
+	}
+	SECTION("a column retyped under its own name") {
+		twin.Far("ALTER TABLE t ALTER COLUMN b TYPE BIGINT");
+	}
+	SECTION("a column added at the end") {
+		twin.Far("ALTER TABLE t ADD COLUMN d INTEGER");
+	}
+
+	REQUIRE_THAT(DecodeError(twin, wire), Catch::Contains("changed on the source"));
+}
+
+TEST_CASE("a read through an attach that has not seen a change reports the change", "[transport][stale_schema]") {
+	Twin twin(Transport::SUBSTRAIT);
+	WireForAllColumns(twin);
+
+	twin.Far("ALTER TABLE t DROP COLUMN b");
+	twin.Far("ALTER TABLE t ADD COLUMN d INTEGER");
+
+	REQUIRE_THAT(twin.Error("SELECT a, b, c FROM far.t"), Catch::Contains("changed on the source"));
+}
+
+TEST_CASE("a substrait read planned before a column was replaced is not remapped by position",
+          "[transport][stale_schema]") {
+	Twin twin(Transport::SUBSTRAIT);
+	auto wire = WireForAllColumns(twin);
+
+	twin.Far("ALTER TABLE t DROP COLUMN b");
+	SECTION("by a new name") {
+		twin.Far("ALTER TABLE t ADD COLUMN d INTEGER");
+	}
+	SECTION("by the same name, now last") {
+		twin.Far("ALTER TABLE t ADD COLUMN b INTEGER");
+	}
+
+	REQUIRE_THAT(DecodeError(twin, wire), Catch::Contains("changed on the source"));
+}
+
 TEST_CASE("a read fragment arrives on the far side as the plan that was sent", "[transport]") {
 	Twin twin(Transport::NATIVE);
 	twin.Seed();
@@ -60,9 +144,40 @@ TEST_CASE("a substrait write carrying rows reads them from the seam table", "[tr
 	twin.Query("INSERT INTO far.orders VALUES (6, 'zeta', 600, 3, 6.5, NULL)");
 
 	auto &call = twin.LastWrite();
-	REQUIRE(call.wire.find("\"namedTable\":{\"names\":[\"seam\"]}") != string::npos);
+	REQUIRE(call.wire.find("\"namedTable\":{\"names\":[\"seam_") != string::npos);
 	REQUIRE(call.rows.size() == 1);
 	twin.Same("SELECT * FROM far.orders ORDER BY id");
+}
+
+TEST_CASE("a substrait read keeps the field names of a struct_pack", "[transport][struct_pack]") {
+	Twin twin(Transport::SUBSTRAIT);
+	twin.Seed();
+
+	SECTION("a field read by name") {
+		twin.Same("SELECT struct_pack(a := id, b := name).b AS v FROM far.orders ORDER BY id");
+		REQUIRE(twin.LastRead().wire.find("struct_pack") != string::npos);
+	}
+	SECTION("the whole struct") {
+		twin.Same("SELECT struct_pack(a := id, b := name) AS v FROM far.orders ORDER BY id");
+		REQUIRE(twin.LastRead().wire.find("struct_pack") != string::npos);
+	}
+	SECTION("a name that needs quoting, read by name") {
+		twin.Same("SELECT struct_pack(\"Mixed Case\" := id, \"select\" := name).\"Mixed Case\" AS v FROM far.orders "
+		          "ORDER BY id");
+		REQUIRE(twin.LastRead().wire.find("struct_pack") != string::npos);
+	}
+	SECTION("a name that needs quoting, in the whole struct") {
+		twin.Same("SELECT struct_pack(\"Mixed Case\" := id, \"select\" := name) AS v FROM far.orders ORDER BY id");
+		REQUIRE(twin.LastRead().wire.find("struct_pack") != string::npos);
+	}
+	SECTION("a struct inside a struct, read by name") {
+		twin.Same("SELECT struct_pack(a := struct_pack(x := id, y := name)).a.y AS v FROM far.orders ORDER BY id");
+		REQUIRE(twin.LastRead().wire.find("struct_pack") != string::npos);
+	}
+	SECTION("a struct inside a struct, whole") {
+		twin.Same("SELECT struct_pack(a := struct_pack(x := id, y := name)) AS v FROM far.orders ORDER BY id");
+		REQUIRE(twin.LastRead().wire.find("struct_pack") != string::npos);
+	}
 }
 
 TEST_CASE("what the source cannot render is never offered to it", "[transport]") {

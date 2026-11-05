@@ -44,6 +44,13 @@ void ShiftIndicesOf(LogicalOperator &op, const FreshTableIndex &fresh, unordered
 	case LogicalOperatorType::LOGICAL_CHUNK_GET:
 		Shift(op.Cast<LogicalColumnDataGet>().table_index, fresh, moved);
 		break;
+	case LogicalOperatorType::LOGICAL_EMPTY_RESULT:
+		for (auto &binding : op.Cast<LogicalEmptyResult>().bindings) {
+			if (moved.find(binding.table_index) == moved.end()) {
+				moved[binding.table_index] = fresh();
+			}
+		}
+		break;
 	case LogicalOperatorType::LOGICAL_DELIM_GET:
 		Shift(op.Cast<LogicalDelimGet>().table_index, fresh, moved);
 		break;

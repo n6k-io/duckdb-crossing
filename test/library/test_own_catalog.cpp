@@ -68,3 +68,14 @@ TEST_CASE("a catalog of its own reaches its source type through the attach", "[o
 	auto &attach = CrossingAttach::Of(attached.GetCatalog());
 	REQUIRE(attach.Source<FarSource>().Tables("main") == vector<string> {"t"});
 }
+
+TEST_CASE("create index in a catalog of its own is refused and the connection survives",
+          "[own_catalog][create_index]") {
+	Own own;
+
+	auto result = own.con.Query("CREATE INDEX idx ON own.t(id)");
+
+	REQUIRE(result->HasError());
+	REQUIRE_THAT(result->GetError(), Catch::Contains("CREATE INDEX"));
+	REQUIRE(own.Query("SELECT count(*) FROM own.t")->GetValue(0, 0) == Value::BIGINT(3));
+}

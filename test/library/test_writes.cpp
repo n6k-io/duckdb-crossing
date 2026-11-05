@@ -206,6 +206,125 @@ TEST_CASE("a delete of nothing hands the source nothing and reports zero", "[wri
 	REQUIRE(Scalar(twin, "SELECT count(*) FROM orders") == Value::BIGINT(5));
 }
 
+TEST_CASE("a delete whose WHERE holds an IN over one source runs wholly on the source", "[writes]") {
+	auto transport = EACH_TRANSPORT();
+	INFO(TransportName(transport));
+	Twin twin(transport);
+	twin.Seed();
+
+	auto result = twin.Query("DELETE FROM far.orders WHERE id IN (SELECT tenant FROM far.customers)");
+
+	REQUIRE(result->GetValue(0, 0) == Value::BIGINT(3));
+	auto &call = twin.LastWrite();
+	REQUIRE(call.Has(Op::LOGICAL_COMPARISON_JOIN));
+	REQUIRE(!call.Has(Op::LOGICAL_CHUNK_GET));
+	REQUIRE(twin.store->reads.empty());
+	REQUIRE(Scalar(twin, "SELECT count(*) FROM orders") == Value::BIGINT(2));
+}
+
+TEST_CASE("an update whose WHERE holds an IN over one source runs wholly on the source", "[writes]") {
+	auto transport = EACH_TRANSPORT();
+	INFO(TransportName(transport));
+	Twin twin(transport);
+	twin.Seed();
+
+	auto result = twin.Query("UPDATE far.orders SET amt = 0 WHERE id IN (SELECT tenant FROM far.customers)");
+
+	REQUIRE(result->GetValue(0, 0) == Value::BIGINT(3));
+	auto &call = twin.LastWrite();
+	REQUIRE(call.Has(Op::LOGICAL_COMPARISON_JOIN));
+	REQUIRE(!call.Has(Op::LOGICAL_CHUNK_GET));
+	REQUIRE(twin.store->reads.empty());
+	REQUIRE(Scalar(twin, "SELECT sum(amt) FROM orders") == Value::HUGEINT(700));
+}
+
+TEST_CASE("a delete with an IN returns the rows it deleted", "[writes]") {
+	auto transport = EACH_TRANSPORT();
+	INFO(TransportName(transport));
+	Twin twin(transport);
+	twin.Seed();
+
+	auto result = twin.Query("DELETE FROM far.orders WHERE id IN (SELECT tenant FROM far.customers) RETURNING id");
+
+	REQUIRE(result->RowCount() == 3);
+	REQUIRE(Scalar(twin, "SELECT count(*) FROM orders") == Value::BIGINT(2));
+}
+
+TEST_CASE("an insert fed through an IN over one source runs wholly on the source", "[writes]") {
+	auto transport = EACH_TRANSPORT();
+	INFO(TransportName(transport));
+	Twin twin(transport);
+	twin.Seed();
+
+	auto result = twin.Query(
+	    "INSERT INTO far.orders SELECT * FROM far.archive WHERE tenant NOT IN (SELECT tenant FROM far.customers)");
+
+	REQUIRE(result->GetValue(0, 0) == Value::BIGINT(1));
+	auto &call = twin.LastWrite();
+	REQUIRE(call.Has(Op::LOGICAL_COMPARISON_JOIN));
+	REQUIRE(!call.Has(Op::LOGICAL_CHUNK_GET));
+	REQUIRE(twin.store->reads.empty());
+	REQUIRE(Scalar(twin, "SELECT name FROM orders WHERE id = 9") == Value("zeta"));
+}
+
+TEST_CASE("a delete with a correlated EXISTS runs wholly on the source", "[writes]") {
+	auto transport = EACH_TRANSPORT();
+	INFO(TransportName(transport));
+	Twin twin(transport);
+	twin.Seed();
+
+	auto result =
+	    twin.Query("DELETE FROM far.orders o WHERE EXISTS (SELECT 1 FROM far.customers c WHERE c.tenant < o.tenant)");
+
+	REQUIRE(result->GetValue(0, 0) == Value::BIGINT(3));
+	REQUIRE(!twin.LastWrite().Has(Op::LOGICAL_CHUNK_GET));
+	REQUIRE(twin.store->reads.empty());
+	REQUIRE(Scalar(twin, "SELECT count(*) FROM orders") == Value::BIGINT(2));
+}
+
+TEST_CASE("an update with a correlated EXISTS runs wholly on the source", "[writes]") {
+	auto transport = EACH_TRANSPORT();
+	INFO(TransportName(transport));
+	Twin twin(transport);
+	twin.Seed();
+
+	auto result = twin.Query(
+	    "UPDATE far.orders o SET amt = 0 WHERE EXISTS (SELECT 1 FROM far.customers c WHERE c.tenant < o.tenant)");
+
+	REQUIRE(result->GetValue(0, 0) == Value::BIGINT(3));
+	REQUIRE(!twin.LastWrite().Has(Op::LOGICAL_CHUNK_GET));
+	REQUIRE(twin.store->reads.empty());
+	REQUIRE(Scalar(twin, "SELECT sum(amt) FROM orders") == Value::HUGEINT(200));
+}
+
+TEST_CASE("an insert fed by a CTE runs wholly on the source", "[writes]") {
+	auto transport = EACH_TRANSPORT();
+	INFO(TransportName(transport));
+	Twin twin(transport);
+	twin.Seed();
+
+	auto result = twin.Query("INSERT INTO far.orders WITH x AS MATERIALIZED (SELECT * FROM far.archive) "
+	                         "SELECT a.* FROM x a JOIN x e ON a.id = e.id");
+
+	REQUIRE(result->GetValue(0, 0) == Value::BIGINT(1));
+	REQUIRE(!twin.LastWrite().Has(Op::LOGICAL_CHUNK_GET));
+	REQUIRE(twin.store->reads.empty());
+	REQUIRE(Scalar(twin, "SELECT name FROM orders WHERE id = 9") == Value("zeta"));
+}
+
+TEST_CASE("an insert fed by a CTE over a sample writes the rows both references read", "[writes]") {
+	auto transport = EACH_TRANSPORT();
+	INFO(TransportName(transport));
+	Twin twin(transport);
+	twin.Seed();
+
+	auto result = twin.Query("INSERT INTO far.archive WITH x AS MATERIALIZED (SELECT * FROM far.orders USING SAMPLE 2) "
+	                         "SELECT a.* FROM x a JOIN x e ON a.id = e.id");
+
+	REQUIRE(result->GetValue(0, 0) == Value::BIGINT(2));
+	REQUIRE(Scalar(twin, "SELECT count(*) FROM archive") == Value::BIGINT(3));
+}
+
 TEST_CASE("a key that identifies more than one source row fails the write and rolls it back", "[writes]") {
 	auto transport = EACH_TRANSPORT();
 	INFO(TransportName(transport));
@@ -487,4 +606,53 @@ TEST_CASE("each statement outside a transaction is its own session on the source
 	twin.Query("SELECT count(*) FROM far.orders");
 
 	REQUIRE(twin.store->transaction_ends == vector<string> {"commit", "commit"});
+}
+
+TEST_CASE("a conflict clause on an undeclared key is refused and changes nothing", "[writes][on_conflict]") {
+	auto transport = EACH_TRANSPORT();
+	auto sql =
+	    GENERATE(as<string> {}, "INSERT INTO far.orders (id, amt) VALUES (1, 0) ON CONFLICT DO NOTHING",
+	             "INSERT INTO far.orders (id, amt) VALUES (1, 0) ON CONFLICT (id) DO NOTHING",
+	             "INSERT OR IGNORE INTO far.orders (id, amt) VALUES (1, 0)",
+	             "INSERT OR REPLACE INTO far.orders (id, amt) VALUES (1, 0)",
+	             "INSERT INTO far.orders (id, amt) VALUES (1, 0) ON CONFLICT (id) DO UPDATE SET amt = excluded.amt");
+	INFO(TransportName(transport) << " " << sql);
+	Twin twin(transport);
+	twin.Seed();
+
+	REQUIRE_THAT(twin.Error(sql), Catch::Contains("UNIQUE/PRIMARY KEY"));
+
+	REQUIRE(twin.store->writes.empty());
+	REQUIRE(Scalar(twin, "SELECT count(*) FROM orders") == Value::BIGINT(5));
+	REQUIRE(Scalar(twin, "SELECT amt FROM orders WHERE id = 1") == Value::INTEGER(50));
+}
+
+TEST_CASE("a conflict clause on a declared key leaves the rows the source itself would", "[writes][on_conflict]") {
+	auto transport = EACH_TRANSPORT();
+	auto sql =
+	    GENERATE(as<string> {}, "INSERT INTO far.orders (id, amt) VALUES (1, 0) ON CONFLICT DO NOTHING",
+	             "INSERT INTO far.orders (id, amt) VALUES (1, 0) ON CONFLICT (id) DO NOTHING",
+	             "INSERT OR IGNORE INTO far.orders (id, amt) VALUES (1, 0)",
+	             "INSERT OR REPLACE INTO far.orders (id, amt) VALUES (1, 0)",
+	             "INSERT INTO far.orders (id, amt) VALUES (1, 0) ON CONFLICT (id) DO UPDATE SET amt = excluded.amt",
+	             "INSERT INTO far.orders (id, amt) VALUES (1, 7) ON CONFLICT (id) DO UPDATE SET amt = orders.amt + "
+	             "excluded.amt",
+	             "INSERT INTO far.orders (id, amt) VALUES (1, 0) ON CONFLICT (id) DO UPDATE SET amt = excluded.amt "
+	             "WHERE orders.amt > 1000",
+	             "INSERT INTO far.orders (id, amt) VALUES (1, 0), (6, 600) ON CONFLICT (id) DO UPDATE SET amt = "
+	             "excluded.amt",
+	             "INSERT INTO far.orders (id, amt) VALUES (1, 0), (6, 600) ON CONFLICT DO NOTHING");
+	INFO(TransportName(transport) << " " << sql);
+	const string rows = "SELECT string_agg(o::VARCHAR, ';' ORDER BY id) FROM orders o";
+
+	Twin plain(transport);
+	plain.Seed();
+	plain.Far(Twin::Unprefixed(sql));
+
+	Twin twin(transport);
+	twin.store->declare_key_constraints = true;
+	twin.Seed();
+	twin.Query(sql);
+
+	REQUIRE(Scalar(twin, rows) == Scalar(plain, rows));
 }

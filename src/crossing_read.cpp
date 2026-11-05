@@ -41,6 +41,8 @@ bool PlanIsOrdered(const LogicalOperator &op) {
 	case LogicalOperatorType::LOGICAL_FILTER:
 	case LogicalOperatorType::LOGICAL_LIMIT:
 		return !op.children.empty() && PlanIsOrdered(*op.children[0]);
+	case LogicalOperatorType::LOGICAL_MATERIALIZED_CTE:
+		return PlanIsOrdered(*op.children[1]);
 	default:
 		return false;
 	}

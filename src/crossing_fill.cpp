@@ -5,6 +5,7 @@
 #include "internal/fill.hpp"
 #include "internal/source_evaluation.hpp"
 
+#include "duckdb/main/settings.hpp"
 #include "duckdb/parser/column_definition.hpp"
 #include "duckdb/parser/parsed_data/create_table_info.hpp"
 #include "duckdb/planner/expression/bound_cast_expression.hpp"
@@ -85,7 +86,8 @@ void FillFromFeed(ClientContext &context, unique_ptr<LogicalOperator> &node, Cro
                   unique_ptr<LogicalOperator> feed, const SeamObstacle &stop, bool returning,
                   vector<idx_t> key_positions, const FreshTableIndex &fresh) {
 	auto table_index = TableIndexOf(*node);
-	auto fill = FillSeamFromFeed(std::move(feed), *fragment, table.source, stop, fresh);
+	auto fill = FillSeamFromFeed(std::move(feed), *fragment, table.source, stop, fresh,
+	                             Settings::Get<ScalarSubqueryErrorOnMultipleRowsSetting>(context));
 	auto write = MakeWriteBindData(table, verb, std::move(seam), std::move(fragment));
 	if (!fill.remainder) {
 		node = MakeFence(table_index, std::move(write));

@@ -643,6 +643,13 @@ PhysicalOperator &CrossingWriteCatalog::PlanMergeInto(ClientContext &context, Ph
 	return result;
 }
 
+// The base implementation casts the scan's bind data to TableScanBindData and writes through it.
+unique_ptr<LogicalOperator> CrossingWriteCatalog::BindCreateIndex(Binder &, CreateStatement &, TableCatalogEntry &table,
+                                                                  unique_ptr<LogicalOperator>) {
+	throw BinderException("crossing: '%s' is served by a source; CREATE INDEX is not supported",
+	                      table.name.GetIdentifierName());
+}
+
 void CrossingWriteState::SeeKey(DataChunk &chunk, const vector<idx_t> &key_positions, idx_t index) {
 	child_list_t<Value> key;
 	for (idx_t k = 0; k < key_positions.size(); k++) {

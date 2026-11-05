@@ -229,7 +229,7 @@ CrossingFeed FeedOf(LogicalOperator &write, const vector<column_t> &key_columns,
 }
 
 SeamFill FillSeamFromFeed(unique_ptr<LogicalOperator> feed, CrossingFragment &fragment, CrossingSource &source,
-                          const SeamObstacle &stop, const FreshTableIndex &fresh) {
+                          const SeamObstacle &stop, const FreshTableIndex &fresh, bool single_joins_cross) {
 	auto &identity = source.Identity();
 	if (!fragment.HasSeam()) {
 		throw InternalException("crossing: the fragment has no seam to fill");
@@ -239,7 +239,7 @@ SeamFill FillSeamFromFeed(unique_ptr<LogicalOperator> feed, CrossingFragment &fr
 	auto seam_index = (*slot)->Cast<LogicalGet>().table_index;
 
 	SplitFiltersAgainst(feed, source);
-	auto labels = LabelSubtreesUnder(*feed, source);
+	auto labels = LabelSubtreesUnder(*feed, source, single_joins_cross);
 
 	SeamFill fill;
 	unique_ptr<LogicalOperator> *cursor = &feed;

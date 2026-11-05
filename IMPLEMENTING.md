@@ -167,11 +167,19 @@ carrying it on the target.
 
 - `AcceptsCall` — asked per call, operator, aggregate and window expression.
   Column refs, constants, comparisons, `AND`/`OR`, casts, `BETWEEN`, `CASE`,
-  `UNNEST` pass without asking. Subqueries, lambdas, volatile and inconsistent
-  expressions never cross.
+  `UNNEST` pass without asking. Lambdas, volatile and inconsistent expressions
+  never cross.
 - `AcceptsType` — asked about the type of every expression that would move,
   except a bare reference to a described column.
-- `AcceptsOperator` — asked per operator after its expressions passed.
+- `AcceptsOperator` — asked per operator after its expressions passed, except
+  `CHUNK_GET` and `EMPTY_RESULT`, which are never asked about. A subquery
+  is asked about as the operators DuckDB plans it to, such as `MARK` and `SINGLE`
+  joins and materialized CTEs. A CTE ref is asked about only when its definition
+  reads no source. A yes on a `SINGLE` join claims the source raises the multi-row
+  error. While the target's `scalar_subquery_error_on_multiple_rows` is off, a
+  `SINGLE` join is not asked about: it stays on the target in a read or write, and
+  `CREATE VIEW` refuses a body holding one. A view is judged only when created, so
+  turning the setting off later leaves its join on the source.
 
 A yes claims the source computes the expression as DuckDB does.
 
@@ -289,6 +297,10 @@ for (auto &use : CrossingTablesOf(*plan)) { ... }
 
 The receiver is a DuckDB instance of the same commit with
 `RegisterCrossingPlanFunctions(db)` called; `context` has a transaction open.
+
+Rendered as Substrait, a plan can read several seams, each as its own one-part
+table. `SubstraitSeamsOf(plan)` lists each name with its rows. Stage them and
+pass `DecodeSubstraitJson` the view holding each one.
 
 ## Transactions
 

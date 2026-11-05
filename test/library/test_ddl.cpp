@@ -325,6 +325,24 @@ TEST_CASE("view bodies that run wholly on the source", "[ddl][view]") {
 		           "o.tenant = c.tenant");
 		twin.Same("SELECT id, cname FROM far.v ORDER BY id");
 	}
+	SECTION("IN over another served table") {
+		twin.Query("CREATE VIEW far.main.v AS SELECT id FROM far.orders WHERE tenant IN (SELECT tenant FROM "
+		           "far.customers)");
+		twin.Same("SELECT id FROM far.v ORDER BY id", "SELECT id FROM orders WHERE tenant IN (SELECT tenant FROM "
+		                                              "customers) ORDER BY id");
+	}
+	SECTION("a correlated EXISTS") {
+		twin.Query("CREATE VIEW far.main.v AS SELECT id FROM far.orders o WHERE EXISTS (SELECT 1 FROM far.customers c "
+		           "WHERE c.tenant > o.tenant)");
+		twin.Same("SELECT id FROM far.v ORDER BY id", "SELECT id FROM orders o WHERE EXISTS (SELECT 1 FROM customers c "
+		                                              "WHERE c.tenant > o.tenant) ORDER BY id");
+	}
+	SECTION("a correlated scalar") {
+		twin.Query("CREATE VIEW far.main.v AS SELECT id, (SELECT cname FROM far.customers c WHERE c.tenant = o.tenant) "
+		           "AS n FROM far.orders o");
+		twin.Same("SELECT id, n FROM far.v ORDER BY id", "SELECT id, (SELECT cname FROM customers c WHERE c.tenant = "
+		                                                 "o.tenant) AS n FROM orders o ORDER BY id");
+	}
 	SECTION("aggregate") {
 		twin.Query("CREATE VIEW far.main.v AS SELECT tenant, sum(amt) AS total FROM far.orders GROUP BY tenant");
 		twin.Same("SELECT tenant, total FROM far.v ORDER BY tenant");
@@ -452,4 +470,18 @@ TEST_CASE("a source view with an alias list is read under its aliases", "[ddl][v
 	twin.Query("DETACH far");
 	twin.Attach();
 	twin.Same("SELECT a, b FROM far.aliased ORDER BY a");
+}
+
+TEST_CASE("create index on a served table is refused and the connection survives", "[ddl][create_index]") {
+	auto sql =
+	    GENERATE(as<string> {}, "CREATE INDEX idx ON far.orders(id)", "CREATE UNIQUE INDEX idx ON far.orders(id)",
+	             "CREATE INDEX IF NOT EXISTS idx ON far.orders(id)");
+	INFO(sql);
+	Twin twin(Transport::NATIVE);
+	twin.Seed();
+
+	REQUIRE_THAT(twin.Error(sql), Catch::Contains("not supported"));
+
+	REQUIRE(twin.store->ddls.empty());
+	twin.Same("SELECT count(*) FROM far.orders");
 }

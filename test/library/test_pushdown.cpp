@@ -164,6 +164,350 @@ TEST_CASE("a join of two tables of one source is one query on the source", "[pus
 	REQUIRE(call.rows.size() == 4);
 }
 
+TEST_CASE("an IN over one source's tables is one query on the source", "[pushdown]") {
+	auto transport = EACH_TRANSPORT();
+	INFO(TransportName(transport));
+	Twin twin(transport);
+	twin.Seed();
+
+	twin.Same("SELECT id FROM far.orders WHERE tenant IN (SELECT tenant FROM far.customers WHERE cname <> 'acme') "
+	          "ORDER BY id");
+
+	REQUIRE(twin.store->reads.size() == 1);
+	auto &call = twin.LastRead();
+	REQUIRE(HasJoin(call));
+	REQUIRE(call.tables.size() == 2);
+	REQUIRE(call.rows.size() == 2);
+}
+
+TEST_CASE("an IN beside another condition is one query on the source", "[pushdown]") {
+	auto transport = EACH_TRANSPORT();
+	INFO(TransportName(transport));
+	Twin twin(transport);
+	twin.Seed();
+
+	twin.Same("SELECT id FROM far.orders WHERE amt > 100 AND tenant IN (SELECT tenant FROM far.customers) ORDER BY id");
+
+	REQUIRE(twin.store->reads.size() == 1);
+	auto &call = twin.LastRead();
+	REQUIRE(HasJoin(call));
+	REQUIRE(call.tables.size() == 2);
+	REQUIRE(call.rows.size() == 3);
+}
+
+TEST_CASE("an IN over a table the target holds keeps the join on the target", "[pushdown]") {
+	auto transport = EACH_TRANSPORT();
+	INFO(TransportName(transport));
+	Twin twin(transport);
+	twin.Seed();
+	twin.Both("CREATE TABLE regions(tenant INTEGER)");
+	twin.Both("INSERT INTO regions VALUES (1), (2)");
+
+	twin.Same("SELECT id FROM far.orders WHERE tenant IN (SELECT tenant FROM regions) ORDER BY id");
+
+	REQUIRE(twin.store->reads.size() == 1);
+	REQUIRE(!HasJoin(twin.LastRead()));
+}
+
+TEST_CASE("an IN whose NULL result matters answers as the source would", "[pushdown]") {
+	auto transport = EACH_TRANSPORT();
+	INFO(TransportName(transport));
+	Twin twin(transport);
+	twin.Seed();
+
+	auto names = string("(SELECT name FROM far.orders WHERE id > 3)");
+	twin.Same("SELECT id FROM far.orders WHERE name IN " + names + " ORDER BY id");
+	twin.Same("SELECT id FROM far.orders WHERE name NOT IN " + names + " ORDER BY id");
+	twin.Same("SELECT id, name IN " + names + " FROM far.orders ORDER BY id");
+	twin.Same("SELECT id FROM far.orders WHERE (name IN " + names + ") IS NULL ORDER BY id");
+	twin.Same("SELECT id FROM far.orders WHERE id = 1 OR name IN " + names + " ORDER BY id");
+
+	REQUIRE(twin.store->reads.size() == 5);
+}
+
+TEST_CASE("two INs over one source's tables are one query on the source", "[pushdown]") {
+	auto transport = EACH_TRANSPORT();
+	INFO(TransportName(transport));
+	Twin twin(transport);
+	twin.Seed();
+
+	twin.Same("SELECT id FROM far.orders WHERE tenant IN (SELECT tenant FROM far.customers) "
+	          "AND id IN (SELECT tenant FROM far.customers WHERE cname <> 'globex') ORDER BY id");
+
+	REQUIRE(twin.store->reads.size() == 1);
+	auto &call = twin.LastRead();
+	REQUIRE(call.tables.size() == 3);
+	REQUIRE(call.rows.size() == 2);
+}
+
+TEST_CASE("an IN over several columns is one query on the source", "[pushdown]") {
+	auto transport = EACH_TRANSPORT();
+	INFO(TransportName(transport));
+	Twin twin(transport);
+	twin.Seed();
+
+	twin.Same("SELECT o.id FROM far.orders o WHERE (o.tenant, o.amt) IN "
+	          "(SELECT i.tenant, i.amt FROM far.orders i WHERE i.amt > 100) ORDER BY o.id");
+
+	REQUIRE(twin.store->reads.size() == 1);
+	auto &call = twin.LastRead();
+	REQUIRE(call.tables.size() == 2);
+	REQUIRE(call.rows.size() == 4);
+}
+
+TEST_CASE("a comparison with ANY or ALL over one source's tables is one query on the source", "[pushdown]") {
+	auto sql = GENERATE(as<string> {},
+	                    "SELECT id FROM far.orders WHERE amt > ANY (SELECT tenant FROM far.customers) "
+	                    "ORDER BY id",
+	                    "SELECT id FROM far.orders WHERE amt > ALL (SELECT tenant FROM far.customers) ORDER BY id",
+	                    "SELECT id FROM far.orders WHERE tenant <> ANY (SELECT tenant FROM far.customers) ORDER BY id",
+	                    "SELECT id FROM far.orders WHERE tenant = ALL (SELECT tenant FROM far.customers) ORDER BY id");
+	auto transport = EACH_TRANSPORT();
+	INFO(TransportName(transport));
+	Twin twin(transport);
+	twin.Seed();
+
+	twin.Same(sql);
+
+	REQUIRE(twin.store->reads.size() == 1);
+	REQUIRE(twin.LastRead().tables.size() == 2);
+}
+
+TEST_CASE("an IN crosses when a filter beside it stays on the target", "[pushdown]") {
+	auto transport = EACH_TRANSPORT();
+	INFO(TransportName(transport));
+	Twin twin(transport);
+	twin.store->refused_functions.insert("upper");
+	twin.Seed();
+
+	twin.Same("SELECT id FROM far.orders WHERE upper(name) = 'BETA' AND tenant IN (SELECT tenant FROM far.customers)");
+
+	REQUIRE(twin.store->reads.size() == 1);
+	auto &call = twin.LastRead();
+	REQUIRE(HasJoin(call));
+	REQUIRE(!call.Mentions("upper"));
+	REQUIRE(call.tables.size() == 2);
+	REQUIRE(call.rows.size() == 4);
+}
+
+TEST_CASE("two VALUES lists in one plan each read their own rows", "[pushdown]") {
+	auto transport = EACH_TRANSPORT();
+	INFO(TransportName(transport));
+	Twin twin(transport);
+	twin.Seed();
+
+	twin.Same(
+	    "SELECT id FROM far.orders WHERE tenant IN (VALUES (1), (2)) AND id IN (VALUES (2), (3), (5)) ORDER BY id");
+	twin.Same("SELECT o.id FROM far.orders o JOIN (VALUES (1), (2)) t(x) ON o.tenant = t.x "
+	          "JOIN (VALUES (2), (3), (5)) u(y) ON o.id = u.y ORDER BY o.id");
+}
+
+TEST_CASE("a NOT IN or an IN read as a value over one source's tables is one query on the source", "[pushdown]") {
+	auto sql = GENERATE(
+	    as<string> {},
+	    "SELECT id FROM far.orders WHERE tenant NOT IN (SELECT tenant FROM far.customers WHERE cname <> 'acme') "
+	    "ORDER BY id",
+	    "SELECT id, tenant IN (SELECT tenant FROM far.customers WHERE cname <> 'acme') FROM far.orders ORDER BY id");
+	auto transport = EACH_TRANSPORT();
+	INFO(TransportName(transport));
+	Twin twin(transport);
+	twin.Seed();
+
+	twin.Same(sql);
+
+	REQUIRE(twin.store->reads.size() == 1);
+	REQUIRE(twin.LastRead().tables.size() == 2);
+}
+
+TEST_CASE("a correlated subquery over one source's tables is one query on the source", "[pushdown]") {
+	auto sql = GENERATE(
+	    as<string> {},
+	    "SELECT id FROM far.orders o WHERE EXISTS (SELECT 1 FROM far.customers c WHERE c.tenant = o.tenant) ORDER BY "
+	    "id",
+	    "SELECT id FROM far.orders o WHERE NOT EXISTS (SELECT 1 FROM far.customers c WHERE c.tenant = o.tenant) "
+	    "ORDER BY id",
+	    "SELECT id FROM far.orders o WHERE EXISTS (SELECT 1 FROM far.customers c WHERE c.tenant > o.tenant) ORDER BY "
+	    "id",
+	    "SELECT id FROM far.orders o WHERE tenant IN (SELECT tenant FROM far.customers c WHERE c.tenant < o.amt) "
+	    "ORDER BY id",
+	    "SELECT id FROM far.orders o WHERE tenant NOT IN (SELECT tenant FROM far.customers c WHERE c.tenant < o.amt) "
+	    "ORDER BY id",
+	    "SELECT id, (SELECT cname FROM far.customers c WHERE c.tenant = o.tenant) FROM far.orders o ORDER BY id");
+	auto transport = EACH_TRANSPORT();
+	INFO(TransportName(transport));
+	Twin twin(transport);
+	twin.Seed();
+
+	twin.Same(sql);
+
+	REQUIRE(twin.store->reads.size() == 1);
+	REQUIRE(twin.LastRead().tables.size() == 2);
+}
+
+TEST_CASE("a correlated NOT IN answers each outer row by its own group's NULLs", "[pushdown]") {
+	auto transport = EACH_TRANSPORT();
+	INFO(TransportName(transport));
+	Twin twin(transport);
+	twin.Seed();
+
+	twin.Same("SELECT id FROM far.orders o WHERE name NOT IN (SELECT i.name FROM far.orders i WHERE i.amt < o.amt) "
+	          "ORDER BY id");
+	twin.Same("SELECT id FROM far.orders o WHERE (name IN (SELECT i.name FROM far.orders i WHERE i.amt < o.amt)) "
+	          "IS NULL ORDER BY id");
+
+	REQUIRE(twin.store->reads.size() == 2);
+}
+
+TEST_CASE("a correlated scalar matching several rows fails as the source would", "[pushdown]") {
+	auto transport = EACH_TRANSPORT();
+	INFO(TransportName(transport));
+	Twin twin(transport);
+	twin.Seed();
+
+	REQUIRE_THAT(
+	    twin.Error("SELECT tenant, (SELECT o.id FROM far.orders o WHERE o.tenant = c.tenant) FROM far.customers c"),
+	    Catch::Contains("More than one row"));
+}
+
+TEST_CASE("a correlated scalar stays on a target that does not raise the multi-row error", "[pushdown]") {
+	auto transport = EACH_TRANSPORT();
+	INFO(TransportName(transport));
+	Twin twin(transport);
+	twin.Seed();
+	twin.Query("SET scalar_subquery_error_on_multiple_rows = false");
+
+	auto result =
+	    twin.Query("SELECT tenant, (SELECT o.id FROM far.orders o WHERE o.tenant = c.tenant) FROM far.customers c");
+
+	REQUIRE(result->RowCount() == 3);
+	REQUIRE(twin.store->reads.size() == 2);
+}
+
+TEST_CASE("a correlated subquery over a table the target holds keeps the join on the target", "[pushdown]") {
+	auto transport = EACH_TRANSPORT();
+	INFO(TransportName(transport));
+	Twin twin(transport);
+	twin.Seed();
+	twin.Both("CREATE TABLE regions(tenant INTEGER)");
+	twin.Both("INSERT INTO regions VALUES (2), (3)");
+
+	twin.Same(
+	    "SELECT id FROM far.orders o WHERE EXISTS (SELECT 1 FROM regions r WHERE r.tenant > o.tenant) ORDER BY id");
+
+	REQUIRE(twin.store->reads.size() == 1);
+	REQUIRE(!HasJoin(twin.LastRead()));
+}
+
+TEST_CASE("a correlated subquery with a filter the source refuses reads each side apart", "[pushdown]") {
+	auto transport = EACH_TRANSPORT();
+	INFO(TransportName(transport));
+	Twin twin(transport);
+	twin.store->refused_functions.insert("upper");
+	twin.Seed();
+
+	twin.Same("SELECT id FROM far.orders o WHERE EXISTS (SELECT 1 FROM far.customers c WHERE c.tenant > o.tenant AND "
+	          "upper(c.cname) <> 'ACME') ORDER BY id");
+
+	REQUIRE(twin.store->reads.size() == 2);
+	for (auto &read : twin.store->reads) {
+		REQUIRE(!read.Mentions("upper"));
+	}
+}
+
+TEST_CASE("a CTE over one source's tables is one query on the source", "[pushdown]") {
+	auto sql =
+	    GENERATE(as<string> {},
+	             "WITH x AS MATERIALIZED (SELECT id, tenant FROM far.orders) "
+	             "SELECT a.id FROM x a JOIN x e ON a.id = e.tenant ORDER BY a.id",
+	             "WITH x AS MATERIALIZED (SELECT id FROM far.orders), y AS MATERIALIZED (SELECT id FROM x WHERE "
+	             "id > 2) SELECT x.id FROM x JOIN y ON x.id = y.id ORDER BY x.id",
+	             "WITH v(t) AS MATERIALIZED (VALUES (1), (2)) "
+	             "SELECT o.id FROM far.orders o JOIN v a ON o.tenant = a.t JOIN v e ON o.id = e.t ORDER BY o.id");
+	auto transport = EACH_TRANSPORT();
+	INFO(TransportName(transport));
+	Twin twin(transport);
+	twin.Seed();
+
+	twin.Same(sql);
+
+	REQUIRE(twin.store->reads.size() == 1);
+}
+
+TEST_CASE("a CTE reference to a sample reads the same rows every time", "[pushdown]") {
+	auto transport = EACH_TRANSPORT();
+	INFO(TransportName(transport));
+	Twin twin(transport);
+	twin.Seed();
+
+	auto result = twin.Query("WITH x AS MATERIALIZED (SELECT id FROM far.orders USING SAMPLE 2) "
+	                         "SELECT count(*) FROM x a JOIN x e ON a.id = e.id");
+
+	REQUIRE(result->GetValue(0, 0) == Value::BIGINT(2));
+	REQUIRE(twin.store->reads.size() == 1);
+}
+
+TEST_CASE("an order inside a CTE's body comes back in order across partitions", "[pushdown]") {
+	auto transport = EACH_TRANSPORT();
+	INFO(TransportName(transport));
+	Twin twin(transport);
+	twin.store->read_partitions = 4;
+	twin.Seed();
+
+	twin.Same("WITH x AS MATERIALIZED (SELECT id FROM far.orders) SELECT a.id FROM x a JOIN x e ON a.id = e.id "
+	          "ORDER BY a.id DESC");
+
+	REQUIRE(twin.store->reads.size() == 1);
+	REQUIRE(twin.LastRead().ordered);
+}
+
+TEST_CASE("a limit under a correlated subquery crosses whichever comparison it uses", "[pushdown]") {
+	auto comparison = GENERATE(as<string> {}, "=", ">");
+	auto transport = EACH_TRANSPORT();
+	INFO(TransportName(transport) << " " << comparison);
+	Twin twin(transport);
+	twin.Seed();
+
+	twin.Same("SELECT id FROM (SELECT * FROM far.orders ORDER BY id LIMIT 3) o WHERE EXISTS (SELECT 1 FROM "
+	          "far.customers c WHERE c.tenant " +
+	          comparison + " o.tenant) ORDER BY id");
+
+	REQUIRE(twin.store->reads.size() == 1);
+}
+
+TEST_CASE("stacked correlated subqueries read each table use once", "[pushdown]") {
+	auto transport = EACH_TRANSPORT();
+	INFO(TransportName(transport));
+	Twin twin(transport);
+	twin.Seed();
+
+	twin.Same("SELECT id FROM far.orders o WHERE EXISTS (SELECT 1 FROM far.customers c WHERE c.tenant > o.tenant) "
+	          "AND EXISTS (SELECT 1 FROM far.customers c WHERE c.tenant > o.amt) "
+	          "AND EXISTS (SELECT 1 FROM far.customers c WHERE c.tenant > o.id) ORDER BY id");
+
+	REQUIRE(twin.store->reads.size() == 1);
+	idx_t orders = 0;
+	for (auto &use : twin.LastRead().tables) {
+		orders += use.table == "orders" ? 1 : 0;
+	}
+	REQUIRE(orders == 1);
+}
+
+TEST_CASE("a correlated count and a lateral are one query on the source", "[pushdown]") {
+	auto sql = GENERATE(
+	    as<string> {},
+	    "SELECT id, (SELECT count(*) FROM far.customers c WHERE c.tenant > o.tenant) FROM far.orders o ORDER BY id",
+	    "SELECT o.id, l.n FROM far.orders o, LATERAL (SELECT count(*) AS n FROM far.customers c WHERE c.tenant > "
+	    "o.tenant) l ORDER BY o.id");
+	auto transport = EACH_TRANSPORT();
+	INFO(TransportName(transport));
+	Twin twin(transport);
+	twin.Seed();
+
+	twin.Same(sql);
+
+	REQUIRE(twin.store->reads.size() == 1);
+}
+
 TEST_CASE("a join with a table the target holds keeps the join on the target", "[pushdown]") {
 	auto transport = EACH_TRANSPORT();
 	INFO(TransportName(transport));

@@ -7,6 +7,7 @@
 #include "internal/fill.hpp"
 #include "internal/pass.hpp"
 
+#include "duckdb/main/settings.hpp"
 #include "duckdb/optimizer/optimizer.hpp"
 #include "duckdb/planner/binder.hpp"
 
@@ -69,7 +70,8 @@ void CrossingFoldPass(OptimizerExtensionInput &input, unique_ptr<LogicalOperator
 	FillBareWrites(input.context, plan, fresh, identity);
 	ResolveKeyAliases(*plan, identity);
 	AddRowImageForReturning(*plan, identity);
-	FoldCrossableWorkIntoFragments(plan, fresh, identity);
+	FoldCrossableWorkIntoFragments(plan, fresh, identity,
+	                               Settings::Get<ScalarSubqueryErrorOnMultipleRowsSetting>(input.context));
 	FillWrites(input.context, plan, fresh, identity);
 }
 

@@ -12,8 +12,8 @@ namespace duckdb {
 
 namespace {
 
-//! Top-down, so the first labelled node reached is the largest one: everything below it is labelled
-//! too, and folding the biggest is what leaves the least behind.
+//! Top-down, so the first labelled node reached is the largest one: folding the biggest is what leaves
+//! the least behind.
 void FoldEveryLabelledSubtree(unique_ptr<LogicalOperator> &node, const SubtreeLabels &sources,
                               const CrossingIdentity &identity, const FreshTableIndex &fresh,
                               vector<ReplacementBinding> &rewired) {
@@ -68,14 +68,14 @@ void NarrowScansToRequestedColumns(unique_ptr<LogicalOperator> &plan, const Cros
 }
 
 void FoldCrossableWorkIntoFragments(unique_ptr<LogicalOperator> &plan, const FreshTableIndex &fresh,
-                                    const CrossingIdentity &identity) {
+                                    const CrossingIdentity &identity, bool single_joins_cross) {
 	if (!PlanHoldsCrossing(*plan, identity)) {
 		return;
 	}
 	NarrowEveryFragmentToItsScan(*plan, fresh, identity);
 	PushFiltersIntoJoinBranches(plan, identity);
 	SplitFiltersAtEvaluableHalf(plan, identity);
-	auto sources = LabelSubtrees(*plan, identity);
+	auto sources = LabelSubtrees(*plan, identity, single_joins_cross);
 	vector<ReplacementBinding> rewired;
 	FoldEveryLabelledSubtree(plan, sources, identity, fresh, rewired);
 	if (!rewired.empty()) {
