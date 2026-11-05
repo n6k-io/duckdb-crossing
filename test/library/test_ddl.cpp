@@ -471,3 +471,17 @@ TEST_CASE("a source view with an alias list is read under its aliases", "[ddl][v
 	twin.Attach();
 	twin.Same("SELECT a, b FROM far.aliased ORDER BY a");
 }
+
+TEST_CASE("create index on a served table is refused and the connection survives", "[ddl][create_index]") {
+	auto sql =
+	    GENERATE(as<string> {}, "CREATE INDEX idx ON far.orders(id)", "CREATE UNIQUE INDEX idx ON far.orders(id)",
+	             "CREATE INDEX IF NOT EXISTS idx ON far.orders(id)");
+	INFO(sql);
+	Twin twin(Transport::NATIVE);
+	twin.Seed();
+
+	REQUIRE_THAT(twin.Error(sql), Catch::Contains("not supported"));
+
+	REQUIRE(twin.store->ddls.empty());
+	twin.Same("SELECT count(*) FROM far.orders");
+}

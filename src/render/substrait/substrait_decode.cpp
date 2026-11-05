@@ -69,6 +69,14 @@ string ColumnName(idx_t i) {
 	return "c" + std::to_string(i);
 }
 
+string TypeList(const vector<LogicalType> &types) {
+	string out;
+	for (auto &type : types) {
+		out += (out.empty() ? "" : ", ") + type.ToString();
+	}
+	return out;
+}
+
 string StrOf(yyjson_val *obj, const char *key) {
 	auto *val = obj ? yyjson_obj_get(obj, key) : nullptr;
 	if (!val || !yyjson_is_str(val)) {
@@ -473,6 +481,32 @@ private:
 		return out;
 	}
 
+	// Fields are positions in the schema the plan was built against, so they mean nothing against any other.
+	void RequireSchemaUnchanged(yyjson_val *read, const string &schema, const string &table,
+	                            const vector<ColumnDefinition> &columns) {
+		auto *base = Require(read, "baseSchema");
+		auto expected_names = StrArrayOf(base, "names");
+		auto *wire_types = Require(Require(base, "struct"), "types");
+		vector<LogicalType> expected_types;
+		size_t idx, max;
+		yyjson_val *type;
+		yyjson_arr_foreach(wire_types, idx, max, type) {
+			expected_types.push_back(SubstraitTypeFromJson(*conn.context, type));
+		}
+		vector<string> names;
+		vector<LogicalType> types;
+		for (auto &column : columns) {
+			names.push_back(column.Name().GetIdentifierName());
+			types.push_back(column.Type());
+		}
+		if (names != expected_names || types != expected_types) {
+			throw CatalogException("crossing: '%s.%s' changed on the source: it now has [%s] as [%s], the plan expects "
+			                       "[%s] as [%s]; refresh the attach",
+			                       schema, table, StringUtil::Join(names, ", "), TypeList(types),
+			                       StringUtil::Join(expected_names, ", "), TypeList(expected_types));
+		}
+	}
+
 	Built Read(yyjson_val *read) {
 		if (yyjson_obj_get(read, "virtualTable")) {
 			return EmptyRead(read);
@@ -494,6 +528,7 @@ private:
 			ref->SetQualifiedName(Identifier(names.size() == 3 ? names[0] : catalog),
 			                      Identifier(names[names.size() - 2]), Identifier(names.back()));
 			rel = make_shared_ptr<ViewRelation>(conn.context, std::move(ref), names.back());
+			RequireSchemaUnchanged(read, names[names.size() - 2], names.back(), rel->Columns());
 		} else {
 			throw InvalidInputException("substrait: a named table needs [schema, table]");
 		}

@@ -7,6 +7,7 @@
 #include "duckdb/main/query_result.hpp"
 #include "duckdb/main/query_parameters.hpp"
 #include "duckdb/main/relation.hpp"
+#include "duckdb/parser/constraints/unique_constraint.hpp"
 #include "duckdb/parser/parsed_data/alter_info.hpp"
 #include "duckdb/parser/parsed_data/attach_info.hpp"
 #include "duckdb/parser/parsed_data/create_info.hpp"
@@ -330,6 +331,13 @@ CrossingTable FarSource::DescribeOn(FarStore &store, Connection &con, const stri
 	}
 	auto unique = store.key_unique.find(name);
 	table.key_unique = unique != store.key_unique.end() ? unique->second : !table.key.empty();
+	if (store.declare_key_constraints && !table.key.empty()) {
+		vector<Identifier> key_columns;
+		for (auto &column : table.key) {
+			key_columns.emplace_back(column);
+		}
+		table.constraints.push_back(make_uniq<UniqueConstraint>(std::move(key_columns), true));
+	}
 	auto verbs = store.verbs.find(name);
 	if (verbs != store.verbs.end()) {
 		table.verbs = verbs->second;

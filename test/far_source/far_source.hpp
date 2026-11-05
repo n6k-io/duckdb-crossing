@@ -98,6 +98,7 @@ struct FarStore {
 	vector<LogicalOperatorType> refused_operators;
 	case_insensitive_map_t<vector<string>> keys;
 	case_insensitive_map_t<bool> key_unique;
+	bool declare_key_constraints = false;
 	case_insensitive_map_t<vector<CrossingVerb>> verbs;
 	case_insensitive_map_t<vector<CrossingVerb>> schema_verbs;
 	string declined;
