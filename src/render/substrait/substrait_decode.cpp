@@ -404,7 +404,8 @@ private:
 		};
 	}
 
-	//! Everything built emits c0..c(width-1), so a parent never needs it bound to name its columns.
+	//! Everything a parent reads emits c0..c(width-1), so a parent never needs it bound to name its columns.
+	//! A width-0 read still emits one unnamed NULL, which no parent names.
 	struct Built {
 		unique_ptr<QueryNode> node;
 		idx_t width = 0;

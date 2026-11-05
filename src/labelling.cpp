@@ -117,7 +117,8 @@ SubtreeLabel LabelSubtree(LogicalOperator &op, LabelRun &run, optional_ptr<Cross
 	if (RuleKindFor(op.type) == RuleKind::NONE) {
 		return {};
 	}
-	// The multi-row error is the setting of whoever runs the join, and the plan does not carry it.
+	// A SINGLE join crosses only where the target raises the multi-row error, and the source must raise
+	// it too: whoever runs the join reads the setting, and the plan does not carry it.
 	if (!run.single_joins_cross && IsSingleJoin(op)) {
 		return {};
 	}
