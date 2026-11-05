@@ -149,6 +149,37 @@ TEST_CASE("a substrait write carrying rows reads them from the seam table", "[tr
 	twin.Same("SELECT * FROM far.orders ORDER BY id");
 }
 
+TEST_CASE("a substrait read keeps the field names of a struct_pack", "[transport][struct_pack]") {
+	Twin twin(Transport::SUBSTRAIT);
+	twin.Seed();
+
+	SECTION("a field read by name") {
+		twin.Same("SELECT struct_pack(a := id, b := name).b AS v FROM far.orders ORDER BY id");
+		REQUIRE(twin.LastRead().wire.find("struct_pack") != string::npos);
+	}
+	SECTION("the whole struct") {
+		twin.Same("SELECT struct_pack(a := id, b := name) AS v FROM far.orders ORDER BY id");
+		REQUIRE(twin.LastRead().wire.find("struct_pack") != string::npos);
+	}
+	SECTION("a name that needs quoting, read by name") {
+		twin.Same("SELECT struct_pack(\"Mixed Case\" := id, \"select\" := name).\"Mixed Case\" AS v FROM far.orders "
+		          "ORDER BY id");
+		REQUIRE(twin.LastRead().wire.find("struct_pack") != string::npos);
+	}
+	SECTION("a name that needs quoting, in the whole struct") {
+		twin.Same("SELECT struct_pack(\"Mixed Case\" := id, \"select\" := name) AS v FROM far.orders ORDER BY id");
+		REQUIRE(twin.LastRead().wire.find("struct_pack") != string::npos);
+	}
+	SECTION("a struct inside a struct, read by name") {
+		twin.Same("SELECT struct_pack(a := struct_pack(x := id, y := name)).a.y AS v FROM far.orders ORDER BY id");
+		REQUIRE(twin.LastRead().wire.find("struct_pack") != string::npos);
+	}
+	SECTION("a struct inside a struct, whole") {
+		twin.Same("SELECT struct_pack(a := struct_pack(x := id, y := name)) AS v FROM far.orders ORDER BY id");
+		REQUIRE(twin.LastRead().wire.find("struct_pack") != string::npos);
+	}
+}
+
 TEST_CASE("what the source cannot render is never offered to it", "[transport]") {
 	auto transport = EACH_TRANSPORT();
 	INFO(TransportName(transport));

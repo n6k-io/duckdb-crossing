@@ -296,6 +296,17 @@ private:
 		if (name == "coalesce") {
 			return make_uniq<OperatorExpression>(ExpressionType::OPERATOR_COALESCE, std::move(args));
 		}
+		if (name == "struct_pack") {
+			auto type = SubstraitTypeFromJson(*conn.context, Require(node, "outputType"));
+			auto &fields = StructType::GetChildTypes(type);
+			if (fields.size() != args.size()) {
+				throw InvalidInputException("substrait: struct_pack has %llu arguments and %llu fields", args.size(),
+				                            fields.size());
+			}
+			for (idx_t i = 0; i < args.size(); i++) {
+				args[i]->SetAlias(Identifier(fields[i].first));
+			}
+		}
 		return make_uniq<FunctionExpression>(Identifier(DuckDBFunctionName(name)), std::move(args));
 	}
 
