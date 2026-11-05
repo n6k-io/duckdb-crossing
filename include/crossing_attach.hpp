@@ -53,8 +53,8 @@ public:
 	bool ServesSchema(const string &schema);
 	bool ServesTable(const string &schema, const string &table, optional_ptr<Transaction> transaction);
 	//! Forgets what the source listed and described; the next lookup asks again. Entries already
-	//! handed out stay alive for the life of the attach. Never blocks on a lookup in progress, so it
-	//! is safe from the thread that delivers that lookup's reply; that lookup returns what it fetched.
+	//! handed out stay valid (SchemaState::retired). Never blocks on a lookup in progress, so it is
+	//! safe from the thread that delivers that lookup's reply; that lookup returns what it fetched.
 	void Refresh();
 	//! The same for one schema. The schema list itself is kept.
 	void Refresh(const string &schema);
@@ -80,7 +80,6 @@ public:
 	PhysicalOperator &PlanCreateTableAs(ClientContext &context, PhysicalPlanGenerator &planner, LogicalCreateTable &op,
 	                                    PhysicalOperator &plan);
 
-	//! The source's side of `transaction`, begun on first use.
 	CrossingSession &Session(ClientContext &context, Transaction &transaction);
 	//! Hands the source's side back; null when the transaction never touched the source. Call this
 	//! before a base transaction manager frees `transaction`, and hand the result to Commit or
@@ -127,7 +126,9 @@ private:
 
 	//! Applies queued Refresh calls. Caller holds schemas_lock.
 	void ApplyRefreshes();
+	//! Caller holds schemas_lock.
 	case_insensitive_map_t<Listing> &ListedSchemas();
+	//! Caller holds schemas_lock.
 	optional_ptr<const case_insensitive_set_t> TablesOf(const string &schema);
 	template <class F>
 	auto WithTables(const string &schema, optional_ptr<Transaction> transaction, F &&f);
@@ -135,10 +136,12 @@ private:
 	void RetireCache(SchemaState &state);
 	//! Caller holds state.lock.
 	void RetireCacheLocked(SchemaState &state);
+	//! Caller holds state.lock.
 	void RetireIfStale(SchemaState &state);
 	void Retire(Slot &slot);
 	SchemaState &StateOf(const string &schema);
 	SchemaState &StateOf(const string &schema, optional_ptr<Transaction> transaction);
+	//! Caller holds state.lock.
 	CatalogEntry &GetOrDescribe(SchemaState &state, const string &schema, SchemaCatalogEntry &owner, const string &name,
 	                            optional_ptr<Transaction> transaction);
 	CrossingTable DescribeAs(const string &schema, const string &name, optional_ptr<Transaction> transaction);

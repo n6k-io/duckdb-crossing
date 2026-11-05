@@ -31,7 +31,7 @@ TEST_CASE("SELECT amt FROM memory_source() WHERE amt > 100", "[bound]") {
 
 	auto plan = env.Bind("SELECT amt FROM memory_source() WHERE amt > 100");
 
-	// The cast is not noise. This is the plan before duckdb's optimizers, so the literal has not been
+	// This is the plan before duckdb's optimizers, so the literal has not been
 	// folded to its column's type yet -- which is what a rule sees when the pass runs where it runs.
 	REQUIRE_PLAN(plan, "proj{amt} | filter{amt > CAST(100 AS INTEGER)} | crossing[proj{id, amt} | scan]");
 
@@ -164,7 +164,7 @@ TEST_CASE("SELECT a.amt FROM memory_source() a, memory_source() b WHERE a.id = b
 
 	FoldCrossableWorkIntoFragments(plan, TestIndices(), MemoryIdentity());
 
-	// One region. The right-hand scan is only read for its id, so alignment narrowed it to that.
+	// One region. The right-hand scan is only read for its id, so it is narrowed to that.
 	REQUIRE_PLAN(plan, "crossing[proj{amt} | filter{id = id} | "
 	                   "cross(proj{id, amt} | scan, proj{id} | scan)]");
 }

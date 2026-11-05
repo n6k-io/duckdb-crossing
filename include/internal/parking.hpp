@@ -13,8 +13,7 @@ struct CrossingParking : public Task {
 
 	CrossingWaker Waker();
 
-	//! Holds state.lock.
-	bool Park(StateWithBlockableTasks &state);
+	bool Park(StateWithBlockableTasks &state) DUCKDB_REQUIRES(state.lock);
 	bool Park();
 
 	void Reschedule() override;

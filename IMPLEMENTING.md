@@ -49,7 +49,7 @@ default when absent:
 | `Schemas` | one schema, `main` |
 | `DescribeSchema` | no schema allows `CREATE` |
 | `AcceptsCall` | no function, operator, aggregate or window crosses |
-| `AcceptsType` | no expression crosses |
+| `AcceptsType` | no expression crosses except a bare reference to a described column |
 | `AcceptsOperator` | every operator accepted |
 | `Detach` | nothing |
 | `Group` | the source is its own group |
@@ -60,13 +60,15 @@ default when absent:
 
 Members must be public. Neither type may be `final`. A member with the right name
 and the wrong signature fails to compile with the member, the signature wanted
-and the return type found. `test/contract/` holds wrong sources and their messages.
+and the return type found. `test/contract/` holds wrong sources; `CMakeLists.txt`
+holds the message each must produce.
 
 A source may instead derive from `CrossingSource` and `CrossingSession` directly.
 
 ## Describe
 
 Asked once per table, on first use, and kept until the attach or schema is refreshed.
+A lookup under a different `owner` asks again.
 
 ```cpp
 CrossingTable ToyDB::Describe(const string &schema, const string &name) {
@@ -84,11 +86,9 @@ CrossingTable ToyDB::Describe(const string &schema, const string &name) {
   means this order.
 - `key` — columns that identify a row. Without one, an update or delete that
   reads its rows, or a `MERGE` that updates or deletes, is a `BinderException`.
-  `key_unique = true` vouches uniqueness; only then may a keyed write run wholly
-  on the source.
-- `verbs` — a verb absent here is refused before the statement runs. The only
-  source of what a table allows. `DELETE_` has a trailing underscore. `ALTER`
-  and `DROP` go through `Session::Ddl`.
+  See `CrossingTable::key_unique`.
+- `verbs` — the only source of what a table allows; see `CrossingTable::verbs`.
+  `ALTER` and `DROP` go through `Session::Ddl`.
 - `constraints` — constraints the source enforces.
 
 `DescribeSchema(schema)` returns a `CrossingSchema` the same way; `CREATE`
@@ -122,8 +122,8 @@ through crossing.
 `ddl.plan` is the body, planned and folded as a read: floors only, the same plan
 `Session::Read` would get. A body that does not fold wholly onto the source is
 refused before the source is asked. The plan's columns are
-`CrossingViewColumnNames(view)`, in order; the plan itself names them `c0`, `c1`,
-... A source that stores views as SQL renders the plan rather than reusing
+`CrossingViewColumnNames(view)`, in order; rendered Substrait names them `c0`,
+`c1`, ... A source that stores views as SQL renders the plan rather than reusing
 `view.query`, which names the target's catalog: `DecodeSubstraitView` gives the
 body as a query with its columns named. A source that serves views lists and describes them as tables;
 `DROP VIEW` and `CREATE OR REPLACE VIEW` need `DROP` on the described view.
@@ -151,15 +151,11 @@ CrossingPlan ToyDB::Plan(const CrossingPlanRequest &request) {
 - `SELECT` — a floor: the table named, emitting one column per described
   column, in order. Crossed work is stacked on it; it is still there in `Read`.
   Row filtering may be stacked on the floor here.
-- Write — a seam node: where the rows go. `request.seam.key_columns` then
-  `set_columns` are the seam's column order: insert = row image in `Describe`
-  order; update = key then set columns; delete = key. An update that reads
-  nothing of its rows has empty `request.seam.key_columns`: its seam is its set
-  columns. A delete that reads nothing is never planned.
+- Write — a seam node: where the rows go, with the columns of `request.seam`;
+  see `CrossingSeam`. A delete that reads nothing gets no write `Plan`.
 - `CrossingPlan::Declined(reason)` refuses; the reason is in the error.
-- The plan names tables; it never scans them. A `LogicalGet` of your own storage
-  is bound to the connection that made it and cannot travel, so crossing refuses
-  a plan holding one. Bind the table where the plan runs: `BindFloors` in
+- The plan names tables and never scans them; see `RequirePlaceholderScans` in
+  `src/crossing_read.cpp`. Bind the table where the plan runs: `BindFloors` in
   `Read`, `ExecuteWrite` in `Write`. `FloorOf(node)` returns the schema and
   table named.
 - Table indices you use are yours; crossing remaps them.
@@ -182,9 +178,9 @@ A yes claims the source computes the expression as DuckDB does.
 ## Group
 
 Attaches whose sources return one non-null `Group()` cross together: a join or
-view body over them folds into one fragment, planned by whichever source owns
-its first scan. Return one group only for sources that answer `Accepts*` alike.
-A view's body must be in the group of the attach that holds the view.
+view body over them folds into one fragment, carried by its first scan. See
+`CrossingSource::Group` for what a group promises. A view's body must be in the
+group of the attach that holds the view.
 
 The fragment is read through one attach's session, so each floor must say where
 its table lives: pass `catalog` to `MakeFloorNode` when the group spans
@@ -193,9 +189,8 @@ catalogs. Substrait then names the table `[catalog, schema, table]`, and
 decoding Substrait checks those catalogs with the `check` argument of
 `DecodeSubstraitJson` / `DecodeSubstraitView`.
 
-The session is the first scan's attach's, unless the transaction has written to
-another attach in the fragment. That attach's session is used instead, so the
-read sees the write.
+For which attach's session reads the fragment, see `ReadingCatalog` in
+`src/crossing_read.cpp`.
 
 ## Read
 
@@ -212,18 +207,15 @@ CrossingScan ToySession::Read(ClientContext &, const CrossingQuery &query) {
 }
 ```
 
-`CrossingQuery`: `kind`, `plan` (unoptimized tree, run as is), `types`,
-`ordered`, `tables`, `written`, `key_columns`, `set_columns`. `plan.ToString()`
-prints it; `SerializeCrossingPlan(plan)` gives bytes.
+`CrossingQuery` is in `include/crossing.hpp`. `query.plan.ToString()` prints the
+plan; `SerializeCrossingPlan(query.plan)` gives bytes.
 
 - Called once per scan operator. The chunk must carry exactly `query.types`.
-  `Rows()` with an empty chunk ends the partition.
-- `partitions` > 1 lets DuckDB pull with that many threads; each thread opens
-  and drains one partition at a time. Together partitions produce every row
-  once. Ordering and batch indexes: see `CrossingScan` in `include/crossing.hpp`.
-- A reader with nothing yet returns `Wait()` and calls `waker.Wake()` later from
-  any thread. Wake is idempotent, safe before the pull returns and after the
-  statement ended. Each pull gets its own waker.
+  Pull outcomes: see `CrossingReadResult`.
+- `partitions` > 1 lets DuckDB pull with that many threads. Together partitions
+  produce every row once. Claiming, ordering and batch indexes: see `CrossingScan`.
+- `waker.Wake()` may come from any thread. It is idempotent, safe before the pull
+  returns and after the statement ended. Each pull gets its own waker.
 - Scan and readers are destroyed when DuckDB stops asking.
 
 ### Running the plan on a DuckDB
@@ -236,17 +228,12 @@ result->ThrowIfError();
 QueryResultStream<ChunkFormat> stream(std::move(result));
 ```
 
-`SubmitCrossingPlan` runs a bound plan as a query. Do not go through
-`LogicalPlanStatement`: DuckDB copies a statement before planning it whenever a
-`ClientContextState` can request a rebind, and that statement cannot be copied.
-Calling `Fetch` on the result itself collects every row first; move it into a
+For `SubmitCrossingPlan` and `BindFloors`, see `include/crossing.hpp`. Calling
+`Fetch` on the result itself collects every row first; move it into a
 `QueryResultStream` to stream.
 
-`BindFloors` replaces each floor with the table it names, bound on `context`,
-which must have a transaction open. The floor keeps its table index and column
-bindings, so the plan above it is untouched. A table whose columns no longer
-match the floor is a `CatalogException`. A resolver may stand something else
-in for a floor, such as a subquery with a row filter:
+A `CrossingFloorResolver` may stand something else in for a floor, such as a
+subquery with a row filter:
 
 ```cpp
 BindFloors(context, plan, "mycatalog", [&](const CrossingFloor &floor) -> unique_ptr<TableRef> {
@@ -272,12 +259,7 @@ CrossingWriter ToySession::Write(ClientContext &, const CrossingQuery &query) {
 - `Wait()` / `waker.Wake()` as for readers.
 - `Done(n)` is the rows the source changed, which DuckDB reports.
 - `RETURNING` never runs wholly on the source.
-- `query.reads_rows` is false on an update or delete with no `WHERE`, no
-  `RETURNING` and no `SET` over a column. It names no key and writes every row of
-  the table: an update's seam holds one row of values;
-  a delete takes nothing (`query.types` is empty, `query.plan` a placeholder). A source with row
-  policies can tell such a write, which needs no read of the rows, from one that
-  reads them.
+- A write that reads none of its rows: see `CrossingQuery::reads_rows`.
 
 ### Running the write on a DuckDB
 
@@ -295,13 +277,8 @@ BindFloors(context, plan, "mycatalog");
 return ExecuteWrite(context, target, std::move(plan));
 ```
 
-`ExecuteWrite` builds the INSERT, UPDATE or DELETE as parser nodes over the
-seam, binds it on `context` (a transaction must be open) and runs it, returning
-the rows changed. Keys match with `IS NOT DISTINCT FROM`. The seam is any
-`TableRef` whose columns are, by position, the key columns then the set
-columns, or a bound plan producing them; null when there are none. A shaper sees the statement before it
-binds, as `CrossingWriteStatement` with the seam's alias and column names, to
-add a row policy or a check.
+For `ExecuteWrite`, its seam and `CrossingWriteShaper`, see `include/crossing.hpp`.
+Keys match with `IS NOT DISTINCT FROM`.
 
 ### Shipping the plan
 
@@ -315,7 +292,7 @@ The receiver is a DuckDB instance of the same commit with
 
 ## Transactions
 
-`Begin` is called the first time a DuckDB transaction touches the source. Every
+`Begin` is called on a DuckDB transaction's first `Read`, `Write` or `Ddl`. Every
 `Read` and `Write` in that transaction goes through the returned session; when
 the transaction resolves, `Commit` or `Rollback` is called and the session
 destroyed. A `Commit` that throws fails the statement; nothing is undone
@@ -333,13 +310,14 @@ each other and themselves.
 
 | call | when |
 |---|---|
-| `Schemas`, `Tables`, `Describe` | once per attach (again after `Refresh`), cached; not serialized |
+| `Schemas`, `Tables`, `DescribeSchema` | cached per attach or schema, asked again after `Refresh`; serialized per attach; must not re-enter crossing |
+| `Describe` | cached per table, asked again after `Refresh`; serialized per schema; must not re-enter crossing |
 | `Plan`, `Accepts*` | binding and optimization, concurrent across statements |
 | `Begin` | once per transaction, on the thread that first needs the session (the binding thread for `Ddl`); different transactions may overlap; must not re-enter crossing |
 | `Detach` | once, DETACH thread |
 | `Session::Read` | once per scan operator; two scans of one statement may overlap on one session |
 | `CrossingScan::open` | once per partition, by the claiming thread; opens overlap |
-| reader | one thread at a time; thread may change after `WAIT`; partitions run concurrently |
+| reader | see `CrossingReader`; partitions run concurrently |
 | `Session::Write` | once per write operator; may repeat per session (`MERGE`) |
 | writer | one thread at a time until `DONE`; thread may change after `WAIT` |
 | `Session::Ddl` | once per DDL statement, on the binding thread; may repeat per session |
@@ -402,7 +380,8 @@ class MyCatalog : public DuckCatalog, public CrossingAttachOwner {
   `Transaction`; or `Commit(transaction)`/`Rollback(transaction)`.
 - `OnDetach` calls `attach.Detach(context)`.
 - `attach.Source<ToyDB>()` returns the native source.
-- Call `Crossing<ToyDB>::RegisterPass(db)` once, or nothing crosses.
+- Call `Crossing<ToyDB>::RegisterPass(db)`, or every read and write of a served
+  table fails. Repeat calls do nothing.
 
 `test/own_catalog/` is a complete example.
 

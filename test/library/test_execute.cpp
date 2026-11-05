@@ -191,7 +191,7 @@ TEST_CASE("SubmitCrossingPlan can be read as a stream", "[execute]") {
 	REQUIRE(!con.Query("SET threads = 1")->HasError());
 	con.BeginTransaction();
 
-	// Rows past the first five million raise, so only a plan that streams hands back its first chunk.
+	// Later rows raise, so only a plan that streams hands back its first chunk.
 	auto statements = con.ExtractStatements(
 	    "SELECT CASE WHEN i < 5000000 THEN i ELSE error('materialized')::BIGINT END FROM range(10000000) t(i)");
 	Planner planner(*con.context);

@@ -136,7 +136,7 @@ struct FarStore {
 	vector<CrossingWaker> kept_wakers;
 	idx_t readers_open = 0;
 	idx_t readers_closed = 0;
-	//! Runs at the start of Schemas ("schemas") and Describe ("describe"), outside `lock`.
+	//! Runs at the start of the source calls that report themselves, with the call's name, outside `lock`.
 	std::function<void(const string &call)> on_source_call;
 	//! Handed to the Substrait decode of every received plan.
 	SubstraitCatalogCheck catalog_check;

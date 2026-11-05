@@ -8,8 +8,7 @@
 namespace duckdb {
 
 //! One operator type's answer, for that node alone. Whether the subtree beneath it also crosses is
-//! the labelling's question. An operator with no rule does not cross. Silence is a refusal, never
-//! an oversight.
+//! the labelling's question. An operator with no rule does not cross.
 enum class RuleKind : uint8_t { NONE, EVALUABLE, LIMIT, ORDER, NEVER };
 
 RuleKind RuleKindFor(LogicalOperatorType type);

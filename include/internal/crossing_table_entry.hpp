@@ -17,10 +17,8 @@ public:
 	string source_schema;
 	CrossingTable described;
 
-	//! The declared key, as column positions in Describe order.
 	vector<column_t> KeyColumnIndexes() const;
 
-	//! The key column a virtual id stands for, or invalid for any other id.
 	optional_idx KeyColumnOfAlias(column_t virtual_id) const;
 
 	const ColumnList &GetColumns() const override {

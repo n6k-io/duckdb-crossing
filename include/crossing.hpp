@@ -2,7 +2,7 @@
 
 // The API a source implements. See IMPLEMENTING.md.
 //
-// Vocabulary. One word per concept, everywhere:
+// Vocabulary:
 //   crossing   the library, and a scan or write that runs on a source
 //   source     the database the implementor's type S fronts; the target is DuckDB
 //   identity   what tells one copy of crossing's nodes from another copy's
@@ -15,7 +15,7 @@
 //   floor      the source's own scan at the bottom of a read fragment; sealed once built
 //   seam       the hole in a write fragment where the rows go
 //   fence      the logical operator standing in for a write the source runs alone
-//   feed       what a fence takes rows from
+//   feed       what a write takes rows from
 //   fold       moving a read subtree into its fragment
 //   fill       moving a feed into a seam
 //   remainder  what a fill leaves on the target
@@ -62,7 +62,6 @@ struct DropInfo;
 //! DELETE_ trails an underscore: DELETE is a macro in some Windows SDK headers.
 enum class CrossingVerb : uint8_t { SELECT = 0, INSERT = 1, UPDATE = 2, DELETE_ = 3, CREATE = 4, ALTER = 5, DROP = 6 };
 
-//! Lowercase, and `delete` for DELETE_.
 const char *CrossingVerbName(CrossingVerb verb);
 
 const vector<CrossingVerb> &CrossingVerbs();
@@ -89,7 +88,9 @@ struct CrossingTable {
 	//! Source order. That order is what every column position in a query means.
 	vector<string> column_names;
 	vector<LogicalType> column_types;
-	//! A verb absent here is refused before the statement runs; the source is never asked about it.
+	//! A verb absent here is refused before the statement runs. An update or delete that reads rows
+	//! (CrossingQuery::reads_rows) also needs SELECT. With UPDATE or DELETE but no SELECT, Plan(SELECT)
+	//! is still asked at bind, since every update and delete binds a scan.
 	vector<CrossingVerb> verbs;
 	vector<string> key;
 	//! The source vouches `key` is unique. Only then may a keyed write run wholly on the source,
@@ -174,7 +175,7 @@ vector<CrossingTableUse> CrossingTablesOf(const LogicalOperator &plan);
 string SerializeCrossingPlan(const LogicalOperator &plan);
 unique_ptr<LogicalOperator> DeserializeCrossingPlan(ClientContext &context, const string &bytes);
 
-//! Makes crossing_floor and crossing_seam resolvable by name, which DeserializeCrossingPlan needs.
+//! Makes the floor and seam functions resolvable by name, which DeserializeCrossingPlan needs.
 void RegisterCrossingPlanFunctions(DatabaseInstance &db);
 
 //! What a read and a write both carry. Lives as long as the scan or writer it was handed to.
@@ -184,10 +185,9 @@ struct CrossingQuery {
 
 	//! SELECT on a read, the write verb on a write.
 	CrossingVerb kind;
-	//! Not yet optimized by DuckDB. A read is the floor with the crossed work on it, under a
-	//! projection crossing adds. A write is the statement with its seam already filled: by a plan
-	//! of yours when the rows come from this source, otherwise by the rows the target gathered. Run
-	//! it as it is.
+	//! Not yet optimized by DuckDB. A read is the crossed work on a projection crossing adds, on the
+	//! floor. A write is the statement with its seam already filled: by a plan of yours when the rows
+	//! come from this source, otherwise by the rows the target gathered. Run it as it is.
 	const LogicalOperator &plan;
 	//! The row types: what a read produces, what a write is handed.
 	vector<LogicalType> types;
@@ -201,10 +201,11 @@ struct CrossingQuery {
 	//! The columns a write sets. An insert names every column of the table, in the order Describe
 	//! declared them. An update names the columns it sets. A delete names none.
 	vector<string> set_columns;
-	//! False on an update or delete that reads nothing of the rows it writes: no WHERE, no RETURNING,
-	//! no SET over a column. It names no key columns and addresses every row of the table; the seam
-	//! carries an update's one row of values. A delete takes nothing: `types` is empty, `plan` is a
-	//! placeholder, and the statement is built with a null seam.
+	//! False on an update or delete that reads nothing of the rows it writes: no WHERE, no FROM or
+	//! USING, no RETURNING, and every SET value foldable (no column, nothing volatile). It names no key
+	//! columns and addresses every row of the table; the seam carries an update's one row of values. A
+	//! delete takes nothing: `types` is empty, `plan` is a placeholder, and the statement is built with
+	//! a null seam. A source with row policies can use this to tell such a write from one that reads.
 	bool reads_rows = true;
 };
 
@@ -214,7 +215,9 @@ unique_ptr<LogicalOperator> MakeSeamNode(vector<LogicalType> types);
 //! The rows a materialised-rows node holds: the seam the target filled, or a VALUES list.
 optional_ptr<const ColumnDataCollection> SeamRowsOf(const LogicalOperator &op);
 
-//! What stands for a floor when it is bound: a TableRef producing the floor's columns, in order.
+//! What stands for a floor when it is bound: a TableRef producing the floor's column names and types,
+//! in order, or BindFloors throws CatalogException. It must bind to a scan or a projection, or
+//! BindFloors throws InternalException. Called twice for one floor when the first ref's names differ.
 //! Null means the default, `catalog.schema.table`.
 using CrossingFloorResolver = std::function<unique_ptr<TableRef>(const CrossingFloor &)>;
 
@@ -240,8 +243,8 @@ struct CrossingWriteTarget {
 	bool reads_rows = true;
 };
 
-//! An INSERT, UPDATE or DELETE of the target reading its rows from the seam, as parser nodes. The
-//! seam is `seam_alias`, with one column per key column then set column, named `seam_columns`.
+//! An INSERT, UPDATE or DELETE of the target reading its rows from the seam, as parser nodes.
+//! `seam_alias` names the seam and `seam_columns` its columns, in BuildWriteStatement's order.
 struct CrossingWriteStatement {
 	unique_ptr<SQLStatement> statement;
 	string seam_alias;
@@ -286,7 +289,7 @@ private:
 //! DONE: the partition is exhausted. WAIT: nothing yet; call the waker's Wake() when there is and
 //! DuckDB pulls again. A reader that never wakes stalls the scan.
 //! `batch_index` places the rows in the scan's order, and is given exactly when the scan is
-//! `batch_indexed`.
+//! `batch_indexed`; otherwise the pull throws InvalidInputException.
 struct CrossingReadResult {
 	enum class Outcome : uint8_t { ROWS, DONE, WAIT };
 
@@ -313,16 +316,19 @@ struct CrossingReadResult {
 	}
 };
 
-//! One partition's rows, pulled by one thread. Fills the chunk with the next rows.
+//! One partition's rows, pulled by one thread at a time; the thread may change after a WAIT.
 using CrossingReader = std::function<CrossingReadResult(ClientContext &context, DataChunk &chunk, CrossingWaker waker)>;
 
 //! One Read. Each partition is opened once, by whichever thread claims it; partitions are claimed
 //! in increasing order and a thread drains several in turn. An ordered scan must be one partition
-//! unless `batch_indexed`. Unindexed, a partition's rows are ordered by its number.
+//! unless `batch_indexed`, or it throws InvalidInputException. Unindexed, a partition's rows are
+//! ordered by its number.
 //! `batch_indexed`: every ROWS carries a batch index, and DuckDB keeps rows in batch-index order
 //! wherever order matters. Across the scan no index is handed out after a larger one, as from one
-//! counter taken in stream order; indexes interleaved across partitions break this. One batch may
-//! span several pulls of the same reader; no two readers share one.
+//! counter taken in stream order. An index going down on one thread throws InvalidInputException,
+//! as indexes interleaved across partitions do once a thread drains a second partition; crossing
+//! checks nothing across threads. One batch may span several pulls of the same reader; no two
+//! readers share one.
 struct CrossingScan {
 	idx_t partitions = 1;
 	bool batch_indexed = false;
@@ -349,6 +355,7 @@ struct CrossingWriteResult {
 
 using CrossingWriter = std::function<CrossingWriteResult(ClientContext &context, CrossingWaker waker)>;
 
+//! `types` is key_columns then set_columns, which are as on CrossingQuery.
 struct CrossingSeam {
 	vector<string> key_columns;
 	vector<string> set_columns;

@@ -150,7 +150,6 @@ void CrossingSchemaEntry::Scan(CatalogType type, const std::function<void(Catalo
 
 optional_ptr<CatalogEntry> CrossingSchemaEntry::LookupEntry(CatalogTransaction transaction,
                                                             const EntryLookupInfo &lookup_info) {
-	// A source reports its views as tables.
 	auto type = lookup_info.GetCatalogType();
 	if (type != CatalogType::TABLE_ENTRY && type != CatalogType::VIEW_ENTRY) {
 		return nullptr;
