@@ -171,7 +171,8 @@ carrying it on the target.
   never cross.
 - `AcceptsType` — asked about the type of every expression that would move,
   except a bare reference to a described column.
-- `AcceptsOperator` — asked per operator after its expressions passed. A subquery
+- `AcceptsOperator` — asked per operator after its expressions passed, except
+  `CHUNK_GET` and `EMPTY_RESULT`, which are never asked about. A subquery
   is asked about as the operators DuckDB plans it to, such as `MARK` and `SINGLE`
   joins and materialized CTEs. A CTE ref is asked about only when its definition
   reads no source. A yes on a `SINGLE` join claims the source raises the multi-row

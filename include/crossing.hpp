@@ -212,7 +212,7 @@ struct CrossingQuery {
 unique_ptr<LogicalOperator> MakeSeamNode(idx_t table_index, vector<LogicalType> types);
 unique_ptr<LogicalOperator> MakeSeamNode(vector<LogicalType> types);
 
-//! The rows a materialised-rows node holds: the seam the target filled, or a VALUES list.
+//! The rows a CHUNK_GET holds: the seam the target filled, or a VALUES list. Null for any other operator.
 optional_ptr<const ColumnDataCollection> SeamRowsOf(const LogicalOperator &op);
 
 //! What stands for a floor when it is bound: a TableRef producing the floor's column names and types,
