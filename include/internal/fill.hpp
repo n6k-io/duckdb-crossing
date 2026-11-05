@@ -27,7 +27,7 @@ struct SeamFill {
 };
 
 SeamFill FillSeamFromFeed(unique_ptr<LogicalOperator> feed, CrossingFragment &fragment, CrossingSource &source,
-                          const SeamObstacle &stop, const FreshTableIndex &fresh);
+                          const SeamObstacle &stop, const FreshTableIndex &fresh, bool single_joins_cross = true);
 
 void MaterialiseConstantRows(ClientContext &context, unique_ptr<LogicalOperator> &node);
 

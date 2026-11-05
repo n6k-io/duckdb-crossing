@@ -101,6 +101,7 @@ TEST_CASE("what belongs to the target never crosses", "[rules]") {
 
 TEST_CASE("rows the target holds are the leaves a write may cross to", "[rules]") {
 	REQUIRE(IsMaterialisedRows(LogicalOperatorType::LOGICAL_CHUNK_GET));
+	REQUIRE(IsMaterialisedRows(LogicalOperatorType::LOGICAL_EMPTY_RESULT));
 	// A VALUES list is turned into rows when its expressions are constant; otherwise it has no rule and stays.
 	REQUIRE(!IsMaterialisedRows(LogicalOperatorType::LOGICAL_EXPRESSION_GET));
 	REQUIRE(!IsMaterialisedRows(LogicalOperatorType::LOGICAL_DUMMY_SCAN));

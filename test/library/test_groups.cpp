@@ -48,6 +48,36 @@ TEST_CASE("a join of attaches outside one group reads each apart", "[groups]") {
 	}
 }
 
+TEST_CASE("a correlated subquery across attaches in one group is one read", "[groups]") {
+	auto transport = EACH_TRANSPORT();
+	INFO(TransportName(transport));
+	Twin twin(transport);
+	twin.Seed();
+	AttachPair(twin, "g", "g");
+	twin.store->reads.clear();
+
+	twin.Same(
+	    "SELECT id FROM a.orders o WHERE EXISTS (SELECT 1 FROM b.customers c WHERE c.tenant > o.tenant) ORDER BY id",
+	    "SELECT id FROM orders o WHERE EXISTS (SELECT 1 FROM customers c WHERE c.tenant > o.tenant) ORDER BY id");
+
+	REQUIRE(twin.store->reads.size() == 1);
+}
+
+TEST_CASE("a correlated subquery across attaches outside one group reads each apart", "[groups]") {
+	auto transport = EACH_TRANSPORT();
+	INFO(TransportName(transport));
+	Twin twin(transport);
+	twin.Seed();
+	AttachPair(twin, "", "");
+	twin.store->reads.clear();
+
+	twin.Same(
+	    "SELECT id FROM a.orders o WHERE EXISTS (SELECT 1 FROM b.customers c WHERE c.tenant > o.tenant) ORDER BY id",
+	    "SELECT id FROM orders o WHERE EXISTS (SELECT 1 FROM customers c WHERE c.tenant > o.tenant) ORDER BY id");
+
+	REQUIRE(twin.store->reads.size() == 2);
+}
+
 TEST_CASE("a view over attaches in one group is accepted", "[groups][view]") {
 	auto transport = EACH_TRANSPORT();
 	Twin twin(transport);

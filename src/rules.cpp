@@ -49,6 +49,8 @@ RuleKind RuleKindFor(LogicalOperatorType type) {
 	case LogicalOperatorType::LOGICAL_UNION:
 	case LogicalOperatorType::LOGICAL_EXCEPT:
 	case LogicalOperatorType::LOGICAL_INTERSECT:
+	case LogicalOperatorType::LOGICAL_MATERIALIZED_CTE:
+	case LogicalOperatorType::LOGICAL_CTE_REF:
 		return RuleKind::EVALUABLE;
 	case LogicalOperatorType::LOGICAL_LIMIT:
 		return RuleKind::LIMIT;
@@ -92,7 +94,7 @@ RuleKind RuleKindFor(LogicalOperatorType type) {
 }
 
 bool IsMaterialisedRows(LogicalOperatorType type) {
-	return type == LogicalOperatorType::LOGICAL_CHUNK_GET;
+	return type == LogicalOperatorType::LOGICAL_CHUNK_GET || type == LogicalOperatorType::LOGICAL_EMPTY_RESULT;
 }
 
 //! Only the bound's form. VerdictOnAll judges a bound's expression.

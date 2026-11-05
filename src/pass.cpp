@@ -68,14 +68,14 @@ void NarrowScansToRequestedColumns(unique_ptr<LogicalOperator> &plan, const Cros
 }
 
 void FoldCrossableWorkIntoFragments(unique_ptr<LogicalOperator> &plan, const FreshTableIndex &fresh,
-                                    const CrossingIdentity &identity) {
+                                    const CrossingIdentity &identity, bool single_joins_cross) {
 	if (!PlanHoldsCrossing(*plan, identity)) {
 		return;
 	}
 	NarrowEveryFragmentToItsScan(*plan, fresh, identity);
 	PushFiltersIntoJoinBranches(plan, identity);
 	SplitFiltersAtEvaluableHalf(plan, identity);
-	auto sources = LabelSubtrees(*plan, identity);
+	auto sources = LabelSubtrees(*plan, identity, single_joins_cross);
 	vector<ReplacementBinding> rewired;
 	FoldEveryLabelledSubtree(plan, sources, identity, fresh, rewired);
 	if (!rewired.empty()) {

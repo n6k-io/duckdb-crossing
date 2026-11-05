@@ -267,6 +267,64 @@ TEST_CASE("an insert fed through an IN over one source runs wholly on the source
 	REQUIRE(Scalar(twin, "SELECT name FROM orders WHERE id = 9") == Value("zeta"));
 }
 
+TEST_CASE("a delete with a correlated EXISTS runs wholly on the source", "[writes]") {
+	auto transport = EACH_TRANSPORT();
+	INFO(TransportName(transport));
+	Twin twin(transport);
+	twin.Seed();
+
+	auto result =
+	    twin.Query("DELETE FROM far.orders o WHERE EXISTS (SELECT 1 FROM far.customers c WHERE c.tenant < o.tenant)");
+
+	REQUIRE(result->GetValue(0, 0) == Value::BIGINT(3));
+	REQUIRE(!twin.LastWrite().Has(Op::LOGICAL_CHUNK_GET));
+	REQUIRE(twin.store->reads.empty());
+	REQUIRE(Scalar(twin, "SELECT count(*) FROM orders") == Value::BIGINT(2));
+}
+
+TEST_CASE("an update with a correlated EXISTS runs wholly on the source", "[writes]") {
+	auto transport = EACH_TRANSPORT();
+	INFO(TransportName(transport));
+	Twin twin(transport);
+	twin.Seed();
+
+	auto result = twin.Query(
+	    "UPDATE far.orders o SET amt = 0 WHERE EXISTS (SELECT 1 FROM far.customers c WHERE c.tenant < o.tenant)");
+
+	REQUIRE(result->GetValue(0, 0) == Value::BIGINT(3));
+	REQUIRE(!twin.LastWrite().Has(Op::LOGICAL_CHUNK_GET));
+	REQUIRE(twin.store->reads.empty());
+	REQUIRE(Scalar(twin, "SELECT sum(amt) FROM orders") == Value::HUGEINT(200));
+}
+
+TEST_CASE("an insert fed by a CTE runs wholly on the source", "[writes]") {
+	auto transport = EACH_TRANSPORT();
+	INFO(TransportName(transport));
+	Twin twin(transport);
+	twin.Seed();
+
+	auto result = twin.Query("INSERT INTO far.orders WITH x AS MATERIALIZED (SELECT * FROM far.archive) "
+	                         "SELECT a.* FROM x a JOIN x e ON a.id = e.id");
+
+	REQUIRE(result->GetValue(0, 0) == Value::BIGINT(1));
+	REQUIRE(!twin.LastWrite().Has(Op::LOGICAL_CHUNK_GET));
+	REQUIRE(twin.store->reads.empty());
+	REQUIRE(Scalar(twin, "SELECT name FROM orders WHERE id = 9") == Value("zeta"));
+}
+
+TEST_CASE("an insert fed by a CTE over a sample writes the rows both references read", "[writes]") {
+	auto transport = EACH_TRANSPORT();
+	INFO(TransportName(transport));
+	Twin twin(transport);
+	twin.Seed();
+
+	auto result = twin.Query("INSERT INTO far.archive WITH x AS MATERIALIZED (SELECT * FROM far.orders USING SAMPLE 2) "
+	                         "SELECT a.* FROM x a JOIN x e ON a.id = e.id");
+
+	REQUIRE(result->GetValue(0, 0) == Value::BIGINT(2));
+	REQUIRE(Scalar(twin, "SELECT count(*) FROM archive") == Value::BIGINT(3));
+}
+
 TEST_CASE("a key that identifies more than one source row fails the write and rolls it back", "[writes]") {
 	auto transport = EACH_TRANSPORT();
 	INFO(TransportName(transport));

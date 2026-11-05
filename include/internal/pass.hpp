@@ -14,7 +14,7 @@ namespace duckdb {
 //! one node per operation, with nothing folded into a scan and nothing yet moved for the target's
 //! benefit: what crosses is optimized by whoever runs it, what stays behind by duckdb afterwards.
 void FoldCrossableWorkIntoFragments(unique_ptr<LogicalOperator> &plan, const FreshTableIndex &fresh,
-                                    const CrossingIdentity &identity);
+                                    const CrossingIdentity &identity, bool single_joins_cross = true);
 
 bool PlanHoldsCrossing(LogicalOperator &op, const CrossingIdentity &identity);
 

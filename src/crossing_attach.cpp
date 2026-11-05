@@ -1,5 +1,9 @@
 #include "crossing_attach.hpp"
 
+#include "duckdb/main/settings.hpp"
+#include "duckdb/planner/subquery/flatten_dependent_join.hpp"
+#include "duckdb/planner/subquery/recursive_dependent_join_planner.hpp"
+
 #include "internal/carrier.hpp"
 #include "internal/crossing_table_entry.hpp"
 #include "internal/crossing_write.hpp"
@@ -409,6 +413,8 @@ optional_ptr<CatalogEntry> CrossingAttach::CreateView(ClientContext &context, Tr
 	binder->SetSearchPath(owner.ParentCatalog(), owner.name);
 	auto query = info.query->Copy();
 	auto bound = binder->Bind(*query);
+	RecursiveDependentJoinPlanner::Plan(*binder, bound.plan);
+	bound.plan = FlattenDependentJoins::DecorrelateIndependent(*binder, std::move(bound.plan));
 	auto &identity = Identity();
 	FreshTableIndex fresh = [&binder]() {
 		return binder->GenerateTableIndex();
@@ -416,7 +422,8 @@ optional_ptr<CatalogEntry> CrossingAttach::CreateView(ClientContext &context, Tr
 	// No MaterialiseConstantRows: rows staged for one read cannot live on in a view, so a body holding
 	// a VALUES list does not fold and the view is refused below.
 	ResolveKeyAliases(*bound.plan, identity);
-	FoldCrossableWorkIntoFragments(bound.plan, fresh, identity);
+	FoldCrossableWorkIntoFragments(bound.plan, fresh, identity,
+	                               Settings::Get<ScalarSubqueryErrorOnMultipleRowsSetting>(context));
 	auto fragment = CrossingReadFragmentOf(*bound.plan, identity);
 	if (!fragment || fragment->frozen || CrossingSourceOf(*bound.plan, identity)->Group() != source->Group()) {
 		throw BinderException("crossing: the body of view '%s' does not run wholly on the source", view_name);

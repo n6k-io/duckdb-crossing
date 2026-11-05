@@ -172,7 +172,8 @@ carrying it on the target.
 - `AcceptsType` — asked about the type of every expression that would move,
   except a bare reference to a described column.
 - `AcceptsOperator` — asked per operator after its expressions passed. A subquery
-  planned as a comparison or any join is asked about as that join, `MARK` included.
+  is asked about as what it plans to: a join, `MARK` and `SINGLE` included, and
+  for most correlated subqueries a materialized CTE and its refs.
 
 A yes claims the source computes the expression as DuckDB does.
 
