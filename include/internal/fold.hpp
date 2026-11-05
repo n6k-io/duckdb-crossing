@@ -10,8 +10,6 @@ namespace duckdb {
 
 //! Folds a subtree that can run wholly on one group into the fragment of the crossing scan inside
 //! it, and hands back that scan to stand in the subtree's place.
-//!
-//! The caller decides the subtree is crossable -- see LabelSubtrees. This only moves it.
 unique_ptr<LogicalOperator> FoldSubtreeIntoItsFragment(unique_ptr<LogicalOperator> subtree,
                                                        const CrossingIdentity &identity);
 

@@ -95,7 +95,7 @@ bool IsMaterialisedRows(LogicalOperatorType type) {
 	return type == LogicalOperatorType::LOGICAL_CHUNK_GET;
 }
 
-//! A limit's bound is not in `expressions`, so it is checked here rather than by CanEvaluateAll.
+//! Only the bound's form. VerdictOnAll judges a bound's expression.
 bool LimitBoundsCross(LogicalOperator &op) {
 	auto &limit = op.Cast<LogicalLimit>();
 	return BoundCrosses(limit.limit_val) && BoundCrosses(limit.offset_val);

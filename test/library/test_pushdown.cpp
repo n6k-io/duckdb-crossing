@@ -372,7 +372,7 @@ TEST_CASE("a VALUES row calling a function only the target has stays on the targ
 	INFO(TransportName(transport));
 	Twin twin(transport);
 	twin.Seed();
-	// Volatile, so the planner cannot fold the call away before crossing sees it.
+	// Volatile, so crossing does not turn the VALUES list into rows.
 	ScalarFunction near_only(
 	    "near_only", vector<LogicalType> {LogicalType::VARCHAR}, LogicalType::VARCHAR,
 	    [](DataChunk &args, ExpressionState &, Vector &result) { result.Reference(args.data[0]); });

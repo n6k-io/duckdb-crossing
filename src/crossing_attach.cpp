@@ -413,8 +413,8 @@ optional_ptr<CatalogEntry> CrossingAttach::CreateView(ClientContext &context, Tr
 	FreshTableIndex fresh = [&binder]() {
 		return binder->GenerateTableIndex();
 	};
-	// No MaterialiseConstantRows: rows staged for one read cannot live on in a view, so a VALUES list
-	// keeps the body on the target.
+	// No MaterialiseConstantRows: rows staged for one read cannot live on in a view, so a body holding
+	// a VALUES list does not fold and the view is refused below.
 	ResolveKeyAliases(*bound.plan, identity);
 	FoldCrossableWorkIntoFragments(bound.plan, fresh, identity);
 	auto fragment = CrossingReadFragmentOf(*bound.plan, identity);

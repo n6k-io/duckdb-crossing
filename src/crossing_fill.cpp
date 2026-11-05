@@ -196,8 +196,7 @@ unique_ptr<LogicalOperator> OneRowOf(ClientContext &context, vector<unique_ptr<E
 	return row;
 }
 
-//! An update or delete that reads nothing of the rows it writes addresses every row of the table, so
-//! it carries no key and its source runs it unnarrowed. An update's values are worked out once, here.
+//! Builds the write CrossingQuery::reads_rows describes. An update's values are worked out once, here.
 void FillBareWrite(ClientContext &context, unique_ptr<LogicalOperator> &node, const FreshTableIndex &fresh,
                    const CrossingIdentity &identity) {
 	if (node->type != LogicalOperatorType::LOGICAL_UPDATE && node->type != LogicalOperatorType::LOGICAL_DELETE) {

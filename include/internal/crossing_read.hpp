@@ -35,7 +35,7 @@ struct CrossingBindData : public TableFunctionData, public CrossingCarrier {
 		return table.source;
 	}
 
-	//! The plan is bound against catalog entries this attach owns, and the source outlives neither.
+	//! Always rebinds, so a prepared statement keeps no plan over entries of an attach that is gone.
 	bool SupportStatementCache() const override {
 		return false;
 	}
@@ -51,10 +51,10 @@ optional_ptr<CrossingBindData> CrossingBindDataOf(LogicalGet &get, const Crossin
 
 TableFunction CrossingReadFunction();
 
-//! The plan the source returned, or the statement fails with why it declined.
+//! The plan the source returned. Throws NotImplementedException with why it declined, or
+//! InternalException if the plan holds a scan other than a floor or seam.
 unique_ptr<LogicalOperator> RequirePlan(CrossingPlan planned, CrossingVerb verb, const string &table);
 
-//! The bind data for a scan of `entry`, with its fragment built and its floor sealed.
 unique_ptr<FunctionData> MakeReadBindData(CrossingTableCatalogEntry &entry);
 
 shared_ptr<CrossingFragment> BuildScanFragment(unique_ptr<LogicalOperator> floor, const string &source_table,
@@ -90,7 +90,6 @@ struct CrossingReadGlobalState : public GlobalSourceState {
 	unique_ptr<CrossingQuery> query;
 	CrossingScan scan;
 	vector<column_t> column_ids;
-	//! Where each requested column sits in the chunk the fragment produces.
 	vector<idx_t> source_position;
 	idx_t source_column_count = 0;
 	atomic<idx_t> next_partition {0};
