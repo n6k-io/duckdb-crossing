@@ -50,6 +50,8 @@ RuleKind RuleKindFor(LogicalOperatorType type) {
 	case LogicalOperatorType::LOGICAL_EXCEPT:
 	case LogicalOperatorType::LOGICAL_INTERSECT:
 	case LogicalOperatorType::LOGICAL_MATERIALIZED_CTE:
+	// A ref has no branches: the labelling takes its answer from the definition, and asks only when
+	// that reads no source.
 	case LogicalOperatorType::LOGICAL_CTE_REF:
 		return RuleKind::EVALUABLE;
 	case LogicalOperatorType::LOGICAL_LIMIT:

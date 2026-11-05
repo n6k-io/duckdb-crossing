@@ -172,10 +172,13 @@ carrying it on the target.
 - `AcceptsType` — asked about the type of every expression that would move,
   except a bare reference to a described column.
 - `AcceptsOperator` — asked per operator after its expressions passed. A subquery
-  is asked about as the operators DuckDB plans it to, which can include `MARK` and
-  `SINGLE` joins and materialized CTEs. A CTE ref whose definition reads a source
-  is not asked about. A `SINGLE` join is not asked about and stays on the target
-  while the target's `scalar_subquery_error_on_multiple_rows` is off.
+  is asked about as the operators DuckDB plans it to, such as `MARK` and `SINGLE`
+  joins and materialized CTEs. A CTE ref is asked about only when its definition
+  reads no source. A yes on a `SINGLE` join claims the source raises the multi-row
+  error. While the target's `scalar_subquery_error_on_multiple_rows` is off, a
+  `SINGLE` join is not asked about: it stays on the target in a read or write, and
+  `CREATE VIEW` refuses a body holding one. A view is judged only when created, so
+  turning the setting off later leaves its join on the source.
 
 A yes claims the source computes the expression as DuckDB does.
 

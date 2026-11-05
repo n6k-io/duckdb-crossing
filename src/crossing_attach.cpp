@@ -413,6 +413,7 @@ optional_ptr<CatalogEntry> CrossingAttach::CreateView(ClientContext &context, Tr
 	binder->SetSearchPath(owner.ParentCatalog(), owner.name);
 	auto query = info.query->Copy();
 	auto bound = binder->Bind(*query);
+	// The Planner flattens dependent joins after binding, and this body never goes through one.
 	RecursiveDependentJoinPlanner::Plan(*binder, bound.plan);
 	bound.plan = FlattenDependentJoins::DecorrelateIndependent(*binder, std::move(bound.plan));
 	auto &identity = Identity();

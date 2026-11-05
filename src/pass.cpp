@@ -12,8 +12,8 @@ namespace duckdb {
 
 namespace {
 
-//! Top-down, so the first labelled node reached is the largest one: everything below it is labelled
-//! too, and folding the biggest is what leaves the least behind.
+//! Top-down, so the first labelled node reached is the largest one: folding the biggest is what leaves
+//! the least behind.
 void FoldEveryLabelledSubtree(unique_ptr<LogicalOperator> &node, const SubtreeLabels &sources,
                               const CrossingIdentity &identity, const FreshTableIndex &fresh,
                               vector<ReplacementBinding> &rewired) {
