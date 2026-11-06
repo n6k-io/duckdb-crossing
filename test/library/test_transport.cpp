@@ -19,7 +19,7 @@ string DecodeError(Twin &twin, const string &wire) {
 	auto &con = twin.store->con;
 	auto catalog = Collected(con.Query("SELECT current_database()"))->GetValue(0, 0).ToString();
 	try {
-		auto result = DecodeSubstraitJson(con, catalog, wire, {})->Execute();
+		auto result = DecodeSubstraitJson(con, catalog, wire)->Execute();
 		return result->HasError() ? result->GetError() : "";
 	} catch (std::exception &ex) {
 		return ex.what();
@@ -137,16 +137,77 @@ TEST_CASE("a substrait write fed by a read of the same source renders as that re
 	REQUIRE(call.rows == vector<vector<Value>> {{Value::INTEGER(2), Value::INTEGER(0)}});
 }
 
-TEST_CASE("a substrait write carrying rows reads them from the seam table", "[transport]") {
+TEST_CASE("a substrait write joining a VALUES list to a read holds the rows in the plan", "[transport]") {
+	Twin twin(Transport::SUBSTRAIT);
+	twin.Seed();
+
+	twin.Query("UPDATE far.orders SET name = v.name FROM (VALUES (2, 'changed')) v(id, name) WHERE orders.id = v.id");
+
+	auto &call = twin.LastWrite();
+	REQUIRE(!call.rows_only);
+	REQUIRE(call.wire.find("\"virtualTable\":{\"expressions\":[{") != string::npos);
+	REQUIRE(call.wire.find("\"namedTable\":{\"names\":[\"main\",\"orders\"]}") != string::npos);
+	REQUIRE(call.rows.size() == 1);
+}
+
+TEST_CASE("a substrait write of gathered rows leaves them out of the JSON", "[transport]") {
 	Twin twin(Transport::SUBSTRAIT);
 	twin.Seed();
 
 	twin.Query("INSERT INTO far.orders VALUES (6, 'zeta', 600, 3, 6.5, NULL)");
 
 	auto &call = twin.LastWrite();
-	REQUIRE(call.wire.find("\"namedTable\":{\"names\":[\"seam_") != string::npos);
+	REQUIRE(call.rows_only);
+	REQUIRE(call.wire.empty());
 	REQUIRE(call.rows.size() == 1);
 	twin.Same("SELECT * FROM far.orders ORDER BY id");
+}
+
+TEST_CASE("a substrait plan holding rows decodes from the JSON alone", "[transport][rows]") {
+	Twin twin(Transport::SUBSTRAIT);
+	twin.Seed();
+
+	twin.Same("SELECT o.id FROM far.orders o JOIN (VALUES (1), (2)) t(x) ON o.id = t.x ORDER BY o.id");
+
+	auto wire = twin.LastRead().wire;
+	REQUIRE(wire.find("\"virtualTable\":{\"expressions\":[{") != string::npos);
+	REQUIRE(wire.find("seam_") == string::npos);
+	REQUIRE(DecodeError(twin, wire) == "");
+}
+
+TEST_CASE("a substrait plan holding no rows decodes with its column types", "[transport][rows]") {
+	Twin twin(Transport::SUBSTRAIT);
+	twin.Seed();
+	twin.Query("SELECT t.x FROM far.orders o JOIN (VALUES (1, 7)) t(k, x) ON o.id = t.k");
+	auto wire = twin.LastRead().wire;
+	auto one_row = string("{\"fields\":[{\"literal\":{\"i32\":1}},{\"literal\":{\"i32\":7}}]}");
+	REQUIRE(wire.find(one_row) != string::npos);
+
+	auto &con = twin.store->con;
+	auto catalog = Collected(con.Query("SELECT current_database()"))->GetValue(0, 0).ToString();
+	auto result = Collected(DecodeSubstraitJson(con, catalog, StringUtil::Replace(wire, one_row, ""))->Execute());
+
+	REQUIRE(!result->HasError());
+	REQUIRE(result->RowCount() == 0);
+	REQUIRE(result->types == vector<LogicalType> {LogicalType::INTEGER});
+}
+
+TEST_CASE("a value in a VALUES list arrives as itself", "[transport][rows]") {
+	Twin twin(Transport::SUBSTRAIT);
+	twin.Seed();
+
+	auto value = GENERATE(as<string> {}, "NULL::INTEGER", "true", "1::TINYINT", "2::SMALLINT", "3", "4::BIGINT",
+	                      "5::HUGEINT", "1.5::FLOAT", "2.5::DOUBLE", "'nan'::FLOAT", "'inf'::FLOAT", "'nan'::DOUBLE",
+	                      "'inf'::DOUBLE", "'-inf'::DOUBLE", "12.50::DECIMAL(10,2)", "'it''s'", "'a' || chr(0) || 'z'",
+	                      "'\\x00\\xFF'::BLOB", "DATE '2024-01-01'", "TIME '12:34:56.789'",
+	                      "TIMESTAMP '2024-01-01 12:34:56.789'", "TIMESTAMPTZ '2024-01-01 12:34:56+00'",
+	                      "INTERVAL 1 DAY", "'00000000-0000-0000-0000-000000000001'::UUID", "[1, NULL, 3]",
+	                      "{'a': 1, 'z': 'it''s'}", "[{'a': [1]}]", "MAP {'k': 1}");
+	INFO(value);
+
+	twin.Same("SELECT t.x FROM far.orders o JOIN (VALUES (1, " + value + ")) t(k, x) ON o.id = t.k");
+
+	REQUIRE(twin.LastRead().wire.find("\"virtualTable\":{\"expressions\":[{") != string::npos);
 }
 
 TEST_CASE("a substrait read keeps the field names of a struct_pack", "[transport][struct_pack]") {

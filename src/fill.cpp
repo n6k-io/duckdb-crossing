@@ -11,7 +11,6 @@
 #include "duckdb/common/string_util.hpp"
 #include "duckdb/common/types/column/column_data_collection.hpp"
 #include "duckdb/execution/expression_executor.hpp"
-#include "duckdb/optimizer/column_binding_replacer.hpp"
 #include "duckdb/planner/expression/bound_columnref_expression.hpp"
 #include "duckdb/planner/operator/logical_column_data_get.hpp"
 #include "duckdb/planner/operator/logical_delete.hpp"
@@ -82,16 +81,12 @@ unique_ptr<Expression> SetValueOf(LogicalUpdate &update, idx_t i) {
 	return update.expressions[i]->Copy();
 }
 
-vector<unique_ptr<Expression>> KeysThenSetFromImage(LogicalOperator &image, const vector<column_t> &key_columns,
-                                                    const vector<PhysicalIndex> &set_columns) {
-	vector<unique_ptr<Expression>> row;
-	for (auto key : key_columns) {
-		row.push_back(RefTo(image, key));
-	}
+vector<idx_t> KeysThenSetInImage(const vector<column_t> &key_columns, const vector<PhysicalIndex> &set_columns) {
+	vector<idx_t> positions(key_columns.begin(), key_columns.end());
 	for (auto &set : set_columns) {
-		row.push_back(RefTo(image, set.index));
+		positions.push_back(set.index);
 	}
-	return row;
+	return positions;
 }
 
 CrossingFeed InsertFeed(LogicalInsert &insert, unique_ptr<LogicalOperator> feed, const FreshTableIndex &fresh) {
@@ -113,9 +108,6 @@ CrossingFeed InsertFeed(LogicalInsert &insert, unique_ptr<LogicalOperator> feed,
 	}
 	CrossingFeed result;
 	result.plan = ProjectionOver(std::move(row), std::move(feed), fresh);
-	if (insert.return_chunk) {
-		result.image = result.plan.get();
-	}
 	return result;
 }
 
@@ -150,10 +142,8 @@ CrossingFeed UpdateFeed(LogicalUpdate &update, const vector<column_t> &key_colum
 		}
 		image.push_back(Named(SetValueOf(update, set), *feed));
 	}
-	auto image_plan = ProjectionOver(std::move(image), std::move(feed), fresh);
-	result.image = image_plan.get();
-	auto seam_row = KeysThenSetFromImage(*image_plan, key_columns, update.columns);
-	result.plan = ProjectionOver(std::move(seam_row), std::move(image_plan), fresh);
+	result.plan = ProjectionOver(std::move(image), std::move(feed), fresh);
+	result.seam_positions = KeysThenSetInImage(key_columns, update.columns);
 	return result;
 }
 
@@ -175,10 +165,8 @@ CrossingFeed DeleteFeed(LogicalDelete &del, const vector<column_t> &key_columns,
 	for (idx_t i = key_count; i < del.expressions.size(); i++) {
 		image.push_back(Named(del.expressions[i]->Copy(), *feed));
 	}
-	auto image_plan = ProjectionOver(std::move(image), std::move(feed), fresh);
-	result.image = image_plan.get();
-	auto seam_row = KeysThenSetFromImage(*image_plan, key_columns, {});
-	result.plan = ProjectionOver(std::move(seam_row), std::move(image_plan), fresh);
+	result.plan = ProjectionOver(std::move(image), std::move(feed), fresh);
+	result.seam_positions = KeysThenSetInImage(key_columns, {});
 	return result;
 }
 
@@ -186,6 +174,17 @@ bool IsConstantRows(const LogicalExpressionGet &get) {
 	for (auto &row : get.expressions) {
 		for (auto &expr : row) {
 			if (!expr->IsFoldable() || !IsColumnFreeExpression(*expr)) {
+				return false;
+			}
+		}
+	}
+	return true;
+}
+
+bool IsConsistentRows(const LogicalExpressionGet &get) {
+	for (auto &row : get.expressions) {
+		for (auto &expr : row) {
+			if (!expr->IsConsistent()) {
 				return false;
 			}
 		}
@@ -210,6 +209,34 @@ string WhyItStays(LogicalOperator &node, CrossingSource &source) {
 		return name + " is not something the source can compute: " + verdict.reason;
 	}
 	return string();
+}
+
+string WhyNotWhole(LogicalOperator &feed, const SubtreeLabels &labels, CrossingSource &source) {
+	auto label = labels.find(&feed);
+	if (label != labels.end() && !label->second.source) {
+		return "the feed reads nothing of the source";
+	}
+	optional_ptr<LogicalOperator> node = &feed;
+	while (true) {
+		auto reason = WhyItStays(*node, source);
+		if (!reason.empty()) {
+			return reason;
+		}
+		node = node->children[0].get();
+	}
+}
+
+void RequireSeamTakesRow(LogicalOperator &feed, const CrossingFragment &fragment, const vector<idx_t> &positions) {
+	auto row_types = feed.types;
+	if (!positions.empty()) {
+		row_types.clear();
+		for (auto position : positions) {
+			row_types.push_back(feed.types[position]);
+		}
+	}
+	if (row_types != fragment.seam_types) {
+		throw InternalException("crossing: the seam row does not fit the seam");
+	}
 }
 
 } // namespace
@@ -238,62 +265,26 @@ SeamFill FillSeamFromFeed(unique_ptr<LogicalOperator> feed, CrossingFragment &fr
 	auto slot = fragment.SeamSlot();
 	auto seam_index = (*slot)->Cast<LogicalGet>().table_index;
 
-	SplitFiltersAgainst(feed, source);
 	auto labels = LabelSubtreesUnder(*feed, source, single_joins_cross);
 
 	SeamFill fill;
-	unique_ptr<LogicalOperator> *cursor = &feed;
-	bool whole = false;
-	while (true) {
-		auto &node = **cursor;
-		if (stop.node.get() == &node) {
-			fill.obstacle = stop.obstacle;
-			break;
-		}
-		auto label = labels.find(&node);
-		if (!stop.node && label != labels.end() &&
-		    (label->second.runs_anywhere || label->second.source->Group() == source.Group()) &&
-		    !SubtreeHoldsFrozenScan(node, identity)) {
-			whole = true;
-			break;
-		}
-		fill.obstacle = WhyItStays(node, source);
-		if (!fill.obstacle.empty()) {
-			break;
-		}
-		cursor = &node.children[0];
-	}
-
-	if (whole) {
-		UnfoldScansIntoPlace(*cursor, identity);
-		fill.seam_types = fragment.seam_types;
-	} else {
-		auto &boundary = *cursor;
-		boundary->ResolveOperatorTypes();
-		fill.seam_types = boundary->types;
-		if (cursor == &feed) {
-			if (fill.seam_types != fragment.seam_types) {
-				throw InternalException("crossing: the seam row does not fit the seam");
-			}
-			fill.remainder = std::move(feed);
-			RejoinAdjacentFiltersEverywhere(fill.remainder, identity);
-			return fill;
-		}
-		auto bindings = boundary->GetColumnBindings();
-		auto seam2_index = fresh();
-		fill.remainder = std::move(boundary);
-		boundary = MakeSeamNode(seam2_index.index, fill.seam_types);
-		ColumnBindingReplacer replacer;
-		for (idx_t i = 0; i < bindings.size(); i++) {
-			replacer.replacement_bindings.emplace_back(bindings[i], ColumnBinding(seam2_index, ProjectionIndex(i)));
-		}
-		replacer.VisitOperator(*feed);
+	fill.seam_types = fragment.seam_types;
+	auto label = labels.find(feed.get());
+	// A label without a source means the rows are already on the target, so moving work onto them saves nothing.
+	bool whole = !stop.stays && label != labels.end() && label->second.source &&
+	             label->second.source->Group() == source.Group() && !SubtreeHoldsFrozenScan(*feed, identity);
+	if (!whole) {
+		fill.obstacle = stop.stays ? stop.obstacle : WhyNotWhole(*feed, labels, source);
+		feed->ResolveOperatorTypes();
+		RequireSeamTakesRow(*feed, fragment, stop.seam_positions);
+		fill.remainder = std::move(feed);
 		RejoinAdjacentFiltersEverywhere(fill.remainder, identity);
+		return fill;
 	}
 
+	UnfoldScansIntoPlace(feed, identity);
 	AdoptSeamIndex(*feed, seam_index);
 	*slot = std::move(feed);
-	fragment.seam_types = fill.seam_types;
 	fragment.ResolveTypesAndText();
 	fragment.VerifyInvariants();
 	RejoinAdjacentFiltersEverywhere(fragment.plan, identity);
@@ -301,15 +292,15 @@ SeamFill FillSeamFromFeed(unique_ptr<LogicalOperator> feed, CrossingFragment &fr
 	return fill;
 }
 
-void MaterialiseConstantRows(ClientContext &context, unique_ptr<LogicalOperator> &node) {
+void MaterialiseConstantRows(ClientContext &context, unique_ptr<LogicalOperator> &node, bool only_consistent) {
 	for (auto &child : node->children) {
-		MaterialiseConstantRows(context, child);
+		MaterialiseConstantRows(context, child, only_consistent);
 	}
 	if (node->type != LogicalOperatorType::LOGICAL_EXPRESSION_GET) {
 		return;
 	}
 	auto &get = node->Cast<LogicalExpressionGet>();
-	if (!IsConstantRows(get)) {
+	if (!IsConstantRows(get) || (only_consistent && !IsConsistentRows(get))) {
 		return;
 	}
 	auto collection = make_uniq<ColumnDataCollection>(Allocator::DefaultAllocator(), get.expr_types);

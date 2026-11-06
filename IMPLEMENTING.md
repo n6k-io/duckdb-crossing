@@ -121,7 +121,9 @@ through crossing.
 `CREATE VIEW` is a `CREATE` whose `ddl.create` is a `CreateViewInfo` and whose
 `ddl.plan` is the body, planned and folded as a read: floors only, the same plan
 `Session::Read` would get. A body that does not fold wholly onto the source is
-refused before the source is asked. The plan's columns are
+refused before the source is asked. A `VALUES` list in the body crosses as its
+rows, unless a row holds something that changes between queries, such as
+`now()`, which is refused. The plan's columns are
 `CrossingViewColumnNames(view)`, in order; rendered Substrait names them `c0`,
 `c1`, ... A source that stores views as SQL renders the plan rather than reusing
 `view.query`, which names the target's catalog: `DecodeSubstraitView` gives the
@@ -181,7 +183,9 @@ carrying it on the target.
   `CREATE VIEW` refuses a body holding one. A view is judged only when created, so
   turning the setting off later leaves its join on the source.
 
-A yes claims the source computes the expression as DuckDB does.
+A yes claims the source computes the expression as DuckDB does. It means the
+source can, not that it must: work over rows the target gathered stays on the
+target.
 
 ## Group
 
@@ -261,9 +265,10 @@ CrossingWriter ToySession::Write(ClientContext &, const CrossingQuery &query) {
 
 - Called once per write operator; not at all when the target gathered no rows.
   `query` outlives the writer.
-- The plan is the one from `Plan` with the seam filled: by a read of this
-  source's tables when the rows came from it, else by gathered rows.
-  `SeamRowsOf(op)` returns those rows.
+- The plan is the one from `Plan` with the seam filled. When every part of the
+  feed can run on this source, it fills the seam with work reading this source's
+  tables. Otherwise all of it runs on the target and the seam holds the gathered
+  rows, so with a bare seam from `Plan`, `SeamRowsOf(query.plan)` returns them.
 - `Wait()` / `waker.Wake()` as for readers.
 - `Done(n)` is the rows the source changed, which DuckDB reports.
 - `RETURNING` never runs wholly on the source.
@@ -298,9 +303,11 @@ for (auto &use : CrossingTablesOf(*plan)) { ... }
 The receiver is a DuckDB instance of the same commit with
 `RegisterCrossingPlanFunctions(db)` called; `context` has a transaction open.
 
-Rendered as Substrait, a plan can read several seams, each as its own one-part
-table. `SubstraitSeamsOf(plan)` lists each name with its rows. Stage them and
-pass `DecodeSubstraitJson` the view holding each one.
+`RenderSubstraitJson(plan)` is complete: rows the plan holds, such as a `VALUES`
+list joined to a table, travel in the JSON, and `DecodeSubstraitJson` needs
+nothing else. Check `SeamRowsOf(query.plan)` first on a write: gathered rows can be
+any size, and JSON is a poor way to move them. Stacking operators on the seam in
+`Plan` makes it null, and rendering then puts those rows in the JSON.
 
 ## Transactions
 

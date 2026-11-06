@@ -30,6 +30,7 @@
 #include "duckdb/parser/statement/select_statement.hpp"
 #include "duckdb/parser/tableref/basetableref.hpp"
 #include "duckdb/parser/tableref/emptytableref.hpp"
+#include "duckdb/parser/tableref/expressionlistref.hpp"
 #include "duckdb/parser/tableref/subqueryref.hpp"
 #include "duckdb/planner/logical_operator.hpp"
 
@@ -45,6 +46,7 @@ using duckdb_yyjson::yyjson_doc;
 using duckdb_yyjson::yyjson_doc_free;
 using duckdb_yyjson::yyjson_doc_get_root;
 using duckdb_yyjson::yyjson_get_bool;
+using duckdb_yyjson::yyjson_get_len;
 using duckdb_yyjson::yyjson_get_num;
 using duckdb_yyjson::yyjson_get_sint;
 using duckdb_yyjson::yyjson_get_str;
@@ -124,9 +126,8 @@ int64_t Int64Of(yyjson_val *val, int64_t fallback) {
 
 class Decoder {
 public:
-	Decoder(Connection &conn_p, const string &catalog_p, const SubstraitSeamViews &seam_views_p,
-	        const SubstraitCatalogCheck &check_p)
-	    : conn(conn_p), catalog(catalog_p), seam_views(seam_views_p), check(check_p) {
+	Decoder(Connection &conn_p, const string &catalog_p, const SubstraitCatalogCheck &check_p)
+	    : conn(conn_p), catalog(catalog_p), check(check_p) {
 	}
 
 	shared_ptr<Relation> Decode(yyjson_val *plan) {
@@ -237,7 +238,7 @@ private:
 			return ConstantExpression::FromValue(Value::DOUBLE(yyjson_get_num(body)));
 		}
 		if (key == "string") {
-			return ConstantExpression::FromValue(Value(string(yyjson_get_str(body))));
+			return ConstantExpression::FromValue(Value(string(yyjson_get_str(body), yyjson_get_len(body))));
 		}
 		if (key == "date") {
 			return ConstantExpression::FromValue(Value::DATE(date_t(NumericCast<int32_t>(Int64Of(body, 0)))));
@@ -492,18 +493,49 @@ private:
 		return out;
 	}
 
+	vector<LogicalType> BaseSchemaTypes(yyjson_val *read) {
+		vector<LogicalType> types;
+		size_t idx, max;
+		yyjson_val *type;
+		yyjson_arr_foreach(Require(Require(Require(read, "baseSchema"), "struct"), "types"), idx, max, type) {
+			types.push_back(SubstraitTypeFromJson(*conn.context, type));
+		}
+		return types;
+	}
+
+	Built RowsRead(yyjson_val *read, yyjson_val *rows) {
+		auto types = BaseSchemaTypes(read);
+		auto list = make_uniq<ExpressionListRef>();
+		list->alias = "crossing_rows";
+		size_t idx, max;
+		yyjson_val *row;
+		yyjson_arr_foreach(rows, idx, max, row) {
+			auto *fields = Require(row, "fields");
+			if (yyjson_arr_size(fields) != types.size()) {
+				throw InvalidInputException("substrait: a row has %llu fields but its table has %llu columns",
+				                            yyjson_arr_size(fields), types.size());
+			}
+			vector<unique_ptr<ParsedExpression>> cells;
+			size_t field_idx, field_max;
+			yyjson_val *field;
+			yyjson_arr_foreach(fields, field_idx, field_max, field) {
+				// The cast keeps the planned type: a VALUES list otherwise infers its columns from the cells.
+				cells.push_back(make_uniq<CastExpression>(types[field_idx], Expr(field, PositionalScope()), false));
+			}
+			list->values.push_back(std::move(cells));
+		}
+		vector<unique_ptr<ParsedExpression>> exprs;
+		for (idx_t i = 0; i < types.size(); i++) {
+			exprs.push_back(make_uniq<ColumnRefExpression>(Identifier("col" + std::to_string(i))));
+		}
+		return Numbered(std::move(list), std::move(exprs));
+	}
+
 	// Fields are positions in the schema the plan was built against, so they mean nothing against any other.
 	void RequireSchemaUnchanged(yyjson_val *read, const string &schema, const string &table,
 	                            const vector<ColumnDefinition> &columns) {
-		auto *base = Require(read, "baseSchema");
-		auto expected_names = StrArrayOf(base, "names");
-		auto *wire_types = Require(Require(base, "struct"), "types");
-		vector<LogicalType> expected_types;
-		size_t idx, max;
-		yyjson_val *type;
-		yyjson_arr_foreach(wire_types, idx, max, type) {
-			expected_types.push_back(SubstraitTypeFromJson(*conn.context, type));
-		}
+		auto expected_names = StrArrayOf(Require(read, "baseSchema"), "names");
+		auto expected_types = BaseSchemaTypes(read);
 		vector<string> names;
 		vector<LogicalType> types;
 		for (auto &column : columns) {
@@ -519,30 +551,23 @@ private:
 	}
 
 	Built Read(yyjson_val *read) {
-		if (yyjson_obj_get(read, "virtualTable")) {
-			return EmptyRead(read);
+		if (auto *table = yyjson_obj_get(read, "virtualTable")) {
+			auto *rows = yyjson_obj_get(table, "expressions");
+			return rows && yyjson_arr_size(rows) > 0 ? RowsRead(read, rows) : EmptyRead(read);
 		}
 		auto *named = Require(read, "namedTable");
 		auto names = StrArrayOf(named, "names");
-		shared_ptr<Relation> rel;
-		if (names.size() == 1) {
-			auto view = seam_views.find(names[0]);
-			if (view == seam_views.end()) {
-				throw InvalidInputException("substrait: the plan reads seam '%s' but it was not staged", names[0]);
-			}
-			rel = conn.View(Identifier(view->second));
-		} else if (names.size() == 2 || names.size() == 3) {
-			if (names.size() == 3 && check) {
-				check(names[0]);
-			}
-			auto ref = make_uniq<BaseTableRef>();
-			ref->SetQualifiedName(Identifier(names.size() == 3 ? names[0] : catalog),
-			                      Identifier(names[names.size() - 2]), Identifier(names.back()));
-			rel = make_shared_ptr<ViewRelation>(conn.context, std::move(ref), names.back());
-			RequireSchemaUnchanged(read, names[names.size() - 2], names.back(), rel->Columns());
-		} else {
+		if (names.size() != 2 && names.size() != 3) {
 			throw InvalidInputException("substrait: a named table needs [schema, table]");
 		}
+		if (names.size() == 3 && check) {
+			check(names[0]);
+		}
+		auto ref = make_uniq<BaseTableRef>();
+		ref->SetQualifiedName(Identifier(names.size() == 3 ? names[0] : catalog), Identifier(names[names.size() - 2]),
+		                      Identifier(names.back()));
+		shared_ptr<Relation> rel = make_shared_ptr<ViewRelation>(conn.context, std::move(ref), names.back());
+		RequireSchemaUnchanged(read, names[names.size() - 2], names.back(), rel->Columns());
 		auto &columns = rel->Columns();
 		vector<idx_t> fields;
 		auto *projection = yyjson_obj_get(read, "projection");
@@ -959,7 +984,6 @@ private:
 
 	Connection &conn;
 	const string &catalog;
-	const SubstraitSeamViews &seam_views;
 	const SubstraitCatalogCheck &check;
 	std::unordered_map<uint64_t, string> functions;
 	std::unordered_map<uint64_t, idx_t> cte_widths;
@@ -968,13 +992,13 @@ private:
 } // namespace
 
 shared_ptr<Relation> DecodeSubstraitJson(Connection &conn, const string &catalog, const string &json,
-                                         const SubstraitSeamViews &seam_views, const SubstraitCatalogCheck &check) {
+                                         const SubstraitCatalogCheck &check) {
 	auto *doc = yyjson_read(json.data(), json.size(), 0);
 	if (!doc) {
 		throw InvalidInputException("substrait: the plan is not valid JSON");
 	}
 	try {
-		Decoder decoder(conn, catalog, seam_views, check);
+		Decoder decoder(conn, catalog, check);
 		auto rel = decoder.Decode(yyjson_doc_get_root(doc));
 		yyjson_doc_free(doc);
 		return rel;
@@ -986,7 +1010,7 @@ shared_ptr<Relation> DecodeSubstraitJson(Connection &conn, const string &catalog
 
 unique_ptr<SelectStatement> DecodeSubstraitView(Connection &conn, const string &catalog, const string &json,
                                                 const vector<string> &names, const SubstraitCatalogCheck &check) {
-	auto rel = DecodeSubstraitJson(conn, catalog, json, {}, check);
+	auto rel = DecodeSubstraitJson(conn, catalog, json, check);
 	auto &columns = rel->Columns();
 	if (columns.size() != names.size()) {
 		throw InvalidInputException("substrait: the view body has %llu columns but %llu names", columns.size(),

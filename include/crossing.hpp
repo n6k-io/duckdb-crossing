@@ -186,8 +186,9 @@ struct CrossingQuery {
 	//! SELECT on a read, the write verb on a write.
 	CrossingVerb kind;
 	//! Not yet optimized by DuckDB. A read is the crossed work on a projection crossing adds, on the
-	//! floor. A write is the statement with its seam already filled: by a plan of yours when the rows
-	//! come from this source, otherwise by the rows the target gathered. Run it as it is.
+	//! floor. A write is the statement with its seam already filled: by work reading this source when
+	//! every part of the feed can run on it, otherwise by the rows the target gathered, all the feed's
+	//! work done (see SeamRowsOf). Run it as it is.
 	const LogicalOperator &plan;
 	//! The row types: what a read produces, what a write is handed.
 	vector<LogicalType> types;

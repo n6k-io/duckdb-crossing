@@ -9,15 +9,17 @@ namespace duckdb {
 
 struct CrossingFeed {
 	unique_ptr<LogicalOperator> plan;
-	optional_ptr<LogicalOperator> image;
+	//! Set when `plan` emits the row image RETURNING needs: where each seam column sits in that image.
+	vector<idx_t> seam_positions;
 };
 
 CrossingFeed FeedOf(LogicalOperator &write, const vector<column_t> &key_columns, unique_ptr<LogicalOperator> feed,
                     const FreshTableIndex &fresh);
 
 struct SeamObstacle {
-	optional_ptr<LogicalOperator> node;
+	bool stays = false;
 	string obstacle;
+	vector<idx_t> seam_positions;
 };
 
 struct SeamFill {
@@ -29,6 +31,6 @@ struct SeamFill {
 SeamFill FillSeamFromFeed(unique_ptr<LogicalOperator> feed, CrossingFragment &fragment, CrossingSource &source,
                           const SeamObstacle &stop, const FreshTableIndex &fresh, bool single_joins_cross = true);
 
-void MaterialiseConstantRows(ClientContext &context, unique_ptr<LogicalOperator> &node);
+void MaterialiseConstantRows(ClientContext &context, unique_ptr<LogicalOperator> &node, bool only_consistent = false);
 
 } // namespace duckdb

@@ -70,6 +70,7 @@ struct FarCall {
 	vector<string> key_columns;
 	vector<string> set_columns;
 	vector<vector<Value>> rows;
+	bool rows_only = false;
 	string wire;
 	string received_text;
 
@@ -165,7 +166,6 @@ private:
 	vector<vector<Value>> EvaluateNative(const LogicalOperator &plan, FarCall &call);
 	vector<vector<Value>> EvaluateSubstrait(const LogicalOperator &plan, FarCall &call);
 	idx_t Apply(const CrossingQuery &query);
-	SubstraitSeamViews StageSeamRows(const LogicalOperator &plan);
 	unique_ptr<CreateViewInfo> ReceiveView(const CreateViewInfo &view, const LogicalOperator &plan);
 	FarCall Record(const CrossingQuery &query);
 

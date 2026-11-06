@@ -94,8 +94,8 @@ TEST_CASE("INSERT INTO t VALUES (1, 2)", "[bound][split]") {
 
 	auto shaped = ShapeBoundWrite(env, plan, {LogicalType::INTEGER, LogicalType::INTEGER});
 
-	REQUIRE(!shaped.split.remainder);
-	REQUIRE_FRAGMENT(*shaped.fragment, "proj{c0, c1} | proj{id, amt} | proj{id, amt} | rows");
+	REQUIRE_PLAN(shaped.split.remainder, "proj{id, amt} | proj{id, amt} | rows");
+	REQUIRE_FRAGMENT(*shaped.fragment, "proj{c0, c1} | seam");
 }
 
 TEST_CASE("INSERT INTO t VALUES (1, 2), (3, 4)", "[bound][split]") {
@@ -106,8 +106,8 @@ TEST_CASE("INSERT INTO t VALUES (1, 2), (3, 4)", "[bound][split]") {
 
 	auto shaped = ShapeBoundWrite(env, plan, {LogicalType::INTEGER, LogicalType::INTEGER});
 
-	REQUIRE(!shaped.split.remainder);
-	REQUIRE_FRAGMENT(*shaped.fragment, "proj{c0, c1} | proj{id, amt} | proj{id, amt} | rows");
+	REQUIRE_PLAN(shaped.split.remainder, "proj{id, amt} | proj{id, amt} | rows");
+	REQUIRE_FRAGMENT(*shaped.fragment, "proj{c0, c1} | seam");
 }
 
 TEST_CASE("INSERT INTO t SELECT id, amt FROM memory_source()", "[bound][split]") {
@@ -134,9 +134,9 @@ TEST_CASE("UPDATE t SET amt = 1 WHERE id = 2", "[bound][split]") {
 
 	auto shaped = ShapeBoundWrite(env, plan, {LogicalType::BIGINT, LogicalType::INTEGER}, {0});
 
-	REQUIRE_PLAN(shaped.split.remainder, "local");
-	REQUIRE_FRAGMENT(*shaped.fragment, "proj{c0, c1} | proj{rowid, CAST(1 AS INTEGER)} | "
-	                                   "proj{CAST(1 AS INTEGER), rowid} | filter{id = CAST(2 AS INTEGER)} | seam");
+	REQUIRE_PLAN(shaped.split.remainder, "proj{rowid, CAST(1 AS INTEGER)} | proj{CAST(1 AS INTEGER), rowid} | "
+	                                     "filter{id = CAST(2 AS INTEGER)} | local");
+	REQUIRE_FRAGMENT(*shaped.fragment, "proj{c0, c1} | seam");
 	REQUIRE(shaped.split.obstacle == "get stays on the target");
 }
 
@@ -148,8 +148,8 @@ TEST_CASE("DELETE FROM t WHERE id = 2", "[bound][split]") {
 
 	auto shaped = ShapeBoundWrite(env, plan, {LogicalType::BIGINT}, {0});
 
-	REQUIRE_PLAN(shaped.split.remainder, "local");
-	REQUIRE_FRAGMENT(*shaped.fragment, "proj{c0} | proj{rowid} | filter{id = CAST(2 AS INTEGER)} | seam");
+	REQUIRE_PLAN(shaped.split.remainder, "proj{rowid} | filter{id = CAST(2 AS INTEGER)} | local");
+	REQUIRE_FRAGMENT(*shaped.fragment, "proj{c0} | seam");
 }
 
 TEST_CASE("SELECT a.amt FROM memory_source() a, memory_source() b WHERE a.id = b.id", "[bound]") {

@@ -106,6 +106,7 @@ public:
 	unique_ptr<CrossingBindData> write;
 	string obstacle;
 	vector<idx_t> key_positions;
+	vector<idx_t> seam_positions;
 
 	const ColumnList &GetColumns() const override {
 		return columns;

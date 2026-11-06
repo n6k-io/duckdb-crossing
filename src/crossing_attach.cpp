@@ -7,6 +7,7 @@
 #include "internal/carrier.hpp"
 #include "internal/crossing_table_entry.hpp"
 #include "internal/crossing_write.hpp"
+#include "internal/fill.hpp"
 #include "internal/pass.hpp"
 
 #include "duckdb/catalog/catalog_entry/schema_catalog_entry.hpp"
@@ -420,8 +421,9 @@ optional_ptr<CatalogEntry> CrossingAttach::CreateView(ClientContext &context, Tr
 	FreshTableIndex fresh = [&binder]() {
 		return binder->GenerateTableIndex();
 	};
-	// No MaterialiseConstantRows: rows staged for one read cannot live on in a view, so a body holding
-	// a VALUES list does not fold and the view is refused below.
+	// A view outlives this statement, so now() in its rows must not be frozen at creation; those rows do not
+	// fold and the view is refused below.
+	MaterialiseConstantRows(context, bound.plan, true);
 	ResolveKeyAliases(*bound.plan, identity);
 	FoldCrossableWorkIntoFragments(bound.plan, fresh, identity,
 	                               Settings::Get<ScalarSubqueryErrorOnMultipleRowsSetting>(context));

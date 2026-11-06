@@ -2,7 +2,6 @@
 #include "crossing_substrait.hpp"
 
 #include "duckdb/common/types/column/column_data_collection.hpp"
-#include "duckdb/main/appender.hpp"
 #include "duckdb/main/extension/extension_loader.hpp"
 #include "duckdb/main/query_result.hpp"
 #include "duckdb/main/query_parameters.hpp"
@@ -555,37 +554,16 @@ vector<vector<Value>> FarSession::EvaluateNative(const LogicalOperator &plan, Fa
 	return RowsOf(*RunPlan(far, std::move(received)));
 }
 
-SubstraitSeamViews FarSession::StageSeamRows(const LogicalOperator &plan) {
-	SubstraitSeamViews views;
-	for (auto &seam : SubstraitSeamsOf(plan)) {
-		auto view = "crossing_" + seam.table;
-		string columns;
-		for (idx_t c = 0; c < seam.rows.Types().size(); c++) {
-			columns += (c ? ", c" : "c") + to_string(c) + " " + seam.rows.Types()[c].ToString();
-		}
-		auto created = far.Query("CREATE OR REPLACE TEMP TABLE " + view + "(" + columns + ")");
-		if (created->HasError()) {
-			created->ThrowError();
-		}
-		Appender appender(far, "temp", "main", Identifier(view));
-		for (auto &chunk : seam.rows.Chunks()) {
-			appender.AppendDataChunk(chunk);
-		}
-		appender.Close();
-		views[seam.table] = view;
-	}
-	return views;
-}
-
 vector<vector<Value>> FarSession::EvaluateSubstrait(const LogicalOperator &plan, FarCall &call) {
 	call.wire = RenderSubstraitJson(plan);
-	auto rel = DecodeSubstraitJson(far, catalog, call.wire, StageSeamRows(plan), store->catalog_check);
+	auto rel = DecodeSubstraitJson(far, catalog, call.wire, store->catalog_check);
 	call.received_text = rel->ToString();
 	return RowsOf(*rel->Execute());
 }
 
 vector<vector<Value>> FarSession::Evaluate(const LogicalOperator &plan, FarCall &call) {
 	if (auto rows = SeamRowsOf(plan)) {
+		call.rows_only = true;
 		return RowsOf(*rows);
 	}
 	lock_guard<mutex> guard(far_lock);
@@ -663,8 +641,7 @@ idx_t FarSession::Apply(const CrossingQuery &query) {
 		BindFloors(*far.context, received, catalog);
 		return ExecuteWrite(*far.context, target, std::move(received));
 	}
-	auto rel = DecodeSubstraitJson(far, catalog, RenderSubstraitJson(query.plan), StageSeamRows(query.plan),
-	                               store->catalog_check);
+	auto rel = DecodeSubstraitJson(far, catalog, RenderSubstraitJson(query.plan), store->catalog_check);
 	return ExecuteWrite(*far.context, target, rel->GetTableRef());
 }
 
