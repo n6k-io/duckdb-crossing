@@ -8,6 +8,7 @@
 
 #include "duckdb/common/string_util.hpp"
 #include "duckdb/execution/physical_plan_generator.hpp"
+#include "duckdb/planner/operator/logical_column_data_get.hpp"
 #include "duckdb/planner/operator/logical_get.hpp"
 #include "duckdb/transaction/meta_transaction.hpp"
 #include "duckdb/transaction/transaction.hpp"
@@ -301,7 +302,11 @@ PhysicalOperator &LogicalCrossingRead::CreatePlan(ClientContext &context, Physic
 	for (auto &column : column_ids) {
 		ids.push_back(column.GetPrimaryIndex());
 	}
-	return planner.Make<CrossingRead>(types, std::move(bind_data), std::move(ids), estimated_cardinality);
+	auto &read = planner.Make<CrossingRead>(types, std::move(bind_data), std::move(ids), estimated_cardinality);
+	if (!children.empty()) {
+		read.children.push_back(planner.CreatePlan(*children[0]));
+	}
+	return read;
 }
 
 vector<ColumnBinding> LogicalCrossingRead::GetColumnBindings() {
@@ -332,11 +337,45 @@ void LogicalCrossingRead::ResolveTypes() {
 	types = output_types;
 }
 
+CrossingSeamFilling::CrossingSeamFilling(shared_ptr<CrossingFragment> fragment_p,
+                                         unique_ptr<ColumnDataCollection> rows)
+    : fragment(std::move(fragment_p)), slot(fragment->SeamSlot()) {
+	if (!slot) {
+		throw InternalException("crossing: rows were gathered for a fragment with no seam");
+	}
+	seam_node = std::move(*slot);
+	auto table_index = seam_node->Cast<LogicalGet>().table_index;
+	*slot = make_uniq<LogicalColumnDataGet>(table_index, fragment->seam_types, std::move(rows));
+	fragment->ResolveTypesAndText();
+}
+
+CrossingSeamFilling::~CrossingSeamFilling() {
+	*slot = std::move(seam_node);
+	fragment->ResolveTypesAndText();
+}
+
 CrossingRead::CrossingRead(PhysicalPlan &physical_plan, vector<LogicalType> types_p,
                            unique_ptr<CrossingBindData> bind_data_p, vector<column_t> column_ids_p,
                            idx_t estimated_cardinality)
     : PhysicalOperator(physical_plan, PhysicalOperatorType::EXTENSION, std::move(types_p), estimated_cardinality),
       bind_data(std::move(bind_data_p)), column_ids(std::move(column_ids_p)) {
+}
+
+unique_ptr<GlobalSinkState> CrossingRead::GetGlobalSinkState(ClientContext &context) const {
+	auto state = make_uniq<CrossingReadSinkState>();
+	state->rows = make_uniq<ColumnDataCollection>(context, bind_data->fragment->seam_types);
+	return std::move(state);
+}
+
+SinkResultType CrossingRead::Sink(ExecutionContext &, DataChunk &chunk, OperatorSinkInput &input) const {
+	input.global_state.Cast<CrossingReadSinkState>().rows->Append(chunk);
+	return SinkResultType::NEED_MORE_INPUT;
+}
+
+SinkFinalizeType CrossingRead::Finalize(Pipeline &, Event &, ClientContext &, OperatorSinkFinalizeInput &input) const {
+	auto &state = input.global_state.Cast<CrossingReadSinkState>();
+	state.filling = make_uniq<CrossingSeamFilling>(bind_data->fragment, std::move(state.rows));
+	return SinkFinalizeType::READY;
 }
 
 unique_ptr<GlobalSourceState> CrossingRead::GetGlobalSourceState(ClientContext &context) const {

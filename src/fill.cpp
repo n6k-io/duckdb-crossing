@@ -238,9 +238,15 @@ SeamFill FillSeamFromFeed(unique_ptr<LogicalOperator> feed, CrossingFragment &fr
 		return fill;
 	}
 
-	UnfoldScansIntoPlace(feed, identity);
+	auto near_child = UnfoldScansIntoPlace(feed, identity);
 	AdoptSeamIndex(*feed, seam_index);
 	*slot = std::move(feed);
+	if (near_child) {
+		// The write's own seam is filled by this work, and the work's seam is what near sends.
+		fill.remainder = std::move(near_child->children[0]);
+		fill.remainder->ResolveOperatorTypes();
+		fragment.seam_types = fill.remainder->types;
+	}
 	fragment.ResolveTypesAndText();
 	fragment.VerifyInvariants();
 	RejoinAdjacentFiltersEverywhere(fragment.plan, identity);

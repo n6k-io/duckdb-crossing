@@ -13,6 +13,27 @@
 
 DuckDB library that pushes plan fragments to a foreign source. `IMPLEMENTING.md` describes the source interface.
 
+## What runs where
+
+Query shape decides, and table sizes never do.
+
+- Work on one source's tables runs on that source.
+- The first inner join between a source's table and rows that read nothing from any
+  source runs on the source, when the source accepts it and a condition links the two
+  sides. Those rows are read first and sent over. `far JOIN a JOIN b` sends `a`, and
+  `far JOIN (a JOIN b)` sends the join's result.
+- Later joins, outer, semi and anti joins, joins with no condition linking the sides,
+  and joins using a CTE or inside a correlated subquery run near.
+
+Refused with an error:
+
+- `RETURNING` on a table whose source can't return rows.
+- `DEFAULT` as a value on a source's table.
+- `ON CONFLICT` that leaves out a column.
+- `MERGE ... INSERT DEFAULT VALUES`.
+- A write to a source's table inside a `WITH` clause.
+- A view over rows that aren't on its source.
+
 ## Build and test
 
 Needs cmake and a C++17 compiler.

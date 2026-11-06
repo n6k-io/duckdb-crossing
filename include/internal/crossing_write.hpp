@@ -115,8 +115,7 @@ public:
 private:
 	CrossingTableCatalogEntry &table;
 	shared_ptr<CrossingFragment> fragment;
-	unique_ptr<LogicalOperator> *slot = nullptr;
-	unique_ptr<LogicalOperator> seam_node;
+	unique_ptr<CrossingSeamFilling> filling;
 	bool empty = false;
 	unique_ptr<CrossingQuery> query;
 	bool opened = false;
@@ -127,27 +126,6 @@ private:
 	DataChunk result_chunk;
 	idx_t affected_rows = 0;
 	unique_ptr<ColumnDataCollection> returned;
-};
-
-//! Holds the near node's Get off its feed through the optimizers: an empty feed would otherwise take
-//! the Get with it (empty_result_pullup.cpp), and a write has to report zero. Gone by the narrow pass.
-class LogicalNearPassThrough : public LogicalExtensionOperator {
-public:
-	vector<ColumnBinding> GetColumnBindings() override {
-		return children[0]->GetColumnBindings();
-	}
-	PhysicalOperator &CreatePlan(ClientContext &context, PhysicalPlanGenerator &planner) override;
-	string GetName() const override;
-	string GetExtensionName() const override;
-	bool SupportSerialization() const override {
-		return false;
-	}
-	void Serialize(Serializer &serializer) const override;
-
-protected:
-	void ResolveTypes() override {
-		types = children[0]->types;
-	}
 };
 
 //! Near's side of a write. Any child is the rows it sends; with none, the source runs all of it.

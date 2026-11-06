@@ -1,6 +1,7 @@
 #pragma once
 
 #include "duckdb/common/atomic.hpp"
+#include "duckdb/common/types/column/column_data_collection.hpp"
 #include "duckdb/execution/physical_operator.hpp"
 #include "duckdb/function/table_function.hpp"
 #include "duckdb/planner/operator/logical_extension_operator.hpp"
@@ -64,6 +65,18 @@ unique_ptr<FunctionData> MakeReadBindData(CrossingTableCatalogEntry &entry);
 shared_ptr<CrossingFragment> BuildScanFragment(unique_ptr<LogicalOperator> floor, const string &source_table,
                                                vector<string> column_names, vector<LogicalType> column_types);
 
+//! The fragment's seam holds `rows` while this lives; destroying it puts the seam back.
+class CrossingSeamFilling {
+public:
+	CrossingSeamFilling(shared_ptr<CrossingFragment> fragment, unique_ptr<ColumnDataCollection> rows);
+	~CrossingSeamFilling();
+
+private:
+	shared_ptr<CrossingFragment> fragment;
+	unique_ptr<LogicalOperator> *slot;
+	unique_ptr<LogicalOperator> seam_node;
+};
+
 class LogicalCrossingRead : public LogicalExtensionOperator {
 public:
 	LogicalCrossingRead(TableIndex table_index, vector<ColumnIndex> column_ids, vector<LogicalType> output_types,
@@ -87,6 +100,11 @@ public:
 
 protected:
 	void ResolveTypes() override;
+};
+
+struct CrossingReadSinkState : public GlobalSinkState {
+	unique_ptr<ColumnDataCollection> rows;
+	unique_ptr<CrossingSeamFilling> filling;
 };
 
 struct CrossingReadGlobalState : public GlobalSourceState {
@@ -121,6 +139,21 @@ public:
 
 	unique_ptr<CrossingBindData> bind_data;
 	vector<column_t> column_ids;
+
+	//! A sink only when the read takes a seam: its child is the rows.
+	unique_ptr<GlobalSinkState> GetGlobalSinkState(ClientContext &context) const override;
+	SinkResultType Sink(ExecutionContext &context, DataChunk &chunk, OperatorSinkInput &input) const override;
+	SinkFinalizeType Finalize(Pipeline &pipeline, Event &event, ClientContext &context,
+	                          OperatorSinkFinalizeInput &input) const override;
+	bool IsSink() const override {
+		return !children.empty();
+	}
+	bool ParallelSink() const override {
+		return false;
+	}
+	bool SinkOrderDependent() const override {
+		return true;
+	}
 
 	unique_ptr<GlobalSourceState> GetGlobalSourceState(ClientContext &context) const override;
 	unique_ptr<LocalSourceState> GetLocalSourceState(ExecutionContext &context,

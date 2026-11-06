@@ -41,6 +41,9 @@ struct FullSource {
 	CrossingVerdict AcceptsOperator(const LogicalOperator &) {
 		return {};
 	}
+	CrossingVerdict AcceptsSeam(const vector<LogicalType> &) {
+		return {};
+	}
 	unique_ptr<Session> Begin(ClientContext &) {
 		return nullptr;
 	}

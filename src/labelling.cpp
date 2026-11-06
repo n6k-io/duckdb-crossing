@@ -50,6 +50,7 @@ SubtreeLabel LabelSubtree(LogicalOperator &op, LabelRun &run, optional_ptr<Cross
 	if (CrossingReadFragmentOf(op, identity)) {
 		SubtreeLabel here;
 		here.source = CrossingSourceOf(op, identity).get();
+		here.holds_seam = !op.children.empty();
 		out[&op] = here;
 		return here;
 	}
@@ -88,6 +89,10 @@ SubtreeLabel LabelSubtree(LogicalOperator &op, LabelRun &run, optional_ptr<Cross
 			agrees = false;
 			continue;
 		}
+		if (child_label.holds_seam && agreed.holds_seam) {
+			agrees = false;
+		}
+		agreed.holds_seam = agreed.holds_seam || child_label.holds_seam;
 		if (!child_label.source) {
 			agreed.runs_anywhere = true;
 			if (!fence_source) {

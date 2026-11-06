@@ -424,6 +424,11 @@ public:
 	virtual CrossingVerdict AcceptsOperator(const LogicalOperator &op) {
 		return CrossingVerdict::Yes();
 	}
+	//! Whether a join may run here on rows the target sends, with these column types. Off by default: a
+	//! source that says yes gets those rows in the plan, as any size of CHUNK_GET.
+	virtual CrossingVerdict AcceptsSeam(const vector<LogicalType> &types) {
+		return CrossingVerdict::No("this source takes no rows into a read");
+	}
 
 	//! Sources with one group serve one store through one transport, so a plan may join them. They
 	//! must answer the Accepts* calls alike.
@@ -534,6 +539,8 @@ CROSSING_MEMBER(AcceptsType, "CrossingVerdict AcceptsType(const LogicalType &typ
                 const LogicalType &);
 CROSSING_MEMBER(AcceptsOperator, "CrossingVerdict AcceptsOperator(const LogicalOperator &op)", CrossingVerdict,
                 const LogicalOperator &);
+CROSSING_MEMBER(AcceptsSeam, "CrossingVerdict AcceptsSeam(const vector<LogicalType> &types)", CrossingVerdict,
+                const vector<LogicalType> &);
 CROSSING_MEMBER(Begin, "unique_ptr<Session> Begin(ClientContext &context)", unique_ptr<SessionOf<T>>, ClientContext &);
 CROSSING_MEMBER(Detach, "void Detach(ClientContext &context)", void, ClientContext &);
 CROSSING_MEMBER(Group, "const void *Group()", const void *);
@@ -556,6 +563,7 @@ struct SourceContract : CheckTables<S, true>,
                         CheckAcceptsCall<S, false>,
                         CheckAcceptsType<S, false>,
                         CheckAcceptsOperator<S, false>,
+                        CheckAcceptsSeam<S, false>,
                         CheckDetach<S, false>,
                         CheckGroup<S, false> {
 	static_assert(!std::is_final<S>::value, "crossing: a source type must not be final");
@@ -651,6 +659,14 @@ CrossingVerdict AcceptsOperatorOn(S &source, const LogicalOperator &op, std::tru
 template <class S>
 CrossingVerdict AcceptsOperatorOn(S &, const LogicalOperator &, std::false_type) {
 	return CrossingVerdict::Yes();
+}
+template <class S>
+CrossingVerdict AcceptsSeamOn(S &source, const vector<LogicalType> &types, std::true_type) {
+	return source.AcceptsSeam(types);
+}
+template <class S>
+CrossingVerdict AcceptsSeamOn(S &, const vector<LogicalType> &, std::false_type) {
+	return CrossingVerdict::No("this source takes no rows into a read");
 }
 template <class S>
 void DetachOn(S &source, ClientContext &context, std::true_type) {
@@ -762,6 +778,9 @@ public:
 	}
 	CrossingVerdict AcceptsOperator(const LogicalOperator &op) override {
 		return crossing_contract::AcceptsOperatorOn(*source, op, crossing_contract::HasAcceptsOperator<S> {});
+	}
+	CrossingVerdict AcceptsSeam(const vector<LogicalType> &types) override {
+		return crossing_contract::AcceptsSeamOn(*source, types, crossing_contract::HasAcceptsSeam<S> {});
 	}
 	unique_ptr<CrossingSession> Begin(ClientContext &context) override {
 		auto session = source->Begin(context);

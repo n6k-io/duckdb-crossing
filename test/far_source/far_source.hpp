@@ -104,6 +104,7 @@ struct FarStore {
 	case_insensitive_map_t<bool> key_unique;
 	bool declare_key_constraints = false;
 	bool returning = true;
+	bool takes_seams = false;
 	case_insensitive_map_t<vector<CrossingVerb>> verbs;
 	case_insensitive_map_t<vector<CrossingVerb>> schema_verbs;
 	string declined;
@@ -199,6 +200,7 @@ public:
 	CrossingVerdict AcceptsCall(const Expression &expr);
 	CrossingVerdict AcceptsType(const LogicalType &type);
 	CrossingVerdict AcceptsOperator(const LogicalOperator &op);
+	CrossingVerdict AcceptsSeam(const vector<LogicalType> &types);
 	unique_ptr<FarSession> Begin(ClientContext &context);
 	void Detach(ClientContext &context);
 	const void *Group();

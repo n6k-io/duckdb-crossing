@@ -180,6 +180,13 @@ A yes claims the source computes the expression as DuckDB does. It means the
 source can, not that it must: work over rows the target gathered stays on the
 target.
 
+- `AcceptsSeam` — whether a join may run on the source using rows the target
+  sends, given their column types. Absent means no, and such a join runs on the
+  target. Asked once per join that could cut. A yes means `Run` can get a plan holding
+  those rows as a `CHUNK_GET` of any size: rendering puts them in the JSON and
+  `SerializeCrossingPlan` in the bytes, or find them with `SeamRowsOf` and send them
+  your own way. An empty `CHUNK_GET` still has to run: `count(*)` over it is a row.
+
 ## Group
 
 Attaches whose sources return one non-null `Group()` cross together: a join or

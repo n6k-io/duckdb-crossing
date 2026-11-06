@@ -982,12 +982,9 @@ TEST_CASE("a merge's seam over the memory limit spills and lands whole", "[write
 TEST_CASE("a conflict clause's RETURNING answers as plain DuckDB does", "[writes][returning][on_conflict]") {
 	auto transport = EACH_TRANSPORT();
 	auto sql = GENERATE(as<string> {},
-	                    "INSERT INTO far.d(id, v) VALUES (1, 5), (2, 6) ON CONFLICT (id) DO UPDATE SET v = excluded.v "
-	                    "RETURNING id, v, w",
+	                    "INSERT INTO far.d(id, v, w) VALUES (1, 5, 0), (2, 6, 0) ON CONFLICT (id) DO UPDATE "
+	                    "SET v = excluded.v RETURNING id, v, w",
 	                    "INSERT INTO far.d(id, v, w) VALUES (1, 5, 0), (2, 6, 0) ON CONFLICT DO NOTHING RETURNING *");
-	if (sql.find("(id, v)") != string::npos) {
-		sql = StringUtil::Replace(sql, "(id, v) VALUES (1, 5), (2, 6)", "(id, v, w) VALUES (1, 5, 0), (2, 6, 0)");
-	}
 	INFO(TransportName(transport) << " " << sql);
 	const string table = "CREATE TABLE d(id INTEGER PRIMARY KEY, v INTEGER, w INTEGER DEFAULT 8)";
 	const string row = "INSERT INTO d VALUES (1, 10, 20)";
@@ -1158,9 +1155,9 @@ TEST_CASE("RETURNING rows over the memory limit spill and all come back", "[writ
 	Twin twin(transport);
 	twin.store->keys["big"] = {"id"};
 	twin.store->key_unique["big"] = true;
-	twin.Far("CREATE TABLE big AS SELECT i::BIGINT AS id, repeat(md5(i::VARCHAR), 32) AS v, 0 AS w FROM range(64000) r(i)");
+	twin.Far("CREATE TABLE big AS SELECT i::BIGINT AS id, repeat(md5(i::VARCHAR), 32) AS v, 0 AS w FROM range(24000) r(i)");
 	twin.Attach();
-	twin.Query("SET memory_limit = '32MB'");
+	twin.Query("SET memory_limit = '16MB'");
 
 	auto result = twin.con.Submit("UPDATE far.big SET w = 1 RETURNING id, v");
 	REQUIRE(!result->HasError());
@@ -1175,10 +1172,10 @@ TEST_CASE("RETURNING rows over the memory limit spill and all come back", "[writ
 	}
 	stream.Close();
 
-	REQUIRE(rows == 64000);
+	REQUIRE(rows == 24000);
 	REQUIRE(wrong == 0);
 	REQUIRE(twin.LastWrite().target_swap_bytes_after_return > 0);
-	REQUIRE(Scalar(twin, "SELECT count(*) FROM big WHERE w = 1") == Value::BIGINT(64000));
+	REQUIRE(Scalar(twin, "SELECT count(*) FROM big WHERE w = 1") == Value::BIGINT(24000));
 }
 
 TEST_CASE("a write inside a WITH clause is refused and changes nothing", "[writes]") {

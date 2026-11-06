@@ -79,7 +79,7 @@ void PushOneFilter(unique_ptr<LogicalOperator> &node, const CrossingIdentity &id
 		bool movable = !expr->IsVolatile() && expr->IsConsistent();
 		for (idx_t side = 0; movable && side < join.children.size() && !moved; side++) {
 			auto &branch = join.children[side];
-			if (!SourceOfFirstScanBelow(*branch, identity) || !BindsOnlyTo(*expr, TableIndicesOf(*branch))) {
+			if (!BindsOnlyTo(*expr, TableIndicesOf(*branch))) {
 				continue;
 			}
 			pushed[side].push_back(std::move(expr));

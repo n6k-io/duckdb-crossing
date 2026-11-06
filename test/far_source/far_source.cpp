@@ -418,6 +418,21 @@ CrossingVerdict FarSource::AcceptsType(const LogicalType &type) {
 	return CrossingVerdict::Yes();
 }
 
+CrossingVerdict FarSource::AcceptsSeam(const vector<LogicalType> &types) {
+	lock_guard<mutex> guard(store->lock);
+	if (!store->takes_seams) {
+		return CrossingVerdict::No("far takes no rows into a read");
+	}
+	for (auto &type : types) {
+		for (auto refused : store->refused_types) {
+			if (type.id() == refused) {
+				return CrossingVerdict::No("far refuses " + type.ToString());
+			}
+		}
+	}
+	return CrossingVerdict::Yes();
+}
+
 CrossingVerdict FarSource::AcceptsOperator(const LogicalOperator &op) {
 	string reason;
 	if (!SubstraitCanRenderOperator(op, reason)) {

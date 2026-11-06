@@ -57,6 +57,22 @@ CrossingWriteNode WriteNodeOf(CrossingTableCatalogEntry &table, CrossingVerb ver
 	return node;
 }
 
+bool FeedIsBareSeam(const LogicalOperator &write_node) {
+	optional_ptr<const LogicalOperator> node = &write_node;
+	while (true) {
+		if (node->children.size() != 1) {
+			return false;
+		}
+		node = node->children[0].get();
+		if (node->type == LogicalOperatorType::LOGICAL_GET) {
+			return node->Cast<LogicalGet>().function.GetName() == CROSSING_SEAM_FUNCTION;
+		}
+		if (node->type != LogicalOperatorType::LOGICAL_PROJECTION) {
+			return false;
+		}
+	}
+}
+
 struct CrossingNearResult {
 	unique_ptr<CrossingSeamFilledWrite> write;
 	bool done = false;
@@ -293,19 +309,18 @@ TableFunction CrossingWriteFunction() {
 }
 
 CrossingSeamFilledWrite::CrossingSeamFilledWrite(const CrossingBindData &write, unique_ptr<ColumnDataCollection> rows)
-    : table(write.table), fragment(write.fragment), slot(fragment->SeamSlot()) {
-	if (slot && (!rows || rows->Count() == 0)) {
-		empty = true;
-		return;
-	}
+    : table(write.table), fragment(write.fragment) {
+	auto slot = fragment->SeamSlot();
 	if (!slot && rows) {
 		throw InternalException("crossing: rows were gathered for a seam a plan already fills");
 	}
+	// Over a bare seam no rows means no write. A join or an aggregate over one still has an answer.
+	if (slot && (!rows || (rows->Count() == 0 && FeedIsBareSeam(*fragment->plan)))) {
+		empty = true;
+		return;
+	}
 	if (slot) {
-		seam_node = std::move(*slot);
-		auto table_index = seam_node->Cast<LogicalGet>().table_index;
-		*slot = make_uniq<LogicalColumnDataGet>(table_index, fragment->seam_types, std::move(rows));
-		fragment->ResolveTypesAndText();
+		filling = make_uniq<CrossingSeamFilling>(fragment, std::move(rows));
 	}
 	query = make_uniq<CrossingQuery>(*fragment->plan);
 	query->types = write.seam.returning_columns.empty() ? vector<LogicalType> {LogicalType::BIGINT}
@@ -317,10 +332,6 @@ CrossingSeamFilledWrite::CrossingSeamFilledWrite(const CrossingBindData &write, 
 CrossingSeamFilledWrite::~CrossingSeamFilledWrite() {
 	reader = nullptr;
 	scan = CrossingScan();
-	if (seam_node) {
-		*slot = std::move(seam_node);
-		fragment->ResolveTypesAndText();
-	}
 }
 
 CrossingWritePull CrossingSeamFilledWrite::Pull(ClientContext &context, CrossingWaker waker) {
@@ -378,22 +389,6 @@ CrossingWritePull CrossingSeamFilledWrite::Pull(ClientContext &context, Crossing
 			affected_rows += NumericCast<idx_t>(result_chunk.GetValue(0, r).GetValue<int64_t>());
 		}
 	}
-}
-
-PhysicalOperator &LogicalNearPassThrough::CreatePlan(ClientContext &, PhysicalPlanGenerator &) {
-	throw InternalException("crossing: a near node's pass-through outlived the optimizers");
-}
-
-string LogicalNearPassThrough::GetName() const {
-	return "CROSSING_NEAR_PASS_THROUGH";
-}
-
-string LogicalNearPassThrough::GetExtensionName() const {
-	return "crossing";
-}
-
-void LogicalNearPassThrough::Serialize(Serializer &) const {
-	throw NotImplementedException("crossing: a near node is planned, never serialized");
 }
 
 LogicalCrossingNear::LogicalCrossingNear(TableIndex table_index_p, vector<ColumnBinding> bindings_p,

@@ -3,8 +3,10 @@
 #include "duckdb/common/serializer/deserializer.hpp"
 #include "duckdb/common/serializer/serializer.hpp"
 #include "duckdb/function/table_function.hpp"
+#include "duckdb/planner/expression/bound_columnref_expression.hpp"
 #include "duckdb/planner/operator/logical_column_data_get.hpp"
 #include "duckdb/planner/operator/logical_get.hpp"
+#include "duckdb/planner/operator/logical_projection.hpp"
 
 namespace duckdb {
 
@@ -120,6 +122,38 @@ unique_ptr<LogicalOperator> MakeSeamNode(idx_t table_index, vector<LogicalType> 
 	                                 std::move(types), std::move(names));
 	get->SetColumnIds(std::move(ids));
 	return std::move(get);
+}
+
+PhysicalOperator &LogicalNearPassThrough::CreatePlan(ClientContext &, PhysicalPlanGenerator &) {
+	throw InternalException("crossing: a near node's pass-through outlived the optimizers");
+}
+
+string LogicalNearPassThrough::GetName() const {
+	return "CROSSING_NEAR_PASS_THROUGH";
+}
+
+string LogicalNearPassThrough::GetExtensionName() const {
+	return "crossing";
+}
+
+void LogicalNearPassThrough::Serialize(Serializer &) const {
+	throw NotImplementedException("crossing: a near node is planned, never serialized");
+}
+
+unique_ptr<LogicalOperator> MakeNearChild(unique_ptr<LogicalOperator> rows, const FreshTableIndex &fresh) {
+	// The near node reads its child by position, but the optimizers that run after this pass reorder by
+	// binding: a build/probe swap of a cross product flips its columns. A projection holds the order.
+	rows->ResolveOperatorTypes();
+	auto bindings = rows->GetColumnBindings();
+	vector<unique_ptr<Expression>> columns;
+	for (idx_t i = 0; i < bindings.size(); i++) {
+		columns.push_back(make_uniq<BoundColumnRefExpression>(rows->types[i], bindings[i]));
+	}
+	auto projection = make_uniq<LogicalProjection>(fresh(), std::move(columns));
+	projection->children.push_back(std::move(rows));
+	auto pass_through = make_uniq<LogicalNearPassThrough>();
+	pass_through->children.push_back(std::move(projection));
+	return std::move(pass_through);
 }
 
 unique_ptr<LogicalOperator> *FindSeamSlot(unique_ptr<LogicalOperator> &plan) {

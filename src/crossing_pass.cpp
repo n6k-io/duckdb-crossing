@@ -46,6 +46,9 @@ void SwapCrossingGetsForTheirNodes(ClientContext &context, unique_ptr<LogicalOpe
 		auto read =
 		    make_uniq<LogicalCrossingRead>(get.table_index, get.GetColumnIds(), get.types, std::move(bind_data));
 		read->SetEstimatedCardinality(cardinality);
+		if (!get.children.empty()) {
+			read->children.push_back(std::move(get.children[0]->children[0]));
+		}
 		node = std::move(read);
 		return;
 	}

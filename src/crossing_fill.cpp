@@ -36,21 +36,6 @@ optional_ptr<CrossingTableCatalogEntry> CrossingTableOfWrite(LogicalOperator &op
 	}
 }
 
-//! The near node reads its child by position, but the optimizers that run after this pass reorder by
-//! binding: a build/probe swap of a cross product flips its columns. A projection holds the order.
-unique_ptr<LogicalOperator> InSeamOrder(unique_ptr<LogicalOperator> rows, const FreshTableIndex &fresh) {
-	rows->ResolveOperatorTypes();
-	auto bindings = rows->GetColumnBindings();
-	vector<unique_ptr<Expression>> columns;
-	for (idx_t i = 0; i < bindings.size(); i++) {
-		columns.push_back(make_uniq<BoundColumnRefExpression>(rows->types[i], bindings[i]));
-	}
-	auto projection = make_uniq<LogicalProjection>(fresh(), std::move(columns));
-	projection->children.push_back(std::move(rows));
-	projection->ResolveOperatorTypes();
-	return std::move(projection);
-}
-
 unique_ptr<LogicalOperator> MakeNearNode(TableIndex table_index, unique_ptr<CrossingBindData> write,
                                          unique_ptr<LogicalOperator> rows, const FreshTableIndex &fresh) {
 	vector<LogicalType> types {LogicalType::BIGINT};
@@ -67,9 +52,7 @@ unique_ptr<LogicalOperator> MakeNearNode(TableIndex table_index, unique_ptr<Cros
 	                                 std::move(types), std::move(names));
 	get->SetColumnIds(std::move(ids));
 	if (rows) {
-		auto pass_through = make_uniq<LogicalNearPassThrough>();
-		pass_through->children.push_back(InSeamOrder(std::move(rows), fresh));
-		get->children.push_back(std::move(pass_through));
+		get->children.push_back(MakeNearChild(std::move(rows), fresh));
 	}
 	return std::move(get);
 }
