@@ -17,6 +17,8 @@ namespace duckdb {
 static constexpr const char *CROSSING_READ_FUNCTION = "crossing_read";
 static constexpr const char *CROSSING_WRITE_FUNCTION = "crossing_write";
 
+struct ShapedWrite;
+
 struct CrossingBindData : public TableFunctionData, public CrossingCarrier {
 	CrossingBindData(CrossingTableCatalogEntry &table, CrossingVerb verb, CrossingSeam seam,
 	                 shared_ptr<CrossingFragment> fragment);
@@ -28,6 +30,8 @@ struct CrossingBindData : public TableFunctionData, public CrossingCarrier {
 	//! A write the feed of which stays near: why, and which seam columns its key is if crossing counts it.
 	string obstacle;
 	vector<idx_t> key_positions;
+	//! Set when far's native statement says the write, rather than a match on its key.
+	shared_ptr<ShapedWrite> shaped;
 
 	const CrossingIdentity &Identity() const override;
 	CrossingVerb Verb() const override {

@@ -1,9 +1,11 @@
 #include "internal/crossing_write.hpp"
 
+#include "internal/crossing_remote.hpp"
 #include "internal/fill.hpp"
 #include "internal/key_check.hpp"
 #include "internal/parking.hpp"
 #include "internal/seam.hpp"
+#include "internal/shaped_write.hpp"
 
 #include "duckdb/common/numeric_utils.hpp"
 #include "duckdb/common/string_util.hpp"
@@ -11,6 +13,8 @@
 #include "duckdb/execution/operator/persistent/physical_merge_into.hpp"
 #include "duckdb/execution/physical_plan_generator.hpp"
 #include "duckdb/planner/expression/bound_columnref_expression.hpp"
+#include "duckdb/planner/expression/bound_comparison_expression.hpp"
+#include "duckdb/planner/expression/bound_conjunction_expression.hpp"
 #include "duckdb/planner/expression/bound_reference_expression.hpp"
 #include "duckdb/parser/parsed_data/create_table_info.hpp"
 #include "duckdb/planner/operator/logical_column_data_get.hpp"
@@ -114,9 +118,113 @@ struct CrossingWriteSourceState : public GlobalSourceState {
 	bool done = false;
 };
 
-CrossingNear &PlanMergeWrite(PhysicalPlanGenerator &planner, LogicalMergeInto &op, ClientContext &context,
-                             CrossingTableCatalogEntry &table, CrossingVerb verb, CrossingSeam seam,
-                             vector<idx_t> key_positions) {
+constexpr idx_t REMOTE_TARGET_INDEX = idx_t(1) << 40;
+
+//! A write as far's statement: the rows come from the fragment's feed, and keys match its first columns.
+CrossingRemoteSlice RemoteWriteSlice(CrossingRemoteStatement &statement, CrossingBindData &bind_data) {
+	auto &fragment = bind_data.fragment;
+	auto &plan = *fragment->plan;
+	auto &node = *WriteOf(plan);
+	auto write = make_uniq<SubstraitWrite>();
+	write->verb = node.verb;
+	write->catalog = node.catalog;
+	write->schema = node.schema;
+	write->table = node.table;
+	write->target_columns = TableColumnNames(bind_data.table);
+	write->target_index = REMOTE_TARGET_INDEX;
+	write->set_columns = node.set_columns;
+	write->returning = node.returning_columns;
+	write->returning_types = node.returning_types;
+
+	CrossingRemoteSlice slice;
+	slice.id = statement.Remote().NextSliceId();
+	slice.keep = fragment;
+	vector<ColumnBinding> bindings;
+	vector<LogicalType> feed_types;
+	if (!plan.children.empty()) {
+		auto &feed = *plan.children[0];
+		slice.borrowed = &feed;
+		feed.ResolveOperatorTypes();
+		bindings = feed.GetColumnBindings();
+		feed_types = feed.types;
+	}
+	if (bind_data.shaped) {
+		auto &shaped = *bind_data.shaped;
+		write->target_index = SHAPED_TARGET_INDEX;
+		write->source_index = SHAPED_SOURCE_INDEX;
+		if (shaped.condition) {
+			slice.owned.push_back(shaped.condition->Copy());
+			write->condition = slice.owned.back().get();
+		}
+		for (auto &value : shaped.values) {
+			slice.owned.push_back(value->Copy());
+			write->values.push_back(*slice.owned.back());
+		}
+		slice.write = std::move(write);
+		return slice;
+	}
+	unique_ptr<Expression> condition;
+	if (node.verb != CrossingVerb::INSERT) {
+		auto key_types = ColumnTypesByName(bind_data.table, node.key_columns);
+		for (idx_t k = 0; k < node.key_columns.size(); k++) {
+			auto column = bind_data.table.GetColumns().GetColumn(Identifier(node.key_columns[k])).Logical().index;
+			auto left = make_uniq<BoundColumnRefExpression>(
+			    key_types[k], ColumnBinding(TableIndex(REMOTE_TARGET_INDEX), ProjectionIndex(column)));
+			auto right = make_uniq<BoundColumnRefExpression>(feed_types[k], bindings[k]);
+			auto same = BoundComparisonExpression::Create(ExpressionType::COMPARE_NOT_DISTINCT_FROM, std::move(left),
+			                                              std::move(right));
+			condition = condition ? make_uniq_base<Expression, BoundConjunctionExpression>(
+			                            ExpressionType::CONJUNCTION_AND, std::move(condition), std::move(same))
+			                      : std::move(same);
+		}
+		for (idx_t i = 0; i < node.set_columns.size(); i++) {
+			auto position = node.key_columns.size() + i;
+			slice.owned.push_back(make_uniq<BoundColumnRefExpression>(feed_types[position], bindings[position]));
+			write->values.push_back(*slice.owned.back());
+		}
+	}
+	if (condition) {
+		slice.owned.push_back(std::move(condition));
+		write->condition = slice.owned.back().get();
+	}
+	slice.write = std::move(write);
+	return slice;
+}
+
+CrossingRemoteKeyCheck RemoteKeyCheck(const CrossingBindData &bind_data) {
+	CrossingRemoteKeyCheck keys;
+	keys.key_positions = bind_data.key_positions;
+	keys.returning = !bind_data.seam.returning_columns.empty();
+	keys.table = bind_data.SourceTable();
+	keys.key_columns = bind_data.seam.key_columns;
+	keys.verb = CrossingVerbName(bind_data.verb);
+	return keys;
+}
+
+void TellPlanned(ClientContext &context, const CrossingBindData &bind_data) {
+	auto &catalog = bind_data.table.ParentCatalog();
+	auto &fragment = *bind_data.fragment;
+	CrossingQuery query(*fragment.plan);
+	query.types = bind_data.seam.returning_columns.empty() ? vector<LogicalType> {LogicalType::BIGINT}
+	                                                       : bind_data.seam.returning_types;
+	query.tables = CrossingTablesOf(*fragment.plan);
+	CrossingAttach::Of(catalog).Session(context, Transaction::Get(context, catalog)).Planned(query);
+}
+
+//! `emit` says, for each output column, which of the columns far returns it is.
+CrossingRemoteColumns RemoteWriteColumns(const CrossingBindData &bind_data, const vector<optional_idx> &emit) {
+	CrossingRemoteColumns columns;
+	columns.received = bind_data.seam.returning_columns.empty() ? vector<LogicalType> {LogicalType::BIGINT}
+	                                                            : bind_data.seam.returning_types;
+	for (auto &position : emit) {
+		columns.positions.push_back(position.IsValid() ? position.GetIndex() : CrossingRemoteColumns::NULL_COLUMN);
+	}
+	return columns;
+}
+
+PhysicalOperator &PlanMergeWrite(PhysicalPlanGenerator &planner, LogicalMergeInto &op, ClientContext &context,
+                                 CrossingTableCatalogEntry &table, CrossingVerb verb, CrossingSeam seam,
+                                 vector<idx_t> key_positions) {
 	auto types = op.types;
 	vector<optional_idx> emit;
 	if (op.return_chunk) {
@@ -132,9 +240,22 @@ CrossingNear &PlanMergeWrite(PhysicalPlanGenerator &planner, LogicalMergeInto &o
 	auto fragment = PlanWriteFragment(table, verb, seam);
 	auto bind_data = MakeWriteBindData(table, verb, std::move(seam), std::move(fragment));
 	bind_data->key_positions = std::move(key_positions);
+	auto &catalog = table.ParentCatalog();
+	auto statement = CrossingAttach::Of(catalog).RemoteStatement(context, Transaction::Get(context, catalog));
+	if (statement) {
+		TellPlanned(context, *bind_data);
+		auto columns = RemoteWriteColumns(*bind_data, emit);
+		auto seam_sink = make_uniq<CrossingRemoteSeamSink>();
+		seam_sink->types = bind_data->fragment->seam_types;
+		seam_sink->keys = RemoteKeyCheck(*bind_data);
+		seam_sink->awaits_result = !op.return_chunk;
+		auto slice = RemoteWriteSlice(*statement, *bind_data);
+		return PlanCrossingRemote(context, planner, std::move(types), std::move(statement), std::move(slice),
+		                          std::move(columns), std::move(seam_sink), nullptr, optional_idx(),
+		                          op.EstimateCardinality(context));
+	}
 	return planner.Make<CrossingNear>(std::move(types), std::move(emit), std::move(bind_data),
-	                                  op.EstimateCardinality(context))
-	    .Cast<CrossingNear>();
+	                                  op.EstimateCardinality(context));
 }
 
 unique_ptr<MergeIntoOperator> PlanCrossingMergeAction(ClientContext &context, LogicalMergeInto &op,
@@ -398,7 +519,24 @@ LogicalCrossingNear::LogicalCrossingNear(TableIndex table_index_p, vector<Column
       emit(std::move(emit_p)), bind_data(std::move(bind_data_p)) {
 }
 
-PhysicalOperator &LogicalCrossingNear::CreatePlan(ClientContext &, PhysicalPlanGenerator &planner) {
+PhysicalOperator &LogicalCrossingNear::CreatePlan(ClientContext &context, PhysicalPlanGenerator &planner) {
+	auto &catalog = bind_data->table.ParentCatalog();
+	auto statement = CrossingAttach::Of(catalog).RemoteStatement(context, Transaction::Get(context, catalog));
+	if (statement) {
+		TellPlanned(context, *bind_data);
+		optional_ptr<PhysicalOperator> feed;
+		unique_ptr<CrossingRemoteSeamSink> seam;
+		optional_idx estimate;
+		if (!children.empty()) {
+			feed = planner.CreatePlan(*children[0]);
+			seam = CrossingSeamSinkOf(context, *feed, RemoteKeyCheck(*bind_data));
+			estimate = feed->estimated_cardinality;
+		}
+		auto columns = RemoteWriteColumns(*bind_data, emit);
+		auto slice = RemoteWriteSlice(*statement, *bind_data);
+		return PlanCrossingRemote(context, planner, output_types, std::move(statement), std::move(slice),
+		                          std::move(columns), std::move(seam), feed, estimate, estimated_cardinality);
+	}
 	auto &node = planner.Make<CrossingNear>(output_types, emit, std::move(bind_data), estimated_cardinality);
 	if (!children.empty()) {
 		node.children.push_back(planner.CreatePlan(*children[0]));
@@ -606,11 +744,75 @@ PhysicalOperator &CrossingWriteCatalog::PlanUpdate(ClientContext &, PhysicalPlan
 	throw PassDidNotRun(op.table);
 }
 
+namespace {
+
+PhysicalOperator &PlanShapedMerge(ClientContext &context, PhysicalPlanGenerator &planner, LogicalMergeInto &op,
+                                  PhysicalOperator &plan, CrossingTableCatalogEntry &table, ShapedWrite &shaped,
+                                  CrossingAttach &attach) {
+	if (op.return_chunk && !table.described.returning) {
+		throw BinderException("crossing: the source of '%s' cannot return rows, so RETURNING is refused",
+		                      table.name.GetIdentifierName());
+	}
+	auto statement = attach.RemoteStatement(context, Transaction::Get(context, table.ParentCatalog()));
+	auto write = make_uniq<SubstraitWrite>();
+	write->merge = true;
+	write->catalog = string();
+	write->schema = table.source_schema;
+	write->table = table.described.name;
+	write->target_columns = TableColumnNames(table);
+	write->target_index = SHAPED_TARGET_INDEX;
+	write->source_index = SHAPED_SOURCE_INDEX;
+	vector<unique_ptr<Expression>> owned;
+	owned.push_back(shaped.condition->Copy());
+	write->condition = owned.back().get();
+	for (auto &action : shaped.actions) {
+		SubstraitWriteAction rendered;
+		rendered.when = action.when;
+		rendered.type = action.type;
+		if (action.condition) {
+			owned.push_back(action.condition->Copy());
+			rendered.condition = owned.back().get();
+		}
+		rendered.columns = action.columns;
+		for (auto &value : action.values) {
+			owned.push_back(value->Copy());
+			rendered.values.push_back(*owned.back());
+		}
+		write->actions.push_back(std::move(rendered));
+	}
+	CrossingRemoteColumns columns;
+	if (op.return_chunk) {
+		write->returning = TableColumnNames(table);
+		write->returning.push_back("merge_action");
+		write->returning_types = op.types;
+		columns = CrossingRemoteColumns::Identity(op.types);
+	} else {
+		columns = CrossingRemoteColumns::Identity({LogicalType::BIGINT});
+	}
+	if (TryPutWriteOnRemote(plan, *statement, write, owned, columns, op.types)) {
+		return plan;
+	}
+	CrossingRemoteSlice slice;
+	slice.id = statement->Remote().NextSliceId();
+	slice.source = MakeSeamNode(0, shaped.source_types);
+	slice.source->ResolveOperatorTypes();
+	slice.write = std::move(write);
+	slice.owned = std::move(owned);
+	auto seam = CrossingSeamSinkOf(context, plan);
+	return PlanCrossingRemote(context, planner, op.types, std::move(statement), std::move(slice), std::move(columns),
+	                          std::move(seam), plan, plan.estimated_cardinality, op.EstimateCardinality(context));
+}
+
+} // namespace
+
 PhysicalOperator &CrossingWriteCatalog::PlanMergeInto(ClientContext &context, PhysicalPlanGenerator &planner,
                                                       LogicalMergeInto &op, PhysicalOperator &plan) {
 	auto table = CrossingTableOf(op.table, attach.Identity());
 	if (!table) {
 		throw PassDidNotRun(op.table);
+	}
+	if (auto shaped = ShapedWrites::Of(context).Take(op)) {
+		return PlanShapedMerge(context, planner, op, plan, *table, *shaped, attach);
 	}
 
 	bool addresses_rows = false;
@@ -637,8 +839,9 @@ PhysicalOperator &CrossingWriteCatalog::PlanMergeInto(ClientContext &context, Ph
 		actions.emplace(entry.first, std::move(planned_actions));
 	}
 
+	auto remote = attach.RemoteStatement(context, Transaction::Get(context, table->ParentCatalog())) != nullptr;
 	auto &result = planner.Make<PhysicalMergeInto>(op.types, plan, std::move(actions), op.row_id_start,
-	                                               op.source_marker, false, op.return_chunk);
+	                                               op.source_marker, false, op.return_chunk, remote);
 	return result;
 }
 
@@ -743,7 +946,28 @@ PhysicalOperator &CrossingAttach::PlanCreateTableAs(ClientContext &context, Phys
 	ddl.schema = schema.name.GetIdentifierName();
 	ddl.table = op.info->Base().GetTableName().GetIdentifierName();
 	ddl.create = op.info->base.get();
-	Authorize(schema, ddl, &Transaction::Get(context, schema.ParentCatalog()));
+	auto &transaction = Transaction::Get(context, schema.ParentCatalog());
+	Authorize(schema, ddl, &transaction);
+	if (auto statement = RemoteStatement(context, transaction)) {
+		auto write = make_uniq<SubstraitWrite>();
+		write->verb = CrossingVerb::CREATE;
+		write->schema = ddl.schema;
+		write->table = ddl.table;
+		for (auto &column : op.info->Base().columns.Logical()) {
+			write->target_columns.push_back(column.GetName().GetIdentifierName());
+		}
+		write->on_conflict = static_cast<uint8_t>(op.info->Base().on_conflict);
+		CrossingRemoteSlice slice;
+		slice.id = statement->Remote().NextSliceId();
+		slice.source = MakeSeamNode(0, plan.types);
+		slice.source->ResolveOperatorTypes();
+		slice.write = std::move(write);
+		NoteAltered(transaction, ddl.schema);
+		auto seam = CrossingSeamSinkOf(context, plan);
+		return PlanCrossingRemote(context, planner, {LogicalType::BIGINT}, std::move(statement), std::move(slice),
+		                          CrossingRemoteColumns::Identity({LogicalType::BIGINT}), std::move(seam), plan,
+		                          plan.estimated_cardinality, op.estimated_cardinality);
+	}
 	auto &result =
 	    planner.Make<CrossingCreateTableAs>(*this, schema, std::move(op.info), plan.types, op.estimated_cardinality);
 	result.children.push_back(plan);

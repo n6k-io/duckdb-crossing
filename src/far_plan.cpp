@@ -118,13 +118,14 @@ TableFunction SeamRowsFunction(const char *name, OrderPreservationType order) {
 
 class PhysicalStreamOut : public PhysicalOperator {
 public:
-	PhysicalStreamOut(PhysicalPlan &physical_plan, vector<LogicalType> types_p, CrossingStreamSink sink_p,
+	PhysicalStreamOut(PhysicalPlan &physical_plan, vector<LogicalType> types_p, CrossingStreamSink sink_p, bool writes_p,
 	                  idx_t estimated_cardinality)
 	    : PhysicalOperator(physical_plan, PhysicalOperatorType::EXTENSION, std::move(types_p), estimated_cardinality),
-	      sink(std::move(sink_p)) {
+	      sink(std::move(sink_p)), writes(writes_p) {
 	}
 
 	CrossingStreamSink sink;
+	bool writes;
 
 	bool IsSink() const override {
 		return true;
@@ -182,11 +183,25 @@ public:
 	void BuildPipelines(Pipeline &current, MetaPipeline &meta_pipeline) override {
 		auto &state = meta_pipeline.GetState();
 		state.SetPipelineSource(current, *this);
+		vector<shared_ptr<Pipeline>> reads;
+		shared_ptr<Pipeline> last_write;
 		for (auto &child : children) {
 			auto &slice = child.get();
 			slice.sink_state.reset();
 			auto &slice_pipeline = meta_pipeline.CreateChildMetaPipeline(current, slice);
 			slice_pipeline.Build(slice.children[0].get());
+			auto base = slice_pipeline.GetBasePipeline();
+			if (!slice.Cast<PhysicalStreamOut>().writes) {
+				reads.push_back(base);
+				continue;
+			}
+			for (auto &read : reads) {
+				base->AddDependency(read);
+			}
+			if (last_write) {
+				base->AddDependency(last_write);
+			}
+			last_write = base;
 		}
 	}
 	vector<const_reference<PhysicalOperator>> GetSources() const override {
@@ -229,8 +244,8 @@ protected:
 class LogicalStreamOut : public LogicalFarOperator {
 public:
 	LogicalStreamOut(TableIndex table_index_p, CrossingLink &link_p, idx_t slice_p, bool ordered_p,
-	                 unique_ptr<LogicalOperator> plan, shared_ptr<CrossingFailure> failure_p)
-	    : LogicalFarOperator(table_index_p), link(link_p), slice(slice_p), ordered(ordered_p),
+	                 bool writes_p, unique_ptr<LogicalOperator> plan, shared_ptr<CrossingFailure> failure_p)
+	    : LogicalFarOperator(table_index_p), link(link_p), slice(slice_p), ordered(ordered_p), writes(writes_p),
 	      failure(std::move(failure_p)) {
 		plan->ResolveOperatorTypes();
 		auto bindings = plan->GetColumnBindings();
@@ -243,6 +258,7 @@ public:
 	CrossingLink &link;
 	idx_t slice;
 	bool ordered;
+	bool writes = false;
 	shared_ptr<CrossingFailure> failure;
 
 	string GetName() const override {
@@ -258,7 +274,7 @@ public:
 		}
 		CrossingStreamSink sink(link, slice, false, std::move(columns), row_types, ordered,
 		                        !ordered || PhysicalPlanGenerator::UseBatchIndex(context, child), failure);
-		auto &out = planner.Make<PhysicalStreamOut>(std::move(row_types), std::move(sink), estimated_cardinality);
+		auto &out = planner.Make<PhysicalStreamOut>(std::move(row_types), std::move(sink), writes, estimated_cardinality);
 		out.children.push_back(child);
 		return out;
 	}
@@ -297,8 +313,7 @@ unique_ptr<LogicalOperator> MakeFarRoot(Binder &binder, CrossingLink &link, vect
                                         shared_ptr<CrossingFailure> failure) {
 	auto root = make_uniq<LogicalFarRoot>(binder.GenerateTableIndex());
 	for (auto &slice : slices) {
-		root->children.push_back(make_uniq<LogicalStreamOut>(binder.GenerateTableIndex(), link, slice.id, slice.ordered,
-		                                                     std::move(slice.plan), failure));
+		root->children.push_back(make_uniq<LogicalStreamOut>(binder.GenerateTableIndex(), link, slice.id, slice.ordered, slice.writes, std::move(slice.plan), failure));
 	}
 	return std::move(root);
 }

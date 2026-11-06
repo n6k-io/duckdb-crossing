@@ -14,6 +14,8 @@
 namespace duckdb {
 
 class AttachedDatabase;
+class CrossingRemote;
+class CrossingRemoteStatement;
 class Catalog;
 class CatalogEntry;
 class SchemaCatalogEntry;
@@ -81,6 +83,8 @@ public:
 	                                    PhysicalOperator &plan);
 
 	CrossingSession &Session(ClientContext &context, Transaction &transaction);
+	//! The statement `context` is planning, when the session runs over a link; null otherwise.
+	shared_ptr<CrossingRemoteStatement> RemoteStatement(ClientContext &context, Transaction &transaction);
 	//! Hands the source's side back; null when the transaction never touched the source. Call this
 	//! before a base transaction manager frees `transaction`, and hand the result to Commit or
 	//! Rollback: a schema the transaction changed is forgotten once the source has resolved it.
@@ -113,6 +117,9 @@ private:
 	struct Slot {
 		mutex lock;
 		unique_ptr<CrossingSession> session;
+		unique_ptr<CrossingRemote> remote;
+		shared_ptr<CrossingRemoteStatement> statement;
+		idx_t statement_query = 0;
 		vector<string> altered_schemas;
 		case_insensitive_map_t<Overlay> overlays;
 	};
@@ -123,6 +130,8 @@ private:
 	optional_ptr<Overlay> OverlayOf(optional_ptr<Transaction> transaction, const string &schema);
 	void Authorize(SchemaCatalogEntry &owner, const CrossingDdl &ddl, optional_ptr<Transaction> transaction);
 	void Settled(CrossingSession &released);
+	void NoteAltered(Transaction &transaction, const string &schema);
+	unique_ptr<CrossingRemote> TakeRemote(CrossingSession &released);
 
 	//! Applies queued Refresh calls. Caller holds schemas_lock.
 	void ApplyRefreshes();
@@ -160,6 +169,7 @@ private:
 	mutex transactions_lock;
 	unordered_map<Transaction *, unique_ptr<Slot>> begun;
 	unordered_map<CrossingSession *, vector<string>> settling;
+	unordered_map<CrossingSession *, unique_ptr<CrossingRemote>> released_remotes;
 };
 
 } // namespace duckdb

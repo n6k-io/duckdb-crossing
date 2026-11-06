@@ -158,8 +158,14 @@ void CrossingFar::RunStatement(CrossingLink &link, CrossingStream &control, cons
 			CrossingFarSlice far_slice;
 			far_slice.id = slice.id;
 			far_slice.ordered = slice.ordered;
+			far_slice.writes = !slice.write_catalog.empty();
 			auto binder = Binder::CreateBinder(context, planner->binder.get());
-			far_slice.plan = binder->Bind(*slice.statement).plan;
+			auto bound = binder->Bind(*slice.statement);
+			if (!slice.returning_types.empty() && bound.types != slice.returning_types) {
+				throw CatalogException("crossing: the write's table changed on the source: it returns other columns "
+				                       "than the description taken at attach says; refresh the attach");
+			}
+			far_slice.plan = std::move(bound.plan);
 			slice_binders.push_back(std::move(binder));
 			slices.push_back(std::move(far_slice));
 		}
@@ -198,8 +204,10 @@ void CrossingFar::RunStatement(CrossingLink &link, CrossingStream &control, cons
 
 void CrossingFar::Serve(CrossingLink &link) {
 	auto control = link.Open(0);
-	auto begin = connection.Query("BEGIN");
-	begin->ThrowIfError();
+	if (!options.transaction_open) {
+		auto begin = connection.Query("BEGIN");
+		begin->ThrowIfError();
+	}
 	const string plan_prefix(CROSSING_CONTROL_PLAN);
 	string header;
 	while (RecvControl(*control, header)) {

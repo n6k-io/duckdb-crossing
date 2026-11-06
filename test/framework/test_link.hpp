@@ -35,6 +35,10 @@ public:
 		lock_guard<mutex> guard(lock);
 		return sending_threads;
 	}
+	idx_t SeamRows() {
+		lock_guard<mutex> guard(lock);
+		return seam_rows;
+	}
 	bool FarSentBeforeSeamEnded() {
 		lock_guard<mutex> guard(lock);
 		return far_sent_before_seam_ended;
@@ -89,6 +93,9 @@ private:
 					stored.rows->Initialize(Allocator::DefaultAllocator(), frame.rows.GetTypes());
 					frame.rows.Copy(*stored.rows);
 					pair.used_streams.insert(id);
+					if (side == 0) {
+						pair.seam_rows += frame.rows.size();
+					}
 					if (side == 1 && !pair.seam_ended) {
 						pair.far_sent_before_seam_ended = true;
 					}
@@ -188,6 +195,7 @@ private:
 	std::set<idx_t> used_streams;
 	std::set<std::thread::id> sending_threads;
 	idx_t waits = 0;
+	idx_t seam_rows = 0;
 	bool seam_ended = false;
 	bool far_sent_before_seam_ended = false;
 };

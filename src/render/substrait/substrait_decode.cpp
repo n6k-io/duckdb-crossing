@@ -176,6 +176,11 @@ public:
 				auto *single = yyjson_obj_get(input, "extensionSingle");
 				slice.statement = WriteStatement(write_detail, single ? Require(single, "input") : nullptr);
 				slice.write_catalog = WriteCatalog(write_detail);
+				size_t type_idx, type_max;
+				yyjson_val *type;
+				yyjson_arr_foreach(Require(write_detail, "returningTypes"), type_idx, type_max, type) {
+					slice.returning_types.push_back(SubstraitTypeFromJson(*conn.context, type));
+				}
 			} else {
 				auto built = Rel(input);
 				auto statement = make_uniq<SelectStatement>();
@@ -283,7 +288,8 @@ private:
 	static vector<unique_ptr<ParsedExpression>> Returning(const vector<string> &columns, const string &alias) {
 		vector<unique_ptr<ParsedExpression>> out;
 		for (auto &column : columns) {
-			out.push_back(alias.empty() ? make_uniq<ColumnRefExpression>(Identifier(column))
+			out.push_back(alias.empty() || column == "merge_action"
+			                  ? make_uniq<ColumnRefExpression>(Identifier(column))
 			                            : make_uniq<ColumnRefExpression>(Identifier(column), Identifier(alias)));
 		}
 		return out;
@@ -374,6 +380,7 @@ private:
 			auto info = make_uniq<CreateTableInfo>(
 			    QualifiedName(Identifier(target_catalog), Identifier(schema), Identifier(table)));
 			info->query = std::move(query);
+			info->on_conflict = static_cast<OnCreateConflict>(yyjson_get_uint(Require(detail, "onConflict")));
 			auto statement = make_uniq<CreateStatement>();
 			statement->info = std::move(info);
 			return std::move(statement);

@@ -1,6 +1,7 @@
 #include "internal/crossing_read.hpp"
 
 #include "crossing_attach.hpp"
+#include "internal/crossing_remote.hpp"
 #include "internal/floor.hpp"
 #include "internal/parking.hpp"
 #include "internal/seam.hpp"
@@ -8,6 +9,7 @@
 
 #include "duckdb/common/string_util.hpp"
 #include "duckdb/execution/physical_plan_generator.hpp"
+#include "duckdb/main/settings.hpp"
 #include "duckdb/planner/operator/logical_column_data_get.hpp"
 #include "duckdb/planner/operator/logical_get.hpp"
 #include "duckdb/transaction/meta_transaction.hpp"
@@ -301,6 +303,39 @@ PhysicalOperator &LogicalCrossingRead::CreatePlan(ClientContext &context, Physic
 	vector<column_t> ids;
 	for (auto &column : column_ids) {
 		ids.push_back(column.GetPrimaryIndex());
+	}
+	auto &catalog = ReadingCatalog(context, *bind_data);
+	auto &attach = CrossingAttach::Of(catalog);
+	auto &transaction = Transaction::Get(context, catalog);
+	if (auto statement = attach.RemoteStatement(context, transaction)) {
+		auto prepared = PrepareReadState(*bind_data->fragment, bind_data->SourceTable(), ids);
+		attach.Session(context, transaction).Planned(*prepared->query);
+		CrossingRemoteColumns columns;
+		columns.received = prepared->query->types;
+		for (idx_t c = 0; c < ids.size(); c++) {
+			if (ids[c] == COLUMN_IDENTIFIER_ROW_ID) {
+				columns.positions.push_back(CrossingRemoteColumns::ROW_ID);
+			} else if (prepared->source_position[c] >= prepared->source_column_count) {
+				columns.positions.push_back(CrossingRemoteColumns::NULL_COLUMN);
+			} else {
+				columns.positions.push_back(prepared->source_position[c]);
+			}
+		}
+		CrossingRemoteSlice slice;
+		slice.id = statement->Remote().NextSliceId();
+		slice.ordered = prepared->query->ordered || Settings::Get<PreserveInsertionOrderSetting>(context);
+		slice.borrowed = bind_data->fragment->plan.get();
+		slice.keep = bind_data->fragment;
+		optional_ptr<PhysicalOperator> feed;
+		unique_ptr<CrossingRemoteSeamSink> seam;
+		optional_idx estimate;
+		if (!children.empty()) {
+			feed = planner.CreatePlan(*children[0]);
+			seam = CrossingSeamSinkOf(context, *feed);
+			estimate = feed->estimated_cardinality;
+		}
+		return PlanCrossingRemote(context, planner, types, std::move(statement), std::move(slice), std::move(columns),
+		                          std::move(seam), feed, estimate, estimated_cardinality);
 	}
 	auto &read = planner.Make<CrossingRead>(types, std::move(bind_data), std::move(ids), estimated_cardinality);
 	if (!children.empty()) {

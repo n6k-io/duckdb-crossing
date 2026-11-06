@@ -383,9 +383,19 @@ struct CrossingIdentity {
 	CrossingIdentity &operator=(const CrossingIdentity &) = delete;
 };
 
+class CrossingLink;
+
 class CrossingSession {
 public:
 	virtual ~CrossingSession() = default;
+
+	//! Non-null: the transaction's statements run as remote operators over this link, not through Run.
+	virtual optional_ptr<CrossingLink> Link(ClientContext &context) {
+		return nullptr;
+	}
+	//! Told of each slice a statement plans over the link.
+	virtual void Planned(const CrossingQuery &query) {
+	}
 
 	virtual CrossingScan Run(ClientContext &context, const CrossingQuery &query) = 0;
 	virtual void Ddl(ClientContext &context, const CrossingDdl &ddl);
@@ -581,6 +591,22 @@ struct SessionContract : CheckRun<Sess, true>,
 };
 
 template <class Sess>
+auto LinkOn(Sess &session, ClientContext &context, int) -> decltype(optional_ptr<CrossingLink>(session.Link(context))) {
+	return session.Link(context);
+}
+template <class Sess>
+optional_ptr<CrossingLink> LinkOn(Sess &, ClientContext &, long) {
+	return nullptr;
+}
+template <class Sess>
+auto PlannedOn(Sess &session, const CrossingQuery &query, int) -> decltype(session.Planned(query)) {
+	session.Planned(query);
+}
+template <class Sess>
+void PlannedOn(Sess &, const CrossingQuery &, long) {
+}
+
+template <class Sess>
 void DdlOn(Sess &session, ClientContext &context, const CrossingDdl &ddl, std::true_type) {
 	session.Ddl(context, ddl);
 }
@@ -708,6 +734,12 @@ public:
 
 	CrossingScan Run(ClientContext &context, const CrossingQuery &query) override {
 		return session->Run(context, query);
+	}
+	optional_ptr<CrossingLink> Link(ClientContext &context) override {
+		return crossing_contract::LinkOn(*session, context, 0);
+	}
+	void Planned(const CrossingQuery &query) override {
+		crossing_contract::PlannedOn(*session, query, 0);
 	}
 	void Ddl(ClientContext &context, const CrossingDdl &ddl) override {
 		crossing_contract::DdlOn(*session, context, ddl, crossing_contract::HasDdl<Sess> {});

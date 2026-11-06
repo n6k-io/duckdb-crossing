@@ -35,7 +35,13 @@ set(CROSSING_LIBRARY_SOURCE_NAMES
     crossing_fill.cpp
     crossing_pass.cpp
     crossing_transactions.cpp
-    crossing_register.cpp)
+    crossing_register.cpp
+    crossing_far.cpp
+    crossing_remote.cpp
+    shaped_write.cpp
+    render/substrait/substrait_types.cpp
+    render/substrait/substrait_render.cpp
+    render/substrait/substrait_decode.cpp)
 
 function(_crossing_expand out_var)
   set(result "")
@@ -77,7 +83,8 @@ endfunction()
 function(crossing_add_to_target target)
   crossing_sources(sources)
   target_sources(${target} PRIVATE ${sources})
-  target_include_directories(${target} PRIVATE ${CROSSING_ROOT}/include)
+  target_include_directories(${target} PRIVATE ${CROSSING_ROOT}/include ${CROSSING_SUBSTRAIT_ROOT}/include
+                                                 ${CROSSING_SUBSTRAIT_ROOT})
 endfunction()
 
 set(CROSSING_SUBSTRAIT_ROOT ${CROSSING_ROOT}/src/render/substrait)
@@ -101,8 +108,6 @@ function(crossing_substrait_sources out_var)
       ${CROSSING_SUBSTRAIT_ROOT}/substrait_types.cpp
       ${CROSSING_SUBSTRAIT_ROOT}/substrait_render.cpp
       ${CROSSING_SUBSTRAIT_ROOT}/substrait_decode.cpp
-      ${CROSSING_ROOT}/src/crossing_far.cpp
-      ${CROSSING_ROOT}/src/crossing_remote.cpp
       PARENT_SCOPE)
 endfunction()
 

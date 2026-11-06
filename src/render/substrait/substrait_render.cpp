@@ -347,11 +347,18 @@ private:
 		for (idx_t c = 0; c < write.target_columns.size(); c++) {
 			scope.emplace_back(TableIndex(write.target_index), ProjectionIndex(c));
 		}
-		scope.insert(scope.end(), bindings.begin(), bindings.end());
+		if (write.source_index.IsValid()) {
+			for (idx_t c = 0; c < bindings.size(); c++) {
+				scope.emplace_back(TableIndex(write.source_index.GetIndex()), ProjectionIndex(c));
+			}
+		} else {
+			scope.insert(scope.end(), bindings.begin(), bindings.end());
+		}
 
 		auto *detail = Detail("Write");
 		yyjson_mut_obj_add_uint(doc, detail, "verb", static_cast<uint8_t>(write.verb));
 		yyjson_mut_obj_add_bool(doc, detail, "merge", write.merge);
+		yyjson_mut_obj_add_uint(doc, detail, "onConflict", write.on_conflict);
 		yyjson_mut_obj_add_strcpy(doc, detail, "catalog", write.catalog.c_str());
 		yyjson_mut_obj_add_strcpy(doc, detail, "schema", write.schema.c_str());
 		yyjson_mut_obj_add_strcpy(doc, detail, "table", write.table.c_str());
@@ -363,6 +370,11 @@ private:
 		yyjson_mut_obj_add_val(doc, detail, "setColumns", Strings(write.set_columns));
 		yyjson_mut_obj_add_val(doc, detail, "values", Exprs(write.values, scope));
 		yyjson_mut_obj_add_val(doc, detail, "returning", Strings(write.returning));
+		auto *returning_types = yyjson_mut_arr(doc);
+		for (auto &type : write.returning_types) {
+			yyjson_mut_arr_add_val(returning_types, Type(type));
+		}
+		yyjson_mut_obj_add_val(doc, detail, "returningTypes", returning_types);
 		auto *actions = yyjson_mut_arr(doc);
 		for (auto &action : write.actions) {
 			auto *entry = yyjson_mut_obj(doc);

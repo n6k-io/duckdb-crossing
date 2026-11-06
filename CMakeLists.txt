@@ -84,7 +84,7 @@ file(GLOB CROSSING_LIBRARY_TEST_SOURCES CONFIGURE_DEPENDS
      ${CMAKE_CURRENT_SOURCE_DIR}/test/library/test_*.cpp)
 crossing_test_target(
   crossing_library_unittest ${CROSSING_LIBRARY_SOURCES}
-  ${CROSSING_SUBSTRAIT_SOURCES} test/far_source/far_source.cpp
+  test/far_source/far_source.cpp
   test/read_only_source/read_only_source.cpp test/own_catalog/own_catalog.cpp
   ${CROSSING_LIBRARY_TEST_SOURCES})
 target_include_directories(

@@ -4,6 +4,7 @@
 #include "internal/crossing_write.hpp"
 #include "internal/fill.hpp"
 #include "internal/names.hpp"
+#include "internal/shaped_write.hpp"
 #include "internal/source_evaluation.hpp"
 
 #include "duckdb/main/settings.hpp"
@@ -70,6 +71,40 @@ void FillFromFeed(ClientContext &context, unique_ptr<LogicalOperator> &node, Cro
 	node = MakeNearNode(table_index, std::move(write), std::move(fill.remainder), fresh);
 }
 
+void FillShaped(ClientContext &context, unique_ptr<LogicalOperator> &node, CrossingTableCatalogEntry &table,
+                shared_ptr<ShapedWrite> shaped, const FreshTableIndex &fresh) {
+	auto verb = VerbOf(*node);
+	if (shaped->reads_target || ReturnsRows(*node)) {
+		RequireVerb(table, CrossingVerb::SELECT);
+	}
+	CrossingSeam seam;
+	seam.types = shaped->source_types;
+	seam.set_columns = shaped->set_columns;
+	if (ReturnsRows(*node)) {
+		if (!table.described.returning) {
+			throw BinderException("crossing: the source of '%s' cannot return rows, so RETURNING is refused",
+			                      table.name.GetIdentifierName());
+		}
+		seam.returning_columns = TableColumnNames(table);
+		seam.returning_types = TableRowTypes(table);
+	}
+	auto table_index = TableIndexOf(*node);
+	if (!shaped->has_source) {
+		auto fragment = PlanBareWriteFragment(table, verb, seam, fresh());
+		auto write = MakeWriteBindData(table, verb, std::move(seam), std::move(fragment));
+		write->shaped = std::move(shaped);
+		node = MakeNearNode(table_index, std::move(write), nullptr, fresh);
+		return;
+	}
+	auto fragment = PlanWriteFragment(table, verb, seam);
+	auto fill = FillSeamFromFeed(std::move(node->children[0]), *fragment, table.source, SeamObstacle(), fresh,
+	                             Settings::Get<ScalarSubqueryErrorOnMultipleRowsSetting>(context));
+	auto write = MakeWriteBindData(table, verb, std::move(seam), std::move(fragment));
+	write->obstacle = std::move(fill.obstacle);
+	write->shaped = std::move(shaped);
+	node = MakeNearNode(table_index, std::move(write), std::move(fill.remainder), fresh);
+}
+
 void FillWrite(ClientContext &context, unique_ptr<LogicalOperator> &node, const FreshTableIndex &fresh,
                const CrossingIdentity &identity) {
 	auto table = CrossingTableOfWrite(*node, identity);
@@ -78,6 +113,10 @@ void FillWrite(ClientContext &context, unique_ptr<LogicalOperator> &node, const 
 	}
 	auto verb = VerbOf(*node);
 	RequireVerb(*table, verb);
+	if (auto shaped = ShapedWrites::Of(context).Take(*node)) {
+		FillShaped(context, node, *table, std::move(shaped), fresh);
+		return;
+	}
 	if (verb != CrossingVerb::INSERT) {
 		RequireKey(*table, table->described, verb == CrossingVerb::UPDATE ? "an update" : "a delete");
 	}
@@ -281,7 +320,8 @@ void FillBareWrite(ClientContext &context, unique_ptr<LogicalOperator> &node, co
 		return;
 	}
 	auto table = CrossingTableOfWrite(*node, identity);
-	if (!table || ReturnsRows(*node) || node->children.size() != 1) {
+	if (!table || ReturnsRows(*node) || node->children.size() != 1 ||
+	    ShapedWrites::Of(context).writes.count(node.get())) {
 		return;
 	}
 	auto verb = VerbOf(*node);

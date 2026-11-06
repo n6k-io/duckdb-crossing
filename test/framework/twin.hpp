@@ -10,7 +10,7 @@
 
 namespace duckdb {
 
-#define EACH_TRANSPORT() GENERATE(Transport::NATIVE, Transport::SUBSTRAIT)
+#define EACH_TRANSPORT() GENERATE(Transport::NATIVE, Transport::SUBSTRAIT, Transport::LINK)
 
 struct Twin {
 	shared_ptr<FarStore> store;

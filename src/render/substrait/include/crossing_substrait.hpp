@@ -55,11 +55,16 @@ struct SubstraitWrite {
 	string table;
 	vector<string> target_columns;
 	idx_t target_index = 0;
+	//! Valid: the expressions read the source's columns by position, under this table index.
+	optional_idx source_index;
 	optional_ptr<const Expression> condition;
 	vector<string> set_columns;
 	vector<reference<const Expression>> values;
 	vector<SubstraitWriteAction> actions;
 	vector<string> returning;
+	vector<LogicalType> returning_types;
+	//! A create: its OnCreateConflict.
+	uint8_t on_conflict = 0;
 };
 
 //! One part of a statement's far plan. `source` holds at most one seam, whose rows come in on this slice's
@@ -89,6 +94,8 @@ struct DecodedSlice {
 	unique_ptr<SQLStatement> statement;
 	//! Set on a write: the catalog it changes.
 	string write_catalog;
+	//! What the write's RETURNING must produce, or empty.
+	vector<LogicalType> returning_types;
 };
 
 struct DecodedStatement {

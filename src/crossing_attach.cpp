@@ -5,6 +5,7 @@
 #include "duckdb/planner/subquery/recursive_dependent_join_planner.hpp"
 
 #include "internal/carrier.hpp"
+#include "internal/crossing_remote.hpp"
 #include "internal/crossing_table_entry.hpp"
 #include "internal/crossing_write.hpp"
 #include "internal/fill.hpp"
@@ -389,13 +390,17 @@ void CrossingAttach::Ddl(ClientContext &context, Transaction &transaction, Schem
 	Authorize(owner, ddl, &transaction);
 	Pin(ddl.schema, owner, ddl.table);
 	Session(context, transaction).Ddl(context, ddl);
+	NoteAltered(transaction, ddl.schema);
+}
+
+void CrossingAttach::NoteAltered(Transaction &transaction, const string &schema) {
 	auto &slot = SlotOf(transaction);
 	lock_guard<mutex> guard(slot.lock);
 	auto &altered = slot.altered_schemas;
-	if (std::find(altered.begin(), altered.end(), ddl.schema) == altered.end()) {
-		altered.push_back(ddl.schema);
+	if (std::find(altered.begin(), altered.end(), schema) == altered.end()) {
+		altered.push_back(schema);
 	}
-	auto &overlay = slot.overlays[ddl.schema];
+	auto &overlay = slot.overlays[schema];
 	overlay.listed = false;
 	overlay.tables.clear();
 	if (overlay.state) {
@@ -457,9 +462,31 @@ CrossingAttach::Slot &CrossingAttach::SlotOf(Transaction &transaction) {
 	return *slot;
 }
 
+shared_ptr<CrossingRemoteStatement> CrossingAttach::RemoteStatement(ClientContext &context, Transaction &transaction) {
+	auto link = Session(context, transaction).Link(context);
+	if (!link) {
+		return nullptr;
+	}
+	auto &slot = SlotOf(transaction);
+	lock_guard<mutex> guard(slot.lock);
+	if (!slot.remote) {
+		slot.remote = make_uniq<CrossingRemote>(*link);
+	}
+	auto query = context.transaction.GetActiveQuery();
+	if (!slot.statement || slot.statement_query != query) {
+		slot.remote->DrainStatement();
+		slot.statement = make_shared_ptr<CrossingRemoteStatement>(*slot.remote);
+		slot.statement_query = query;
+	}
+	return slot.statement;
+}
+
 CrossingSession &CrossingAttach::Session(ClientContext &context, Transaction &transaction) {
 	auto &slot = SlotOf(transaction);
 	lock_guard<mutex> guard(slot.lock);
+	if (slot.remote && slot.statement_query != context.transaction.GetActiveQuery()) {
+		slot.remote->DrainStatement();
+	}
 	if (!slot.session) {
 		slot.session = source->Begin(context);
 		if (!slot.session) {
@@ -486,6 +513,10 @@ unique_ptr<CrossingSession> CrossingAttach::Release(Transaction &transaction) {
 		settling[slot->session.get()] = std::move(slot->altered_schemas);
 	}
 	Retire(*slot);
+	if (slot->remote) {
+		lock_guard<mutex> settling_guard(transactions_lock);
+		released_remotes[slot->session.get()] = std::move(slot->remote);
+	}
 	return std::move(slot->session);
 }
 
@@ -520,16 +551,34 @@ void CrossingAttach::Settled(CrossingSession &released) {
 	}
 }
 
+unique_ptr<CrossingRemote> CrossingAttach::TakeRemote(CrossingSession &released) {
+	lock_guard<mutex> guard(transactions_lock);
+	auto it = released_remotes.find(&released);
+	if (it == released_remotes.end()) {
+		return nullptr;
+	}
+	auto remote = std::move(it->second);
+	released_remotes.erase(it);
+	return remote;
+}
+
 ErrorData CrossingAttach::Commit(unique_ptr<CrossingSession> released) {
 	if (!released) {
 		return ErrorData();
 	}
 	ErrorData error;
 	try {
+		if (auto remote = TakeRemote(*released)) {
+			remote->Commit();
+		}
 		released->Commit();
 	} catch (std::exception &ex) {
 		ErrorData failure(ex);
 		error = ErrorData(failure.Type(), "crossing: commit on source failed: " + failure.RawMessage());
+		try {
+			released->Rollback();
+		} catch (...) {
+		}
 	}
 	Settled(*released);
 	return error;
@@ -538,6 +587,12 @@ ErrorData CrossingAttach::Commit(unique_ptr<CrossingSession> released) {
 void CrossingAttach::Rollback(unique_ptr<CrossingSession> released) {
 	if (!released) {
 		return;
+	}
+	try {
+		if (auto remote = TakeRemote(*released)) {
+			remote->Rollback();
+		}
+	} catch (...) {
 	}
 	try {
 		released->Rollback();

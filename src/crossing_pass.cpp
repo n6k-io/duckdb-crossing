@@ -6,6 +6,7 @@
 #include "internal/crossing_write.hpp"
 #include "internal/fill.hpp"
 #include "internal/pass.hpp"
+#include "internal/shaped_write.hpp"
 
 #include "duckdb/main/settings.hpp"
 #include "duckdb/optimizer/optimizer.hpp"
@@ -92,6 +93,7 @@ void CrossingFoldPass(OptimizerExtensionInput &input, unique_ptr<LogicalOperator
 	RefuseWritesInCtes(*plan, identity);
 	LeaveInsertDefaultsToSource(*plan, identity);
 	NarrowSetsToWhatChanges(*plan, identity);
+	ShapeWrites(input.context, plan, fresh, identity);
 	FillBareWrites(input.context, plan, fresh, identity);
 	ResolveKeyAliases(*plan, identity);
 	FoldCrossableWorkIntoFragments(plan, fresh, identity,

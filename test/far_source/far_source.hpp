@@ -1,5 +1,8 @@
 #pragma once
 
+#include "crossing_far.hpp"
+#include "framework/test_link.hpp"
+
 #include "crossing.hpp"
 #include "crossing_substrait.hpp"
 
@@ -14,7 +17,7 @@
 
 namespace duckdb {
 
-enum class Transport { NATIVE, SUBSTRAIT };
+enum class Transport { NATIVE, SUBSTRAIT, LINK };
 
 const char *TransportName(Transport transport);
 
@@ -116,6 +119,7 @@ struct FarStore {
 
 	vector<FarCall> reads;
 	vector<FarCall> writes;
+	idx_t link_seam_rows = 0;
 	vector<FarDdl> ddls;
 	//! Interned `GROUP` attach options; an element's address is the group of every attach naming it.
 	set<string> groups;
@@ -169,8 +173,11 @@ public:
 	CrossingTable Describe(const string &schema, const string &name);
 	void Commit();
 	void Rollback();
+	optional_ptr<CrossingLink> Link(ClientContext &context);
+	void Planned(const CrossingQuery &query);
 
 private:
+	void EndServing();
 	vector<vector<Value>> Evaluate(const LogicalOperator &plan, FarCall &call);
 	vector<vector<Value>> EvaluateNative(const LogicalOperator &plan, FarCall &call);
 	vector<vector<Value>> EvaluateSubstrait(const LogicalOperator &plan, FarCall &call);
@@ -184,6 +191,9 @@ private:
 	string catalog;
 	mutex far_lock;
 	Connection far;
+	unique_ptr<TestLinkPair> link_pair;
+	unique_ptr<CrossingFar> far_side;
+	std::thread serving;
 };
 
 class FarSource {

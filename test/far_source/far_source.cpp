@@ -178,7 +178,14 @@ CrossingReader FarReader(shared_ptr<const vector<vector<Value>>> rows, idx_t par
 } // namespace
 
 const char *TransportName(Transport transport) {
-	return transport == Transport::NATIVE ? "native" : "substrait";
+	switch (transport) {
+	case Transport::NATIVE:
+		return "native";
+	case Transport::SUBSTRAIT:
+		return "substrait";
+	default:
+		return "link";
+	}
 }
 
 bool FarCall::Has(LogicalOperatorType type) const {
@@ -460,6 +467,7 @@ FarSession::FarSession(shared_ptr<FarStore> store_p, string catalog_p)
 }
 
 FarSession::~FarSession() {
+	EndServing();
 	if (far.context->transaction.HasActiveTransaction()) {
 		far.Rollback();
 	}
@@ -476,14 +484,59 @@ CrossingTable FarSession::Describe(const string &schema, const string &name) {
 	return FarSource::DescribeOn(*store, far, catalog, schema, name);
 }
 
+void FarSession::EndServing() {
+	if (serving.joinable()) {
+		serving.join();
+		lock_guard<mutex> guard(store->lock);
+		store->link_seam_rows += link_pair->SeamRows();
+	}
+}
+
+optional_ptr<CrossingLink> FarSession::Link(ClientContext &) {
+	if (store->transport != Transport::LINK) {
+		return nullptr;
+	}
+	lock_guard<mutex> guard(far_lock);
+	if (!link_pair) {
+		link_pair = make_uniq<TestLinkPair>(store->read_partitions);
+		CrossingFarOptions options;
+		options.catalogs = store->catalog_check;
+		options.transaction_open = true;
+		far_side = make_uniq<CrossingFar>(far, catalog, options);
+		serving = std::thread([this]() {
+			try {
+				far_side->Serve(link_pair->Far());
+			} catch (...) {
+			}
+		});
+	}
+	return link_pair->Near();
+}
+
+void FarSession::Planned(const CrossingQuery &query) {
+	auto call = Record(query);
+	lock_guard<mutex> guard(store->lock);
+	if (WriteOf(query.plan)) {
+		store->writes.push_back(std::move(call));
+	} else {
+		store->reads.push_back(std::move(call));
+	}
+}
+
 void FarSession::Commit() {
-	far.Commit();
+	EndServing();
+	if (far.context->transaction.HasActiveTransaction()) {
+		far.Commit();
+	}
 	lock_guard<mutex> guard(store->lock);
 	store->transaction_ends.push_back("commit");
 }
 
 void FarSession::Rollback() {
-	far.Rollback();
+	EndServing();
+	if (far.context->transaction.HasActiveTransaction()) {
+		far.Rollback();
+	}
 	lock_guard<mutex> guard(store->lock);
 	store->transaction_ends.push_back("rollback");
 }
