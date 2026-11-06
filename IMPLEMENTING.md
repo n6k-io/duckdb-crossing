@@ -309,6 +309,10 @@ nothing else. Check `SeamRowsOf(query.plan)` first on a write: gathered rows can
 any size, and JSON is a poor way to move them. Stacking operators on the seam in
 `Plan` makes it null, and rendering then puts those rows in the JSON.
 
+Gathered rows may have spilled to disk, so walk `SeamRowsOf(query.plan)->Chunks()`
+and send them in whatever batches the transport needs. Crossing sets no size
+limit. A source that cannot move them all fails the statement with its reason.
+
 ## Transactions
 
 `Begin` is called on a DuckDB transaction's first `Read`, `Write` or `Ddl`. Every
@@ -316,6 +320,14 @@ any size, and JSON is a poor way to move them. Stacking operators on the seam in
 the transaction resolves, `Commit` or `Rollback` is called and the session
 destroyed. A `Commit` that throws fails the statement; nothing is undone
 elsewhere. A `Rollback` that throws is discarded.
+
+A write must not be durable until `Commit`. This holds in autocommit too, where
+the statement's session resolves after its last writer returned. A statement can
+fail after a writer returned: a later `MERGE` action can fail, and crossing can
+find that a key without `key_unique` matched more rows than it sent. `Rollback`
+must then leave the source as it was. A source that cannot hold a write until
+`Commit` must not declare a key without `key_unique`, and a `MERGE` of more than
+one action on it is not atomic.
 
 ## Detach
 

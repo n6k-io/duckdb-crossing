@@ -2,6 +2,7 @@
 #include "internal/crossing_catalog.hpp"
 #include "internal/crossing_pass.hpp"
 #include "internal/crossing_transactions.hpp"
+#include "internal/fill.hpp"
 
 #include "duckdb/main/config.hpp"
 #include "duckdb/main/database.hpp"
@@ -58,6 +59,7 @@ void RegisterCrossingPass(DatabaseInstance &db, const CrossingIdentity &identity
 	pass.optimizer_info = make_shared_ptr<CrossingPassInfo>(identity);
 	OptimizerExtension::Register(config, pass);
 	RegisterCrossingPlanFunctions(db);
+	RegisterSourceDefaultFunction(db);
 }
 
 void RegisterCrossing(ExtensionLoader &loader, const string &type, const CrossingIdentity &identity,

@@ -9,6 +9,11 @@
 
 namespace duckdb {
 
+//! Drops the columns an insert did not name from its row and records them in `column_index_map`, so the
+//! source applies its own defaults. RETURNING needs a whole row on the target, so it keeps them, and the
+//! statement fails when they execute.
+void LeaveInsertDefaultsToSource(LogicalOperator &plan, const CrossingIdentity &identity);
+
 //! Turns every update and delete that reads nothing of the rows it writes into one that names no key.
 //! Runs before any fold, while such a write still sits directly on its own table's scan.
 void FillBareWrites(ClientContext &context, unique_ptr<LogicalOperator> &plan, const FreshTableIndex &fresh,

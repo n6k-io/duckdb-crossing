@@ -287,7 +287,9 @@ CatalogEntry &CrossingAttach::GetOrDescribe(SchemaState &state, const string &sc
 	// an entry nothing can resolve.
 	auto create_info = make_uniq<CreateTableInfo>(owner, Identifier(name));
 	for (idx_t c = 0; c < column_names.size(); c++) {
-		create_info->columns.AddColumn(ColumnDefinition(Identifier(column_names[c]), column_types[c]));
+		ColumnDefinition column(Identifier(column_names[c]), column_types[c]);
+		column.SetDefaultValue(SourceDefaultExpression());
+		create_info->columns.AddColumn(std::move(column));
 	}
 	for (auto &constraint : described.constraints) {
 		create_info->constraints.push_back(constraint->Copy());

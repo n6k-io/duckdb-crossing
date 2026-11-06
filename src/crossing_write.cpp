@@ -1,5 +1,6 @@
 #include "internal/crossing_write.hpp"
 
+#include "internal/fill.hpp"
 #include "internal/key_check.hpp"
 #include "internal/parking.hpp"
 #include "internal/seam.hpp"
@@ -151,26 +152,26 @@ unique_ptr<MergeIntoOperator> PlanCrossingMergeAction(ClientContext &context, Lo
 	}
 	case MergeActionType::MERGE_INSERT: {
 		RequireVerb(table, CrossingVerb::INSERT);
-		auto seam = SeamOf(table, table.described, CrossingVerb::INSERT, {});
+		auto names = TableColumnNames(table);
+		vector<string> named;
+		vector<unique_ptr<Expression>> values;
+		for (idx_t c = 0; c < action.expressions.size(); c++) {
+			if (op.return_chunk || !IsSourceDefault(*action.expressions[c])) {
+				named.push_back(names[c]);
+				values.push_back(std::move(action.expressions[c]));
+			}
+		}
+		if (named.empty()) {
+			throw BinderException("crossing: a MERGE into '%s' cannot insert DEFAULT VALUES; name at least one column",
+			                      table.name.GetIdentifierName());
+		}
+		auto seam = SeamOf(table, table.described, CrossingVerb::INSERT, std::move(named));
 		auto fragment = PlanWriteFragment(table, CrossingVerb::INSERT, seam);
 		auto &insert = planner.Make<CrossingWrite>(
 		    MakeWriteBindData(table, CrossingVerb::INSERT, seam, std::move(fragment)), return_types, cardinality);
 		insert.Cast<CrossingWrite>().return_chunk = op.return_chunk;
 		result->op = insert;
-
-		if (!action.column_index_map.empty()) {
-			vector<unique_ptr<Expression>> new_expressions;
-			for (auto &column : table.GetColumns().Physical()) {
-				auto mapped_index = action.column_index_map[column.Physical()];
-				if (mapped_index == DConstants::INVALID_INDEX) {
-					new_expressions.push_back(op.bound_defaults[column.StorageOid()]->Copy());
-				} else {
-					new_expressions.push_back(std::move(action.expressions[mapped_index]));
-				}
-			}
-			action.expressions = std::move(new_expressions);
-		}
-		result->expressions = std::move(action.expressions);
+		result->expressions = std::move(values);
 		break;
 	}
 	case MergeActionType::MERGE_ERROR:
@@ -312,8 +313,8 @@ CrossingSeam SeamOf(TableCatalogEntry &table, const CrossingTable &described, Cr
                     vector<string> set_columns) {
 	CrossingSeam seam;
 	if (verb == CrossingVerb::INSERT) {
-		seam.set_columns = TableColumnNames(table);
-		seam.types = TableRowTypes(table);
+		seam.types = ColumnTypesByName(table, set_columns);
+		seam.set_columns = std::move(set_columns);
 		return seam;
 	}
 	seam.key_columns = described.key;
@@ -667,9 +668,9 @@ CrossingWrite::CrossingWrite(PhysicalPlan &physical_plan, unique_ptr<CrossingBin
       bind_data(std::move(bind_data_p)) {
 }
 
-unique_ptr<GlobalSinkState> CrossingWrite::GetGlobalSinkState(ClientContext &) const {
+unique_ptr<GlobalSinkState> CrossingWrite::GetGlobalSinkState(ClientContext &context) const {
 	auto state = make_uniq<CrossingWriteState>();
-	state->rows = make_uniq<ColumnDataCollection>(Allocator::DefaultAllocator(), bind_data->fragment->seam_types);
+	state->rows = make_uniq<ColumnDataCollection>(context, bind_data->fragment->seam_types);
 	if (return_chunk) {
 		state->returned =
 		    make_uniq<ColumnDataCollection>(Allocator::DefaultAllocator(), TableRowTypes(bind_data->table));
@@ -785,9 +786,9 @@ CrossingCreateTableAs::CrossingCreateTableAs(PhysicalPlan &physical_plan, Crossi
       attach(attach_p), owner(owner_p), info(std::move(info_p)), row_types(std::move(row_types_p)) {
 }
 
-unique_ptr<GlobalSinkState> CrossingCreateTableAs::GetGlobalSinkState(ClientContext &) const {
+unique_ptr<GlobalSinkState> CrossingCreateTableAs::GetGlobalSinkState(ClientContext &context) const {
 	auto state = make_uniq<CrossingCreateTableAsState>();
-	state->rows = make_uniq<ColumnDataCollection>(Allocator::DefaultAllocator(), row_types);
+	state->rows = make_uniq<ColumnDataCollection>(context, row_types);
 	return std::move(state);
 }
 
@@ -818,7 +819,7 @@ SinkFinalizeType CrossingCreateTableAs::Finalize(Pipeline &, Event &, ClientCont
 		}
 		auto &table = entry->Cast<CrossingTableCatalogEntry>();
 		RequireVerb(table, CrossingVerb::INSERT);
-		auto seam = SeamOf(table, table.described, CrossingVerb::INSERT, {});
+		auto seam = SeamOf(table, table.described, CrossingVerb::INSERT, TableColumnNames(table));
 		if (seam.types != row_types) {
 			throw BinderException("crossing: the source describes '%s' with columns other than the ones it was "
 			                      "created with",

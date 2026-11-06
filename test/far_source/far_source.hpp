@@ -71,6 +71,7 @@ struct FarCall {
 	vector<string> set_columns;
 	vector<vector<Value>> rows;
 	bool rows_only = false;
+	idx_t target_swap_bytes = 0;
 	string wire;
 	string received_text;
 

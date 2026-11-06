@@ -9,9 +9,15 @@
 #include "internal/source_evaluation.hpp"
 
 #include "duckdb/common/string_util.hpp"
+#include "duckdb/catalog/catalog.hpp"
 #include "duckdb/common/types/column/column_data_collection.hpp"
 #include "duckdb/execution/expression_executor.hpp"
+#include "duckdb/function/scalar_function.hpp"
+#include "duckdb/parser/expression/function_expression.hpp"
+#include "duckdb/parser/parsed_data/create_scalar_function_info.hpp"
+#include "duckdb/planner/expression/bound_cast_expression.hpp"
 #include "duckdb/planner/expression/bound_columnref_expression.hpp"
+#include "duckdb/planner/expression/bound_function_expression.hpp"
 #include "duckdb/planner/operator/logical_column_data_get.hpp"
 #include "duckdb/planner/operator/logical_delete.hpp"
 #include "duckdb/planner/operator/logical_expression_get.hpp"
@@ -23,6 +29,14 @@
 namespace duckdb {
 
 namespace {
+
+constexpr const char *SOURCE_DEFAULT_FUNCTION = "crossing_source_default";
+
+void ThrowSourceDefault(DataChunk &, ExpressionState &, Vector &) {
+	throw InvalidInputException("crossing: only the source knows this column's default, so it cannot be computed "
+	                            "here. Leave the column out of an INSERT without RETURNING; DEFAULT itself is not "
+	                            "supported");
+}
 
 string NameOfColumn(LogicalOperator &below, idx_t position) {
 	switch (below.type) {
@@ -89,22 +103,11 @@ vector<idx_t> KeysThenSetInImage(const vector<column_t> &key_columns, const vect
 	return positions;
 }
 
-CrossingFeed InsertFeed(LogicalInsert &insert, unique_ptr<LogicalOperator> feed, const FreshTableIndex &fresh) {
+CrossingFeed InsertFeed(unique_ptr<LogicalOperator> feed, const FreshTableIndex &fresh) {
 	feed->ResolveOperatorTypes();
 	vector<unique_ptr<Expression>> row;
-	if (insert.column_index_map.empty()) {
-		for (idx_t c = 0; c < feed->types.size(); c++) {
-			row.push_back(RefTo(*feed, c));
-		}
-	} else {
-		for (idx_t c = 0; c < insert.column_index_map.size(); c++) {
-			auto from = insert.column_index_map[PhysicalIndex(c)];
-			if (from == DConstants::INVALID_INDEX) {
-				row.push_back(insert.bound_defaults[c]->Copy());
-			} else {
-				row.push_back(RefTo(*feed, from));
-			}
-		}
+	for (idx_t c = 0; c < feed->types.size(); c++) {
+		row.push_back(RefTo(*feed, c));
 	}
 	CrossingFeed result;
 	result.plan = ProjectionOver(std::move(row), std::move(feed), fresh);
@@ -245,7 +248,7 @@ CrossingFeed FeedOf(LogicalOperator &write, const vector<column_t> &key_columns,
                     const FreshTableIndex &fresh) {
 	switch (write.type) {
 	case LogicalOperatorType::LOGICAL_INSERT:
-		return InsertFeed(write.Cast<LogicalInsert>(), std::move(feed), fresh);
+		return InsertFeed(std::move(feed), fresh);
 	case LogicalOperatorType::LOGICAL_UPDATE:
 		return UpdateFeed(write.Cast<LogicalUpdate>(), key_columns, std::move(feed), fresh);
 	case LogicalOperatorType::LOGICAL_DELETE:
@@ -290,6 +293,30 @@ SeamFill FillSeamFromFeed(unique_ptr<LogicalOperator> feed, CrossingFragment &fr
 	RejoinAdjacentFiltersEverywhere(fragment.plan, identity);
 	fragment.ResolveTypesAndText();
 	return fill;
+}
+
+unique_ptr<ParsedExpression> SourceDefaultExpression() {
+	return make_uniq<FunctionExpression>(Identifier(SOURCE_DEFAULT_FUNCTION), vector<unique_ptr<ParsedExpression>>());
+}
+
+void RegisterSourceDefaultFunction(DatabaseInstance &db) {
+	ScalarFunction function(SOURCE_DEFAULT_FUNCTION, {}, LogicalType::SQLNULL, ThrowSourceDefault);
+	function.SetVolatile();
+	function.SetFallible();
+	CreateScalarFunctionInfo info(function);
+	info.on_conflict = OnCreateConflict::IGNORE_ON_CONFLICT;
+	Catalog::GetSystemCatalog(db).CreateFunction(CatalogTransaction::GetSystemTransaction(db), info);
+}
+
+bool IsSourceDefault(const Expression &expr) {
+	if (expr.GetExpressionClass() != ExpressionClass::BOUND_FUNCTION) {
+		return false;
+	}
+	auto &function = expr.Cast<BoundFunctionExpression>();
+	if (BoundCastExpression::IsCast(expr)) {
+		return IsSourceDefault(BoundCastExpression::Child(function));
+	}
+	return function.Function().GetName() == SOURCE_DEFAULT_FUNCTION;
 }
 
 void MaterialiseConstantRows(ClientContext &context, unique_ptr<LogicalOperator> &node, bool only_consistent) {

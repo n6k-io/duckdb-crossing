@@ -14,7 +14,9 @@
 #include "duckdb/planner/operator/logical_dummy_scan.hpp"
 #include "duckdb/planner/operator/logical_expression_get.hpp"
 #include "duckdb/planner/operator/logical_get.hpp"
+#include "duckdb/planner/logical_operator_visitor.hpp"
 #include "duckdb/planner/operator/logical_insert.hpp"
+#include "duckdb/planner/operator/logical_merge_into.hpp"
 #include "duckdb/planner/operator/logical_projection.hpp"
 #include "duckdb/planner/operator/logical_update.hpp"
 
@@ -200,9 +202,53 @@ unique_ptr<LogicalOperator> OneRowOf(ClientContext &context, vector<unique_ptr<E
 	return row;
 }
 
+bool HoldsSourceDefault(LogicalOperator &op) {
+	bool found = false;
+	LogicalOperatorVisitor::EnumerateExpressions(op, [&found](unique_ptr<Expression> *expr) {
+		found |= IsSourceDefault(**expr);
+	});
+	for (auto &child : op.children) {
+		found |= HoldsSourceDefault(*child);
+	}
+	return found;
+}
+
+//! DuckDB binds ON CONFLICT as a merge whose source computes the columns left out, as `excluded` may read
+//! them. A merge's own values sit in the projection directly under it, so only what is below that counts.
+void RequireConflictClauseNamesEveryColumn(LogicalMergeInto &merge, const CrossingIdentity &identity) {
+	if (!CrossingTableOf(merge.table, identity) || merge.children.size() != 1) {
+		return;
+	}
+	for (auto &child : merge.children[0]->children) {
+		if (HoldsSourceDefault(*child)) {
+			throw BinderException("crossing: ON CONFLICT on '%s' must give every column a value: only the source "
+			                      "knows the default of a column left out",
+			                      merge.table.name.GetIdentifierName());
+		}
+	}
+}
+
+//! For a write that takes nothing: DuckDB has no scan of zero columns to stand for a seam, so the source
+//! is not asked for a plan and the query carries a placeholder.
+shared_ptr<CrossingFragment> PlaceholderFragment(const FreshTableIndex &fresh) {
+	auto fragment = make_shared_ptr<CrossingFragment>();
+	fragment->plan = make_uniq<LogicalDummyScan>(fresh());
+	fragment->ResolveTypesAndText();
+	return fragment;
+}
+
 //! Builds the write CrossingQuery::reads_rows describes. An update's values are worked out once, here.
 void FillBareWrite(ClientContext &context, unique_ptr<LogicalOperator> &node, const FreshTableIndex &fresh,
                    const CrossingIdentity &identity) {
+	if (node->type == LogicalOperatorType::LOGICAL_INSERT) {
+		auto table = CrossingTableOfWrite(*node, identity);
+		if (table && !node->Cast<LogicalInsert>().column_index_map.empty() && SetColumnsOf(*node, *table).empty()) {
+			RequireVerb(*table, CrossingVerb::INSERT);
+			node = MakeFence(TableIndexOf(*node), MakeWriteBindData(*table, CrossingVerb::INSERT, CrossingSeam(),
+			                                                        PlaceholderFragment(fresh)));
+		}
+		return;
+	}
 	if (node->type != LogicalOperatorType::LOGICAL_UPDATE && node->type != LogicalOperatorType::LOGICAL_DELETE) {
 		return;
 	}
@@ -226,12 +272,7 @@ void FillBareWrite(ClientContext &context, unique_ptr<LogicalOperator> &node, co
 	seam.set_columns = SetColumnsOf(*node, *table);
 	seam.types = ColumnTypesByName(*table, seam.set_columns);
 	if (verb == CrossingVerb::DELETE_) {
-		// Nothing goes in: DuckDB has no scan of zero columns to stand for a seam, so the source is not
-		// asked for a plan and the query carries a placeholder.
-		auto fragment = make_shared_ptr<CrossingFragment>();
-		fragment->plan = make_uniq<LogicalDummyScan>(fresh());
-		fragment->ResolveTypesAndText();
-		node = MakeFence(TableIndexOf(*node), MakeWriteBindData(*table, verb, std::move(seam), std::move(fragment)));
+		node = MakeFence(TableIndexOf(*node), MakeWriteBindData(*table, verb, std::move(seam), PlaceholderFragment(fresh)));
 		return;
 	}
 	auto fragment = PlanWriteFragment(*table, verb, seam);
@@ -241,6 +282,42 @@ void FillBareWrite(ClientContext &context, unique_ptr<LogicalOperator> &node, co
 }
 
 } // namespace
+
+void LeaveInsertDefaultsToSource(LogicalOperator &plan, const CrossingIdentity &identity) {
+	for (auto &child : plan.children) {
+		LeaveInsertDefaultsToSource(*child, identity);
+	}
+	if (plan.type == LogicalOperatorType::LOGICAL_MERGE_INTO) {
+		RequireConflictClauseNamesEveryColumn(plan.Cast<LogicalMergeInto>(), identity);
+		return;
+	}
+	if (plan.type != LogicalOperatorType::LOGICAL_INSERT) {
+		return;
+	}
+	auto &insert = plan.Cast<LogicalInsert>();
+	if (!CrossingTableOf(insert.table, identity) || insert.return_chunk || insert.children.size() != 1 ||
+	    insert.children[0]->type != LogicalOperatorType::LOGICAL_PROJECTION) {
+		return;
+	}
+	auto &projection = insert.children[0]->Cast<LogicalProjection>();
+	bool any = false;
+	for (auto &expr : projection.expressions) {
+		any |= IsSourceDefault(*expr);
+	}
+	if (!any) {
+		return;
+	}
+	vector<unique_ptr<Expression>> named;
+	for (auto &expr : projection.expressions) {
+		if (IsSourceDefault(*expr)) {
+			insert.column_index_map.push_back(DConstants::INVALID_INDEX);
+		} else {
+			insert.column_index_map.push_back(named.size());
+			named.push_back(std::move(expr));
+		}
+	}
+	projection.expressions = std::move(named);
+}
 
 void FillBareWrites(ClientContext &context, unique_ptr<LogicalOperator> &plan, const FreshTableIndex &fresh,
                     const CrossingIdentity &identity) {
@@ -293,6 +370,18 @@ TableIndex TableIndexOf(LogicalOperator &op) {
 
 vector<string> SetColumnsOf(LogicalOperator &op, TableCatalogEntry &table) {
 	vector<string> out;
+	if (op.type == LogicalOperatorType::LOGICAL_INSERT) {
+		auto &named = op.Cast<LogicalInsert>().column_index_map;
+		if (named.empty()) {
+			return TableColumnNames(table);
+		}
+		for (auto &column : table.GetColumns().Physical()) {
+			if (named[column.Physical()] != DConstants::INVALID_INDEX) {
+				out.push_back(column.GetName().GetIdentifierName());
+			}
+		}
+		return out;
+	}
 	if (op.type != LogicalOperatorType::LOGICAL_UPDATE) {
 		return out;
 	}

@@ -183,20 +183,23 @@ unique_ptr<ParsedExpression> KeysMatch(const CrossingWriteTarget &target, const 
 
 unique_ptr<SQLStatement> InsertOf(const CrossingWriteTarget &target, unique_ptr<TableRef> seam,
                                   const vector<string> &seam_columns) {
-	auto node = make_uniq<SelectNode>();
-	for (idx_t c = 0; c < target.set_columns.size(); c++) {
-		auto column = make_uniq<ColumnRefExpression>(Identifier(seam_columns[c]), SEAM_ALIAS);
-		column->SetAlias(Identifier(target.set_columns[c]));
-		node->select_list.push_back(std::move(column));
-	}
-	node->from_table = std::move(seam);
-	auto select = make_uniq<SelectStatement>();
-	select->node = std::move(node);
-
 	auto insert = make_uniq<InsertQueryNode>();
 	insert->SetQualifiedName(Identifier(target.catalog), Identifier(target.schema), Identifier(target.table));
-	insert->columns = IdentifiersOf(target.set_columns);
-	insert->select_statement = std::move(select);
+	if (seam) {
+		auto node = make_uniq<SelectNode>();
+		for (idx_t c = 0; c < target.set_columns.size(); c++) {
+			auto column = make_uniq<ColumnRefExpression>(Identifier(seam_columns[c]), SEAM_ALIAS);
+			column->SetAlias(Identifier(target.set_columns[c]));
+			node->select_list.push_back(std::move(column));
+		}
+		node->from_table = std::move(seam);
+		auto select = make_uniq<SelectStatement>();
+		select->node = std::move(node);
+		insert->columns = IdentifiersOf(target.set_columns);
+		insert->select_statement = std::move(select);
+	} else {
+		insert->default_values = true;
+	}
 	auto statement = make_uniq<InsertStatement>();
 	statement->node = std::move(insert);
 	return std::move(statement);

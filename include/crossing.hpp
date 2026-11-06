@@ -199,8 +199,10 @@ struct CrossingQuery {
 	CrossingTableUse written;
 	//! What an update or a delete addresses rows by. An insert names none.
 	vector<string> key_columns;
-	//! The columns a write sets. An insert names every column of the table, in the order Describe
-	//! declared them. An update names the columns it sets. A delete names none.
+	//! The columns a write sets. An insert names the columns the statement gave a value, in the order
+	//! Describe declared them; the source applies its own defaults to the rest. `INSERT ... DEFAULT VALUES`
+	//! names none, and takes nothing as a delete below does. An update names the columns it sets. A delete
+	//! names none.
 	vector<string> set_columns;
 	//! False on an update or delete that reads nothing of the rows it writes: no WHERE, no FROM or
 	//! USING, no RETURNING, and every SET value foldable (no column, nothing volatile). It names no key

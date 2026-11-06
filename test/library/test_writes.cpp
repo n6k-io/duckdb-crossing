@@ -630,6 +630,218 @@ TEST_CASE("a merge lands its inserts and updates on the source", "[writes]") {
 	REQUIRE(Scalar(twin, "SELECT name FROM orders WHERE id = 9") == Value("merged"));
 }
 
+TEST_CASE("a merge with a failing action leaves nothing from its other action", "[writes]") {
+	auto transport = EACH_TRANSPORT();
+	INFO(TransportName(transport));
+	auto rows = GENERATE(as<string> {}, "SELECT 1 AS id, -1 AS v UNION ALL SELECT 2, 5",
+	                     "SELECT 1 AS id, 5 AS v UNION ALL SELECT 2, -1");
+	INFO(rows);
+	Twin twin(transport);
+	twin.store->keys["guarded"] = {"id"};
+	twin.store->key_unique["guarded"] = true;
+	twin.Far("CREATE TABLE guarded(id INTEGER, v INTEGER CHECK (v >= 0))");
+	twin.Far("INSERT INTO guarded VALUES (1, 10)");
+	twin.Attach();
+
+	auto error = twin.Error("MERGE INTO far.guarded t USING (" + rows +
+	                        ") s ON t.id = s.id "
+	                        "WHEN MATCHED THEN UPDATE SET v = s.v "
+	                        "WHEN NOT MATCHED THEN INSERT VALUES (s.id, s.v)");
+
+	REQUIRE_THAT(error, Catch::Contains("CHECK"));
+	REQUIRE(twin.store->transaction_ends.back() == "rollback");
+	REQUIRE(Scalar(twin, "SELECT count(*) FROM guarded") == Value::BIGINT(1));
+	REQUIRE(Scalar(twin, "SELECT v FROM guarded WHERE id = 1") == Value::INTEGER(10));
+}
+
+TEST_CASE("a seam over the memory limit spills and lands whole", "[writes]") {
+	auto transport = EACH_TRANSPORT();
+	INFO(TransportName(transport));
+	Twin twin(transport);
+	twin.Far("CREATE TABLE big(id BIGINT, v VARCHAR)");
+	twin.Attach();
+	twin.Query("SET memory_limit = '32MB'");
+
+	auto result = twin.Query("INSERT INTO far.big SELECT i, repeat(md5(i::VARCHAR), 32) FROM range(64000) r(i)");
+
+	REQUIRE(result->GetValue(0, 0) == Value::BIGINT(64000));
+	REQUIRE(twin.LastWrite().rows_only);
+	REQUIRE(twin.LastWrite().target_swap_bytes > 0);
+	REQUIRE(Scalar(twin, "SELECT count(*) FROM big WHERE v = repeat(md5(id::VARCHAR), 32)") == Value::BIGINT(64000));
+}
+
+TEST_CASE("a create table as over the memory limit spills and lands whole", "[writes]") {
+	auto transport = EACH_TRANSPORT();
+	INFO(TransportName(transport));
+	Twin twin(transport);
+	twin.store->schema_verbs["main"] = {CrossingVerb::CREATE};
+	twin.Attach();
+	twin.Query("SET memory_limit = '32MB'");
+
+	twin.Query("CREATE TABLE far.big AS SELECT i AS id, repeat(md5(i::VARCHAR), 32) AS v FROM range(64000) r(i)");
+
+	REQUIRE(twin.LastWrite().target_swap_bytes > 0);
+	REQUIRE(Scalar(twin, "SELECT count(*) FROM big WHERE v = repeat(md5(id::VARCHAR), 32)") == Value::BIGINT(64000));
+}
+
+TEST_CASE("an insert hands the source only the columns it named, so the source's defaults fire", "[writes]") {
+	auto transport = EACH_TRANSPORT();
+	INFO(TransportName(transport));
+	Twin twin(transport);
+	twin.Far("CREATE TABLE d(id INTEGER, v INTEGER DEFAULT 7, w INTEGER DEFAULT 8)");
+	twin.Attach();
+
+	twin.Query("INSERT INTO far.d(id) VALUES (1)");
+	REQUIRE(twin.LastWrite().set_columns == vector<string> {"id"});
+	REQUIRE(twin.LastWrite().rows == vector<vector<Value>> {{Value::INTEGER(1)}});
+	REQUIRE(Scalar(twin, "SELECT v FROM d WHERE id = 1") == Value::INTEGER(7));
+
+	twin.Query("INSERT INTO far.d(w, id) VALUES (80, 2)");
+	REQUIRE(twin.LastWrite().set_columns == vector<string> {"id", "w"});
+	REQUIRE(Scalar(twin, "SELECT v FROM d WHERE id = 2") == Value::INTEGER(7));
+	REQUIRE(Scalar(twin, "SELECT w FROM d WHERE id = 2") == Value::INTEGER(80));
+
+	twin.Query("INSERT INTO far.d(id) SELECT i FROM range(3, 4) r(i)");
+	REQUIRE(Scalar(twin, "SELECT w FROM d WHERE id = 3") == Value::INTEGER(8));
+}
+
+TEST_CASE("an insert over the source's own rows that names some columns still runs wholly on it", "[writes]") {
+	auto transport = EACH_TRANSPORT();
+	INFO(TransportName(transport));
+	Twin twin(transport);
+	twin.Far("CREATE TABLE d(id INTEGER, v INTEGER DEFAULT 7)");
+	twin.Far("CREATE TABLE s(id INTEGER)");
+	twin.Far("INSERT INTO s VALUES (1), (2)");
+	twin.Attach();
+
+	auto result = twin.Query("INSERT INTO far.d(id) SELECT id FROM far.s");
+
+	REQUIRE(result->GetValue(0, 0) == Value::BIGINT(2));
+	REQUIRE_FALSE(twin.LastWrite().rows_only);
+	REQUIRE(Scalar(twin, "SELECT count(*) FROM d WHERE v = 7") == Value::BIGINT(2));
+}
+
+TEST_CASE("an insert of default values leaves every column to the source", "[writes]") {
+	auto transport = EACH_TRANSPORT();
+	INFO(TransportName(transport));
+	Twin twin(transport);
+	twin.Far("CREATE TABLE d(id INTEGER DEFAULT 1, v INTEGER DEFAULT 7)");
+	twin.Attach();
+
+	auto result = twin.Query("INSERT INTO far.d DEFAULT VALUES");
+
+	REQUIRE(result->GetValue(0, 0) == Value::BIGINT(1));
+	REQUIRE(twin.LastWrite().set_columns.empty());
+	REQUIRE(Scalar(twin, "SELECT v FROM d WHERE id = 1") == Value::INTEGER(7));
+}
+
+TEST_CASE("a merge insert hands the source only the columns it named", "[writes]") {
+	auto transport = EACH_TRANSPORT();
+	INFO(TransportName(transport));
+	Twin twin(transport);
+	twin.store->keys["d"] = {"id"};
+	twin.store->key_unique["d"] = true;
+	twin.Far("CREATE TABLE d(id INTEGER, v INTEGER DEFAULT 7)");
+	twin.Attach();
+
+	twin.Query("MERGE INTO far.d t USING (SELECT 1 AS id) s ON t.id = s.id "
+	           "WHEN NOT MATCHED THEN INSERT (id) VALUES (s.id)");
+
+	REQUIRE(twin.LastWrite().set_columns == vector<string> {"id"});
+	REQUIRE(Scalar(twin, "SELECT v FROM d WHERE id = 1") == Value::INTEGER(7));
+}
+
+TEST_CASE("DEFAULT is refused rather than written as NULL", "[writes]") {
+	auto transport = EACH_TRANSPORT();
+	INFO(TransportName(transport));
+	auto sql = GENERATE(as<string> {}, "INSERT INTO far.d VALUES (2, DEFAULT)",
+	                    "INSERT INTO far.d(id, v) VALUES (2, DEFAULT)", "UPDATE far.d SET v = DEFAULT",
+	                    "UPDATE far.d SET v = DEFAULT WHERE id = 1", "INSERT INTO far.d(id) VALUES (2) RETURNING *",
+	                    "MERGE INTO far.d t USING (SELECT 1 AS id) s ON t.id = s.id "
+	                    "WHEN MATCHED THEN UPDATE SET v = DEFAULT",
+	                    "MERGE INTO far.d t USING (SELECT 2 AS id) s ON t.id = s.id "
+	                    "WHEN NOT MATCHED THEN INSERT VALUES (s.id, DEFAULT)");
+	INFO(sql);
+	Twin twin(transport);
+	twin.store->keys["d"] = {"id"};
+	twin.store->key_unique["d"] = true;
+	twin.Far("CREATE TABLE d(id INTEGER, v INTEGER DEFAULT 7)");
+	twin.Far("INSERT INTO d VALUES (1, 10)");
+	twin.Attach();
+
+	auto error = twin.Error(sql);
+
+	REQUIRE_THAT(error, Catch::Contains("only the source knows this column's default"));
+	REQUIRE(Scalar(twin, "SELECT count(*) FROM d") == Value::BIGINT(1));
+	REQUIRE(Scalar(twin, "SELECT v FROM d WHERE id = 1") == Value::INTEGER(10));
+}
+
+TEST_CASE("a conflict clause leaving out a column is refused and changes nothing", "[writes][on_conflict]") {
+	auto transport = EACH_TRANSPORT();
+	auto sql = GENERATE(as<string> {}, "INSERT INTO far.d(id) VALUES (1) ON CONFLICT (id) DO UPDATE SET w = excluded.v",
+	                    "INSERT INTO far.d(id) VALUES (2) ON CONFLICT (id) DO UPDATE SET w = 0",
+	                    "INSERT INTO far.d(id) VALUES (2) ON CONFLICT DO NOTHING",
+	                    "INSERT OR REPLACE INTO far.d(id) VALUES (1)",
+	                    "INSERT INTO far.d VALUES (2, DEFAULT, 0) ON CONFLICT DO NOTHING");
+	INFO(TransportName(transport) << " " << sql);
+	Twin twin(transport);
+	twin.store->declare_key_constraints = true;
+	twin.store->keys["d"] = {"id"};
+	twin.store->key_unique["d"] = true;
+	twin.Far("CREATE TABLE d(id INTEGER PRIMARY KEY, v INTEGER DEFAULT 7, w INTEGER)");
+	twin.Far("INSERT INTO d VALUES (1, 10, 20)");
+	twin.Attach();
+
+	auto error = twin.Error(sql);
+
+	REQUIRE_THAT(error, Catch::Contains("must give every column a value"));
+	REQUIRE(Scalar(twin, "SELECT count(*) FROM d") == Value::BIGINT(1));
+	REQUIRE(Scalar(twin, "SELECT w FROM d WHERE id = 1") == Value::INTEGER(20));
+}
+
+TEST_CASE("a conflict clause that names every column reads excluded from the row it was given",
+          "[writes][on_conflict]") {
+	auto transport = EACH_TRANSPORT();
+	INFO(TransportName(transport));
+	Twin twin(transport);
+	twin.store->declare_key_constraints = true;
+	twin.store->keys["d"] = {"id"};
+	twin.store->key_unique["d"] = true;
+	twin.Far("CREATE TABLE d(id INTEGER PRIMARY KEY, v INTEGER DEFAULT 7, w INTEGER)");
+	twin.Far("INSERT INTO d VALUES (1, 10, 20)");
+	twin.Attach();
+
+	twin.Query("INSERT INTO far.d(id, v, w) VALUES (1, 7, 0) ON CONFLICT (id) DO UPDATE SET w = excluded.v");
+
+	REQUIRE(Scalar(twin, "SELECT w FROM d WHERE id = 1") == Value::INTEGER(7));
+}
+
+TEST_CASE("DESCRIBE shows that a column's default belongs to the source", "[writes]") {
+	auto transport = EACH_TRANSPORT();
+	INFO(TransportName(transport));
+	Twin twin(transport);
+	twin.Far("CREATE TABLE d(id INTEGER)");
+	twin.Attach();
+
+	auto result = twin.Query("DESCRIBE far.d");
+
+	REQUIRE(result->GetValue(4, 0) == Value("crossing_source_default()"));
+}
+
+TEST_CASE("a merge inserting default values is refused", "[writes]") {
+	auto transport = EACH_TRANSPORT();
+	INFO(TransportName(transport));
+	Twin twin(transport);
+	twin.store->keys["d"] = {"id"};
+	twin.Far("CREATE TABLE d(id INTEGER, v INTEGER DEFAULT 7)");
+	twin.Attach();
+
+	auto error = twin.Error("MERGE INTO far.d t USING (SELECT 1 AS id) s ON t.id = s.id "
+	                        "WHEN NOT MATCHED THEN INSERT DEFAULT VALUES");
+
+	REQUIRE_THAT(error, Catch::Contains("cannot insert DEFAULT VALUES"));
+}
+
 TEST_CASE("a write returning rows returns what the source now holds", "[writes]") {
 	auto transport = EACH_TRANSPORT();
 	INFO(TransportName(transport));
@@ -763,19 +975,18 @@ TEST_CASE("a conflict clause on an undeclared key is refused and changes nothing
 
 TEST_CASE("a conflict clause on a declared key leaves the rows the source itself would", "[writes][on_conflict]") {
 	auto transport = EACH_TRANSPORT();
-	auto sql =
-	    GENERATE(as<string> {}, "INSERT INTO far.orders (id, amt) VALUES (1, 0) ON CONFLICT DO NOTHING",
-	             "INSERT INTO far.orders (id, amt) VALUES (1, 0) ON CONFLICT (id) DO NOTHING",
-	             "INSERT OR IGNORE INTO far.orders (id, amt) VALUES (1, 0)",
-	             "INSERT OR REPLACE INTO far.orders (id, amt) VALUES (1, 0)",
-	             "INSERT INTO far.orders (id, amt) VALUES (1, 0) ON CONFLICT (id) DO UPDATE SET amt = excluded.amt",
-	             "INSERT INTO far.orders (id, amt) VALUES (1, 7) ON CONFLICT (id) DO UPDATE SET amt = orders.amt + "
-	             "excluded.amt",
-	             "INSERT INTO far.orders (id, amt) VALUES (1, 0) ON CONFLICT (id) DO UPDATE SET amt = excluded.amt "
-	             "WHERE orders.amt > 1000",
-	             "INSERT INTO far.orders (id, amt) VALUES (1, 0), (6, 600) ON CONFLICT (id) DO UPDATE SET amt = "
-	             "excluded.amt",
-	             "INSERT INTO far.orders (id, amt) VALUES (1, 0), (6, 600) ON CONFLICT DO NOTHING");
+	const string into = "INTO far.orders (id, name, amt, tenant, score, ts) VALUES ";
+	const string row_1 = "(1, 'one', 0, 1, 1.0, NULL)";
+	const string row_1_7 = "(1, 'one', 7, 1, 1.0, NULL)";
+	const string row_6 = "(6, 'six', 600, 1, 6.0, NULL)";
+	auto sql = GENERATE_COPY(
+	    "INSERT " + into + row_1 + " ON CONFLICT DO NOTHING", "INSERT " + into + row_1 + " ON CONFLICT (id) DO NOTHING",
+	    "INSERT OR IGNORE " + into + row_1, "INSERT OR REPLACE " + into + row_1,
+	    "INSERT " + into + row_1 + " ON CONFLICT (id) DO UPDATE SET amt = excluded.amt",
+	    "INSERT " + into + row_1_7 + " ON CONFLICT (id) DO UPDATE SET amt = orders.amt + excluded.amt",
+	    "INSERT " + into + row_1 + " ON CONFLICT (id) DO UPDATE SET amt = excluded.amt WHERE orders.amt > 1000",
+	    "INSERT " + into + row_1 + ", " + row_6 + " ON CONFLICT (id) DO UPDATE SET amt = excluded.amt",
+	    "INSERT " + into + row_1 + ", " + row_6 + " ON CONFLICT DO NOTHING");
 	INFO(TransportName(transport) << " " << sql);
 	const string rows = "SELECT string_agg(o::VARCHAR, ';' ORDER BY id) FROM orders o";
 

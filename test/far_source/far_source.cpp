@@ -20,6 +20,7 @@
 #include "duckdb/planner/expression/bound_aggregate_expression.hpp"
 #include "duckdb/planner/expression/bound_function_expression.hpp"
 #include "duckdb/planner/expression/bound_window_expression.hpp"
+#include "duckdb/storage/buffer_manager.hpp"
 
 #include <algorithm>
 #include <chrono>
@@ -593,7 +594,7 @@ CrossingScan FarSession::Read(ClientContext &, const CrossingQuery &query) {
 }
 
 CrossingWriter FarSession::Write(ClientContext &, const CrossingQuery &query) {
-	return [this, &query](ClientContext &, CrossingWaker waker) {
+	return [this, &query](ClientContext &context, CrossingWaker waker) {
 		{
 			lock_guard<mutex> guard(store->lock);
 			if (store->wait_before_write && !store->write_arrived) {
@@ -607,6 +608,7 @@ CrossingWriter FarSession::Write(ClientContext &, const CrossingQuery &query) {
 			store->write_arrived = false;
 		}
 		auto call = Record(query);
+		call.target_swap_bytes = BufferManager::GetBufferManager(context).GetUsedSwap();
 		auto rows = query.types.empty() ? vector<vector<Value>>() : Evaluate(query.plan, call);
 		call.rows = rows;
 		{
