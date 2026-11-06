@@ -22,6 +22,16 @@ CrossingTableCatalogEntry::CrossingTableCatalogEntry(Catalog &catalog, SchemaCat
       described(std::move(described_p)), columns(info.columns.Copy()) {
 }
 
+unique_ptr<CreateInfo> CrossingTableCatalogEntry::GetInfo() const {
+	auto info = TableCatalogEntry::GetInfo();
+	ColumnList plain;
+	for (auto &column : GetColumns().Logical()) {
+		plain.AddColumn(ColumnDefinition(column.Name(), column.Type()));
+	}
+	info->Cast<CreateTableInfo>().columns = std::move(plain);
+	return info;
+}
+
 vector<column_t> CrossingTableCatalogEntry::KeyColumnIndexes() const {
 	vector<column_t> out;
 	for (auto &key : described.key) {

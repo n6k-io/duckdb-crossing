@@ -9,6 +9,7 @@
 #include "crossing.hpp"
 #include "internal/carrier.hpp"
 #include "internal/crossing_table_entry.hpp"
+#include "internal/seam.hpp"
 
 namespace duckdb {
 
@@ -23,6 +24,9 @@ struct CrossingBindData : public TableFunctionData, public CrossingCarrier {
 	CrossingVerb verb;
 	CrossingSeam seam;
 	shared_ptr<CrossingFragment> fragment;
+	//! A write the feed of which stays near: why, and which seam columns its key is if crossing counts it.
+	string obstacle;
+	vector<idx_t> key_positions;
 
 	const CrossingIdentity &Identity() const override;
 	CrossingVerb Verb() const override {
@@ -52,8 +56,8 @@ optional_ptr<CrossingBindData> CrossingBindDataOf(LogicalGet &get, const Crossin
 TableFunction CrossingReadFunction();
 
 //! The plan the source returned. Throws NotImplementedException with why it declined, or
-//! InternalException if the plan holds a scan other than a floor or seam.
-unique_ptr<LogicalOperator> RequirePlan(CrossingPlan planned, CrossingVerb verb, const string &table);
+//! InternalException if the plan holds a scan other than a floor.
+unique_ptr<LogicalOperator> RequirePlan(CrossingPlan planned, const string &table);
 
 unique_ptr<FunctionData> MakeReadBindData(CrossingTableCatalogEntry &entry);
 

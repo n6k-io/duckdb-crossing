@@ -34,8 +34,7 @@ constexpr const char *SOURCE_DEFAULT_FUNCTION = "crossing_source_default";
 
 void ThrowSourceDefault(DataChunk &, ExpressionState &, Vector &) {
 	throw InvalidInputException("crossing: only the source knows this column's default, so it cannot be computed "
-	                            "here. Leave the column out of an INSERT without RETURNING; DEFAULT itself is not "
-	                            "supported");
+	                            "here. Leave the column out of an INSERT; DEFAULT itself is not supported");
 }
 
 string NameOfColumn(LogicalOperator &below, idx_t position) {
@@ -95,14 +94,6 @@ unique_ptr<Expression> SetValueOf(LogicalUpdate &update, idx_t i) {
 	return update.expressions[i]->Copy();
 }
 
-vector<idx_t> KeysThenSetInImage(const vector<column_t> &key_columns, const vector<PhysicalIndex> &set_columns) {
-	vector<idx_t> positions(key_columns.begin(), key_columns.end());
-	for (auto &set : set_columns) {
-		positions.push_back(set.index);
-	}
-	return positions;
-}
-
 CrossingFeed InsertFeed(unique_ptr<LogicalOperator> feed, const FreshTableIndex &fresh) {
 	feed->ResolveOperatorTypes();
 	vector<unique_ptr<Expression>> row;
@@ -117,59 +108,28 @@ CrossingFeed InsertFeed(unique_ptr<LogicalOperator> feed, const FreshTableIndex 
 CrossingFeed UpdateFeed(LogicalUpdate &update, const vector<column_t> &key_columns, unique_ptr<LogicalOperator> feed,
                         const FreshTableIndex &fresh) {
 	feed->ResolveOperatorTypes();
+	vector<unique_ptr<Expression>> row;
+	auto first_key = feed->types.size() - key_columns.size();
+	for (idx_t k = 0; k < key_columns.size(); k++) {
+		row.push_back(RefTo(*feed, first_key + k));
+	}
+	for (idx_t i = 0; i < update.expressions.size(); i++) {
+		row.push_back(Named(SetValueOf(update, i), *feed));
+	}
 	CrossingFeed result;
-	if (!update.return_chunk) {
-		vector<unique_ptr<Expression>> row;
-		auto first_key = feed->types.size() - key_columns.size();
-		for (idx_t k = 0; k < key_columns.size(); k++) {
-			row.push_back(RefTo(*feed, first_key + k));
-		}
-		for (idx_t i = 0; i < update.expressions.size(); i++) {
-			row.push_back(Named(SetValueOf(update, i), *feed));
-		}
-		result.plan = ProjectionOver(std::move(row), std::move(feed), fresh);
-		return result;
-	}
-
-	vector<unique_ptr<Expression>> image;
-	for (idx_t c = 0; c < update.bound_defaults.size(); c++) {
-		idx_t set = update.columns.size();
-		for (idx_t i = 0; i < update.columns.size(); i++) {
-			if (update.columns[i].index == c) {
-				set = i;
-				break;
-			}
-		}
-		if (set == update.columns.size()) {
-			throw BinderException("crossing: RETURNING needs a value for every column of the row");
-		}
-		image.push_back(Named(SetValueOf(update, set), *feed));
-	}
-	result.plan = ProjectionOver(std::move(image), std::move(feed), fresh);
-	result.seam_positions = KeysThenSetInImage(key_columns, update.columns);
+	result.plan = ProjectionOver(std::move(row), std::move(feed), fresh);
 	return result;
 }
 
 CrossingFeed DeleteFeed(LogicalDelete &del, const vector<column_t> &key_columns, unique_ptr<LogicalOperator> feed,
                         const FreshTableIndex &fresh) {
 	feed->ResolveOperatorTypes();
+	vector<unique_ptr<Expression>> row;
+	for (idx_t k = 0; k < key_columns.size(); k++) {
+		row.push_back(Named(del.expressions[k]->Copy(), *feed));
+	}
 	CrossingFeed result;
-	auto key_count = key_columns.size();
-	if (!del.return_chunk) {
-		vector<unique_ptr<Expression>> row;
-		for (idx_t k = 0; k < key_count; k++) {
-			row.push_back(Named(del.expressions[k]->Copy(), *feed));
-		}
-		result.plan = ProjectionOver(std::move(row), std::move(feed), fresh);
-		return result;
-	}
-
-	vector<unique_ptr<Expression>> image;
-	for (idx_t i = key_count; i < del.expressions.size(); i++) {
-		image.push_back(Named(del.expressions[i]->Copy(), *feed));
-	}
-	result.plan = ProjectionOver(std::move(image), std::move(feed), fresh);
-	result.seam_positions = KeysThenSetInImage(key_columns, {});
+	result.plan = ProjectionOver(std::move(row), std::move(feed), fresh);
 	return result;
 }
 
@@ -229,15 +189,8 @@ string WhyNotWhole(LogicalOperator &feed, const SubtreeLabels &labels, CrossingS
 	}
 }
 
-void RequireSeamTakesRow(LogicalOperator &feed, const CrossingFragment &fragment, const vector<idx_t> &positions) {
-	auto row_types = feed.types;
-	if (!positions.empty()) {
-		row_types.clear();
-		for (auto position : positions) {
-			row_types.push_back(feed.types[position]);
-		}
-	}
-	if (row_types != fragment.seam_types) {
+void RequireSeamTakesRow(LogicalOperator &feed, const CrossingFragment &fragment) {
+	if (feed.types != fragment.seam_types) {
 		throw InternalException("crossing: the seam row does not fit the seam");
 	}
 }
@@ -279,7 +232,7 @@ SeamFill FillSeamFromFeed(unique_ptr<LogicalOperator> feed, CrossingFragment &fr
 	if (!whole) {
 		fill.obstacle = stop.stays ? stop.obstacle : WhyNotWhole(*feed, labels, source);
 		feed->ResolveOperatorTypes();
-		RequireSeamTakesRow(*feed, fragment, stop.seam_positions);
+		RequireSeamTakesRow(*feed, fragment);
 		fill.remainder = std::move(feed);
 		RejoinAdjacentFiltersEverywhere(fill.remainder, identity);
 		return fill;

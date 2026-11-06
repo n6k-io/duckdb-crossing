@@ -76,15 +76,6 @@ unique_ptr<Expression> RefAt(const LogicalType &type, idx_t position);
 
 optional_ptr<LogicalGet> FindGetWithIndex(LogicalOperator &op, TableIndex table_index);
 
-vector<unique_ptr<Expression>> RowImageFrom(LogicalGet &get, TableCatalogEntry &table);
-
-bool MergeDeletes(LogicalMergeInto &merge);
-
-vector<unique_ptr<Expression>> ImageFromSetValues(TableCatalogEntry &table, const CrossingSeam &seam,
-                                                  const vector<unique_ptr<Expression>> &set_values);
-
-CrossingTableUse WrittenTable(const string &source_schema, const CrossingTable &described, const CrossingSeam &seam);
-
 CrossingSeam SeamOf(TableCatalogEntry &table, const CrossingTable &described, CrossingVerb verb,
                     vector<string> set_columns);
 
@@ -95,67 +86,31 @@ void RequireKey(TableCatalogEntry &table, const CrossingTable &described, const 
 shared_ptr<CrossingFragment> PlanWriteFragment(CrossingTableCatalogEntry &table, CrossingVerb verb,
                                                const CrossingSeam &seam);
 
+//! A write that takes nothing: its node has no child, so there is no seam to fill.
+shared_ptr<CrossingFragment> PlanBareWriteFragment(CrossingTableCatalogEntry &table, CrossingVerb verb,
+                                                   const CrossingSeam &seam, TableIndex table_index);
+
 unique_ptr<CrossingBindData> MakeWriteBindData(CrossingTableCatalogEntry &table, CrossingVerb verb, CrossingSeam seam,
                                                shared_ptr<CrossingFragment> fragment);
 
-class CrossingSeamEntry : public TableCatalogEntry {
-public:
-	CrossingSeamEntry(Catalog &catalog, SchemaCatalogEntry &schema, CreateTableInfo &info,
-	                  unique_ptr<CrossingBindData> write, string obstacle);
-
-	unique_ptr<CrossingBindData> write;
-	string obstacle;
-	vector<idx_t> key_positions;
-	vector<idx_t> seam_positions;
-
-	const ColumnList &GetColumns() const override {
-		return columns;
-	}
-	unique_ptr<BaseStatistics> GetStatistics(ClientContext &context, column_t column_id) override;
-	TableFunction GetScanFunction(ClientContext &context, unique_ptr<FunctionData> &bind_data) override;
-	TableStorageInfo GetStorageInfo(ClientContext &context) override;
-
-private:
-	ColumnList columns;
-};
-
-const string &CrossingSeamEntriesKey();
-
-class CrossingSeamEntries : public ClientContextState {
-public:
-	void Hold(shared_ptr<TableCatalogEntry> entry) {
-		live.push_back(std::move(entry));
-	}
-
-	shared_ptr<TableCatalogEntry> Share(TableCatalogEntry &entry) {
-		for (auto &held : live) {
-			if (held.get() == &entry) {
-				return held;
-			}
-		}
-		throw InternalException("crossing: the seam of '%s' outlived its statement", entry.name.GetIdentifierName());
-	}
-
-	void QueryEnd(ClientContext &context, optional_ptr<ErrorData> error) override {
-		live.clear();
-	}
-
-	static shared_ptr<CrossingSeamEntries> Get(ClientContext &context) {
-		return context.registered_state->GetOrCreate<CrossingSeamEntries>(CrossingSeamEntriesKey());
-	}
-
-private:
-	vector<shared_ptr<TableCatalogEntry>> live;
-};
-
 TableFunction CrossingWriteFunction();
+
+//! One pull of a write's readers: done with the rows it changed, or waiting on the waker.
+struct CrossingWritePull {
+	bool done = false;
+	idx_t affected_rows = 0;
+};
 
 class CrossingSeamFilledWrite {
 public:
 	CrossingSeamFilledWrite(const CrossingBindData &write, unique_ptr<ColumnDataCollection> rows);
 	~CrossingSeamFilledWrite();
 
-	CrossingWriteResult Pull(ClientContext &context, CrossingWaker waker);
+	CrossingWritePull Pull(ClientContext &context, CrossingWaker waker);
+	//! The rows a write with RETURNING left, once done. Null without RETURNING or when no call was made.
+	unique_ptr<ColumnDataCollection> TakeReturned() {
+		return std::move(returned);
+	}
 
 private:
 	CrossingTableCatalogEntry &table;
@@ -164,19 +119,57 @@ private:
 	unique_ptr<LogicalOperator> seam_node;
 	bool empty = false;
 	unique_ptr<CrossingQuery> query;
-	CrossingWriter writer;
+	bool opened = false;
+	bool returning = false;
+	CrossingScan scan;
+	idx_t next_partition = 0;
+	CrossingReader reader;
+	DataChunk result_chunk;
+	idx_t affected_rows = 0;
+	unique_ptr<ColumnDataCollection> returned;
 };
 
-class LogicalCrossingFence : public LogicalExtensionOperator {
+//! Holds the near node's Get off its feed through the optimizers: an empty feed would otherwise take
+//! the Get with it (empty_result_pullup.cpp), and a write has to report zero. Gone by the narrow pass.
+class LogicalNearPassThrough : public LogicalExtensionOperator {
 public:
-	LogicalCrossingFence(TableIndex table_index, unique_ptr<CrossingBindData> bind_data);
+	vector<ColumnBinding> GetColumnBindings() override {
+		return children[0]->GetColumnBindings();
+	}
+	PhysicalOperator &CreatePlan(ClientContext &context, PhysicalPlanGenerator &planner) override;
+	string GetName() const override;
+	string GetExtensionName() const override;
+	bool SupportSerialization() const override {
+		return false;
+	}
+	void Serialize(Serializer &serializer) const override;
+
+protected:
+	void ResolveTypes() override {
+		types = children[0]->types;
+	}
+};
+
+//! Near's side of a write. Any child is the rows it sends; with none, the source runs all of it.
+class LogicalCrossingNear : public LogicalExtensionOperator {
+public:
+	LogicalCrossingNear(TableIndex table_index, vector<ColumnBinding> bindings, vector<LogicalType> output_types,
+	                    vector<optional_idx> emit, unique_ptr<CrossingBindData> bind_data);
 
 	TableIndex table_index;
+	vector<ColumnBinding> bindings;
+	vector<LogicalType> output_types;
+	//! For each output column, the returned column it is; invalid when nothing reads it.
+	vector<optional_idx> emit;
 	unique_ptr<CrossingBindData> bind_data;
 
 	PhysicalOperator &CreatePlan(ClientContext &context, PhysicalPlanGenerator &planner) override;
-	vector<ColumnBinding> GetColumnBindings() override;
-	vector<TableIndex> GetTableIndex() const override;
+	vector<ColumnBinding> GetColumnBindings() override {
+		return bindings;
+	}
+	vector<TableIndex> GetTableIndex() const override {
+		return {table_index};
+	}
 	string GetName() const override;
 	InsertionOrderPreservingMap<string> ParamsToString() const override;
 	string GetExtensionName() const override;
@@ -186,68 +179,33 @@ public:
 	void Serialize(Serializer &serializer) const override;
 
 protected:
-	void ResolveTypes() override;
-};
-
-class CrossingFence : public PhysicalOperator {
-public:
-	static constexpr const PhysicalOperatorType TYPE = PhysicalOperatorType::EXTENSION;
-
-	CrossingFence(PhysicalPlan &physical_plan, unique_ptr<CrossingBindData> bind_data, idx_t estimated_cardinality);
-
-	unique_ptr<CrossingBindData> bind_data;
-
-	unique_ptr<GlobalSourceState> GetGlobalSourceState(ClientContext &context) const override;
-	SourceResultType GetDataInternal(ExecutionContext &context, DataChunk &chunk,
-	                                 OperatorSourceInput &input) const override;
-	bool IsSource() const override {
-		return true;
+	void ResolveTypes() override {
+		types = output_types;
 	}
-
-	string GetName() const override;
-	InsertionOrderPreservingMap<string> ParamsToString() const override;
 };
 
-void AddRowImageForReturning(LogicalOperator &plan, const CrossingIdentity &identity);
-
-struct CrossingWriteState : public GlobalSinkState {
-	unique_ptr<ColumnDataCollection> rows;
-	value_set_t seen_keys;
-	unique_ptr<ColumnDataCollection> returned;
-	ColumnDataScanState returned_scan;
-	bool returned_scanning = false;
-	idx_t affected_rows = 0;
-	idx_t keys_sent = 0;
-	unique_ptr<CrossingSeamFilledWrite> write;
-
-	void SeeKey(DataChunk &chunk, const vector<idx_t> &key_positions, idx_t index);
-};
-
-class CrossingWrite : public PhysicalOperator {
+class CrossingNear : public PhysicalOperator {
 public:
 	static constexpr const PhysicalOperatorType TYPE = PhysicalOperatorType::EXTENSION;
 
-	CrossingWrite(PhysicalPlan &physical_plan, unique_ptr<CrossingBindData> bind_data, vector<LogicalType> types,
-	              idx_t estimated_cardinality);
+	CrossingNear(PhysicalPlan &physical_plan, vector<LogicalType> types, vector<optional_idx> emit,
+	             unique_ptr<CrossingBindData> bind_data, idx_t estimated_cardinality);
 
+	vector<optional_idx> emit;
 	unique_ptr<CrossingBindData> bind_data;
-	shared_ptr<TableCatalogEntry> entry;
-	bool return_chunk = false;
-	string obstacle;
-
-	vector<unique_ptr<Expression>> seam_row;
-	vector<unique_ptr<Expression>> returned_row;
-	vector<idx_t> key_positions;
 
 	unique_ptr<GlobalSinkState> GetGlobalSinkState(ClientContext &context) const override;
 	SinkResultType Sink(ExecutionContext &context, DataChunk &chunk, OperatorSinkInput &input) const override;
 	SinkFinalizeType Finalize(Pipeline &pipeline, Event &event, ClientContext &context,
 	                          OperatorSinkFinalizeInput &input) const override;
 	bool IsSink() const override {
-		return true;
+		return !children.empty();
 	}
 	bool ParallelSink() const override {
 		return false;
+	}
+	bool SinkOrderDependent() const override {
+		return true;
 	}
 
 	unique_ptr<GlobalSourceState> GetGlobalSourceState(ClientContext &context) const override;

@@ -30,8 +30,7 @@ struct ToyDB {
 };
 
 struct ToySession {
-	CrossingScan Read(ClientContext &context, const CrossingQuery &query);
-	CrossingWriter Write(ClientContext &context, const CrossingQuery &query);
+	CrossingScan Run(ClientContext &context, const CrossingQuery &query);
 	void Ddl(ClientContext &context, const CrossingDdl &ddl);
 	vector<string> Tables(const string &schema);
 	CrossingTable Describe(const string &schema, const string &name);
@@ -41,7 +40,7 @@ struct ToySession {
 ```
 
 No base class. `Crossing<ToyDB>` finds members by name. Required: `Session`,
-`Tables`, `Describe`, `Plan`, `Begin`, `Session::Read`. Optional, with the
+`Tables`, `Describe`, `Plan`, `Begin`, `Session::Run`. Optional, with the
 default when absent:
 
 | member | absent |
@@ -53,7 +52,6 @@ default when absent:
 | `AcceptsOperator` | every operator accepted |
 | `Detach` | nothing |
 | `Group` | the source is its own group |
-| `Session::Write` | no table may declare a write verb; one that does is refused at first use |
 | `Session::Ddl` | no table may declare `ALTER` or `DROP`, no schema `CREATE`; one that does is refused at first use |
 | `Session::Tables`, `Session::Describe` | the source's `Tables` and `Describe` |
 | `Session::Commit`, `Session::Rollback` | nothing |
@@ -89,6 +87,7 @@ CrossingTable ToyDB::Describe(const string &schema, const string &name) {
   See `CrossingTable::key_unique`.
 - `verbs` — the only source of what a table allows; see `CrossingTable::verbs`.
   `ALTER` and `DROP` go through `Session::Ddl`.
+- `returning` — the source can return the rows a write leaves.
 - `constraints` — constraints the source enforces.
 
 `DescribeSchema(schema)` returns a `CrossingSchema` the same way; `CREATE`
@@ -120,7 +119,7 @@ through crossing.
 
 `CREATE VIEW` is a `CREATE` whose `ddl.create` is a `CreateViewInfo` and whose
 `ddl.plan` is the body, planned and folded as a read: floors only, the same plan
-`Session::Read` would get. A body that does not fold wholly onto the source is
+`Session::Run` would get. A body that does not fold wholly onto the source is
 refused before the source is asked. A `VALUES` list in the body crosses as its
 rows, unless a row holds something that changes between queries, such as
 `now()`, which is refused. The plan's columns are
@@ -138,28 +137,22 @@ target.
 
 ## Plan
 
-Asked once per read scan and once per write operator (`MERGE` plans once per
-action).
+Asked once per read scan. An update or delete binds a scan of its table too, so it
+is asked for those. A write needs no plan of its own: crossing builds it.
 
 ```cpp
 CrossingPlan ToyDB::Plan(const CrossingPlanRequest &request) {
-	if (request.verb == CrossingVerb::SELECT) {
-		return CrossingPlan::Of(MakeFloorNode(0, request.schema, request.table, names, types));
-	}
-	return CrossingPlan::Of(MakeSeamNode(0, request.seam.types));
+	return CrossingPlan::Of(MakeFloorNode(0, request.schema, request.table, names, types));
 }
 ```
 
-- `SELECT` — a floor: the table named, emitting one column per described
-  column, in order. Crossed work is stacked on it; it is still there in `Read`.
-  Row filtering may be stacked on the floor here.
-- Write — a seam node: where the rows go, with the columns of `request.seam`;
-  see `CrossingSeam`. A delete that reads nothing gets no write `Plan`.
+- A floor: the table named, emitting one column per described column, in order.
+  Crossed work is stacked on it; it is still there in `Run`. Row filtering may be
+  stacked on the floor here.
 - `CrossingPlan::Declined(reason)` refuses; the reason is in the error.
 - The plan names tables and never scans them; see `RequirePlaceholderScans` in
   `src/crossing_read.cpp`. Bind the table where the plan runs: `BindFloors` in
-  `Read`, `ExecuteWrite` in `Write`. `FloorOf(node)` returns the schema and
-  table named.
+  `Run`. `FloorOf(node)` returns the schema and table named.
 - Table indices you use are yours; crossing remaps them.
 
 ## Accepts
@@ -204,10 +197,12 @@ decoding Substrait checks those catalogs with the `check` argument of
 For which attach's session reads the fragment, see `ReadingCatalog` in
 `src/crossing_read.cpp`.
 
-## Read
+## Run
+
+Every read and write comes through one call. `WriteOf(query.plan)` tells them apart.
 
 ```cpp
-CrossingScan ToySession::Read(ClientContext &, const CrossingQuery &query) {
+CrossingScan ToySession::Run(ClientContext &, const CrossingQuery &query) {
 	auto cursor = make_shared_ptr<ToyCursor>(ToyOpen(conn, query));
 	CrossingScan scan;
 	scan.open = [cursor](ClientContext &, idx_t) -> CrossingReader {
@@ -256,41 +251,59 @@ BindFloors(context, plan, "mycatalog", [&](const CrossingFloor &floor) -> unique
 ## Write
 
 ```cpp
-CrossingWriter ToySession::Write(ClientContext &, const CrossingQuery &query) {
-	return [this, &query](ClientContext &, CrossingWaker) {
-		return CrossingWriteResult::Done(ToyRun(conn, query));
+if (auto node = WriteOf(query.plan)) {
+	CrossingScan scan;
+	scan.open = [this, &query, node](ClientContext &, idx_t) -> CrossingReader {
+		auto done = make_shared_ptr<bool>(false);
+		return [this, &query, node, done](ClientContext &, DataChunk &chunk, CrossingWaker) {
+			if (*done) {
+				return CrossingReadResult::Done();
+			}
+			chunk.data[0].SetValue(0, Value::BIGINT(ToyWrite(conn, *node, query.plan)));
+			chunk.SetChildCardinality(1);
+			*done = true;
+			return CrossingReadResult::Rows();
+		};
 	};
+	return scan;
 }
 ```
 
-- Called once per write operator; not at all when the target gathered no rows.
-  `query` outlives the writer.
-- The plan is the one from `Plan` with the seam filled. When every part of the
-  feed can run on this source, it fills the seam with work reading this source's
-  tables. Otherwise all of it runs on the target and the seam holds the gathered
-  rows, so with a bare seam from `Plan`, `SeamRowsOf(query.plan)` returns them.
-- `Wait()` / `waker.Wake()` as for readers.
-- `Done(n)` is the rows the source changed, which DuckDB reports.
-- `RETURNING` never runs wholly on the source.
-- A write that reads none of its rows: see `CrossingQuery::reads_rows`.
+- `Run` is called once per write operator; not at all when the target gathered no
+  rows. `query` outlives the scan.
+- The readers produce one row of one BIGINT, the rows the source changed, which
+  DuckDB reports. A write that has to wait returns `Wait()` as any reader does.
+- `CrossingWriteNode` says what to write. Its child says with what. When every part
+  of the feed can run on this source, the child is work reading this source's tables.
+  Otherwise all of it runs on the target and the child holds the gathered rows, so
+  `SeamRowsOf(*query.plan.children[0])` returns them. No child means the write takes
+  nothing: a delete of every row, or `INSERT ... DEFAULT VALUES`.
+- Render or bind the child, not the node: a renderer never sees a write node, and
+  `BindFloors` refuses one.
+- With `node->returning_columns`, the readers instead produce the rows the write
+  left, those columns of them, and crossing holds them until the write has finished.
+  Declare `CrossingTable::returning` to take these; without it `RETURNING` is refused
+  before the source hears of it. `SubmitWrite` handles them for a source on DuckDB.
+- A write that reads none of its rows: see `CrossingWriteTarget::reads_rows`.
 
 ### Running the write on a DuckDB
 
 ```cpp
-CrossingWriteTarget target {"mycatalog", query.written.schema, query.written.table, query.kind,
-                            query.key_columns, query.set_columns, query.reads_rows};
-if (query.types.empty()) {
-	return ExecuteWrite(context, target, unique_ptr<TableRef>());
+auto target = CrossingWriteTargetOf("mycatalog", *node);
+if (query.plan.children.empty()) {
+	return SubmitWrite(context, target, unique_ptr<TableRef>());
 }
-if (auto rows = SeamRowsOf(query.plan)) {
-	return ExecuteWrite(context, target, SeamRefOfRows(*rows));
+auto &feed = *query.plan.children[0];
+if (auto rows = SeamRowsOf(feed)) {
+	return SubmitWrite(context, target, SeamRefOfRows(*rows));
 }
-auto plan = DeserializeCrossingPlan(context, SerializeCrossingPlan(query.plan));
+auto received = DeserializeCrossingPlan(context, SerializeCrossingPlan(query.plan));
+auto plan = std::move(received->children[0]);
 BindFloors(context, plan, "mycatalog");
-return ExecuteWrite(context, target, std::move(plan));
+return SubmitWrite(context, target, std::move(plan));
 ```
 
-For `ExecuteWrite`, its seam and `CrossingWriteShaper`, see `include/crossing.hpp`.
+For `SubmitWrite`, its seam and `CrossingWriteShaper`, see `include/crossing.hpp`.
 Keys match with `IS NOT DISTINCT FROM`.
 
 ### Shipping the plan
@@ -305,25 +318,23 @@ The receiver is a DuckDB instance of the same commit with
 
 `RenderSubstraitJson(plan)` is complete: rows the plan holds, such as a `VALUES`
 list joined to a table, travel in the JSON, and `DecodeSubstraitJson` needs
-nothing else. Check `SeamRowsOf(query.plan)` first on a write: gathered rows can be
-any size, and JSON is a poor way to move them. Stacking operators on the seam in
-`Plan` makes it null, and rendering then puts those rows in the JSON.
+nothing else. Check `SeamRowsOf` on a write's child first: gathered rows can be any
+size, and JSON is a poor way to move them.
 
-Gathered rows may have spilled to disk, so walk `SeamRowsOf(query.plan)->Chunks()`
-and send them in whatever batches the transport needs. Crossing sets no size
+Gathered rows may have spilled to disk, so walk `Chunks()` on them and send them in whatever batches the transport needs. Crossing sets no size
 limit. A source that cannot move them all fails the statement with its reason.
 
 ## Transactions
 
-`Begin` is called on a DuckDB transaction's first `Read`, `Write` or `Ddl`. Every
-`Read` and `Write` in that transaction goes through the returned session; when
+`Begin` is called on a DuckDB transaction's first `Run` or `Ddl`. Every
+`Run` in that transaction goes through the returned session; when
 the transaction resolves, `Commit` or `Rollback` is called and the session
 destroyed. A `Commit` that throws fails the statement; nothing is undone
 elsewhere. A `Rollback` that throws is discarded.
 
 A write must not be durable until `Commit`. This holds in autocommit too, where
-the statement's session resolves after its last writer returned. A statement can
-fail after a writer returned: a later `MERGE` action can fail, and crossing can
+the statement's session resolves after its last reader returned. A statement can
+fail after a write's reader returned: a later `MERGE` action can fail, and crossing can
 find that a key without `key_unique` matched more rows than it sent. `Rollback`
 must then leave the source as it was. A source that cannot hold a write until
 `Commit` must not declare a key without `key_unique`, and a `MERGE` of more than
@@ -346,14 +357,12 @@ each other and themselves.
 | `Plan`, `Accepts*` | binding and optimization, concurrent across statements |
 | `Begin` | once per transaction, on the thread that first needs the session (the binding thread for `Ddl`); different transactions may overlap; must not re-enter crossing |
 | `Detach` | once, DETACH thread |
-| `Session::Read` | once per scan operator; two scans of one statement may overlap on one session |
+| `Session::Run` | once per scan or write operator, and per session more than once (`MERGE`); two scans of one statement may overlap on one session |
 | `CrossingScan::open` | once per partition, by the claiming thread; opens overlap |
 | reader | see `CrossingReader`; partitions run concurrently |
-| `Session::Write` | once per write operator; may repeat per session (`MERGE`) |
-| writer | one thread at a time until `DONE`; thread may change after `WAIT` |
 | `Session::Ddl` | once per DDL statement, on the binding thread; may repeat per session |
 | `Session::Tables`, `Session::Describe` | after `Ddl` in that session, once per schema or table until the next `Ddl` |
-| `Commit`, `Rollback` | once, after every reader and writer returned |
+| `Commit`, `Rollback` | once, after every reader returned |
 | `Waker::Wake` | any thread, any time |
 
 ## Registering
@@ -427,3 +436,19 @@ the lists. A source includes `crossing.hpp`. Its own catalog also needs
 `crossing_attach.hpp`. Substrait needs `crossing_substrait.hpp`, whose sources and
 include path come from `crossing_substrait_sources` and `crossing_substrait_includes`.
 Streaming a result needs DuckDB's `duckdb/main/query_result_stream.hpp`.
+
+## Migrating from `Read` and `Write`
+
+- `Session::Read` and `Session::Write` are one `Session::Run`. Branch on
+  `WriteOf(query.plan)`.
+- A write's `CrossingWriter` is a one-partition `CrossingScan` whose reader produces
+  the count as one BIGINT.
+- `query.kind`, `written`, `key_columns`, `set_columns` and `reads_rows` move to
+  `CrossingWriteNode`. `CrossingWriteTargetOf` builds the target, `reads_rows` included.
+- The plan a write carries is the node. Use its child where you used `query.plan`,
+  and an absent child where you checked `query.types.empty()`.
+- `ExecuteWrite` is `SubmitWrite`, which returns the result rather than a count.
+- `RETURNING` now runs on the source: set `CrossingTable::returning` and produce the
+  rows `node->returning_columns` names, or the statement is refused.
+- `Plan` answers for scans only, so drop its write branch and `MakeSeamNode`. A
+  source refuses a write through `CrossingTable::verbs`.

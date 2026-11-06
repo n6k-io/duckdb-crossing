@@ -158,18 +158,6 @@ TEST_CASE("a stop keeps a read of the same source on the target", "[split]") {
 	REQUIRE_FRAGMENT(*fragment, "proj{c0, c1} | seam");
 }
 
-TEST_CASE("a stop with seam positions keeps a row wider than the seam", "[split]") {
-	auto fragment = FragmentOverSeam({LogicalType::INTEGER});
-	SeamObstacle stop;
-	stop.stays = true;
-	stop.seam_positions = {1};
-
-	auto split = Split(PlanFromDSL("proj{c0, c1} | rows"), *fragment, stop);
-
-	REQUIRE_PLAN(split.remainder, "proj{c0, c1} | rows");
-	REQUIRE(fragment->seam_types == vector<LogicalType> {LogicalType::INTEGER});
-}
-
 TEST_CASE("a stop of a row the seam does not take is refused", "[split]") {
 	auto fragment = FragmentOverSeam({LogicalType::INTEGER});
 	SeamObstacle stop;

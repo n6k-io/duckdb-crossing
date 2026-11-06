@@ -107,7 +107,7 @@ unique_ptr<CrossingReadGlobalState> PrepareReadState(const CrossingFragment &fra
 	if (!fragment.plan) {
 		throw InternalException("crossing: the scan of '%s' carries no plan", source_table);
 	}
-	state->query = make_uniq<CrossingQuery>(CrossingVerb::SELECT, *fragment.plan);
+	state->query = make_uniq<CrossingQuery>(*fragment.plan);
 	state->query->types = emitted;
 	state->query->ordered = PlanIsOrdered(*fragment.plan);
 	state->query->tables = CrossingTablesOf(*fragment.plan);
@@ -257,40 +257,34 @@ shared_ptr<CrossingFragment> BuildScanFragment(unique_ptr<LogicalOperator> floor
 }
 
 //! A scan of the source's own storage cannot travel: it is bound to the connection that made it.
-//! The source names its table with a floor or seam and binds it where the plan runs.
-void RequirePlaceholderScans(const LogicalOperator &op, CrossingVerb verb, const string &table) {
-	if (op.type == LogicalOperatorType::LOGICAL_GET) {
-		auto &get = op.Cast<LogicalGet>();
-		if (!FloorOf(get) && get.function.GetName() != CROSSING_SEAM_FUNCTION) {
-			throw InternalException("crossing: the source's %s of '%s' holds a %s scan; return MakeFloorNode or "
-			                        "MakeSeamNode and bind the table in Read or Write",
-			                        verb == CrossingVerb::SELECT ? "scan" : CrossingVerbName(verb), table,
-			                        get.function.GetName().GetIdentifierName());
-		}
+//! The source names its table with a floor and binds it where the plan runs.
+void RequirePlaceholderScans(const LogicalOperator &op, const string &table) {
+	if (op.type == LogicalOperatorType::LOGICAL_GET && !FloorOf(op)) {
+		throw InternalException("crossing: the source's scan of '%s' holds a %s scan; return MakeFloorNode and bind "
+		                        "the table in Run",
+		                        table, op.Cast<LogicalGet>().function.GetName().GetIdentifierName());
 	}
 	for (auto &child : op.children) {
-		RequirePlaceholderScans(*child, verb, table);
+		RequirePlaceholderScans(*child, table);
 	}
 }
 
-unique_ptr<LogicalOperator> RequirePlan(CrossingPlan planned, CrossingVerb verb, const string &table) {
+unique_ptr<LogicalOperator> RequirePlan(CrossingPlan planned, const string &table) {
 	if (planned.plan) {
-		RequirePlaceholderScans(*planned.plan, verb, table);
+		RequirePlaceholderScans(*planned.plan, table);
 		return std::move(planned.plan);
 	}
 	auto &reason = planned.verdict.reason;
-	throw NotImplementedException("crossing: the source has no %s of '%s': %s",
-	                              verb == CrossingVerb::SELECT ? "scan" : CrossingVerbName(verb), table,
+	throw NotImplementedException("crossing: the source has no scan of '%s': %s", table,
 	                              reason.empty() ? "declined" : reason);
 }
 
 unique_ptr<FunctionData> MakeReadBindData(CrossingTableCatalogEntry &entry) {
 	CrossingPlanRequest request;
-	request.verb = CrossingVerb::SELECT;
 	request.schema = entry.source_schema;
 	request.table = entry.described.name;
 	request.described = &entry.described;
-	auto floor = RequirePlan(entry.source.Plan(request), CrossingVerb::SELECT, entry.described.name);
+	auto floor = RequirePlan(entry.source.Plan(request), entry.described.name);
 	auto fragment = BuildScanFragment(std::move(floor), entry.described.name, entry.described.column_names,
 	                                  entry.described.column_types);
 	return make_uniq<CrossingBindData>(entry, CrossingVerb::SELECT, CrossingSeam(), std::move(fragment));
@@ -353,7 +347,7 @@ unique_ptr<GlobalSourceState> CrossingRead::GetGlobalSourceState(ClientContext &
 
 	auto &catalog = ReadingCatalog(context, *bind_data);
 	auto &session = CrossingAttach::Of(catalog).Session(context, Transaction::Get(context, catalog));
-	state->scan = session.Read(context, *state->query);
+	state->scan = session.Run(context, *state->query);
 	CheckScanPartitions(*state, bind_data->SourceTable());
 	return std::move(state);
 }

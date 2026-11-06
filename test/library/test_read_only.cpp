@@ -5,7 +5,7 @@
 
 using namespace duckdb;
 
-TEST_CASE("a source whose session has no Write reads and refuses writes", "[read_only]") {
+TEST_CASE("a table granting only select reads and refuses writes", "[read_only]") {
 	DuckDB db(nullptr);
 	Connection con(db);
 	ExtensionLoader loader(*db.instance, "rodb");
@@ -21,21 +21,6 @@ TEST_CASE("a source whose session has no Write reads and refuses writes", "[read
 	auto insert = con.Query("INSERT INTO ro.t VALUES (1)");
 	REQUIRE(insert->HasError());
 	REQUIRE_THAT(insert->GetError(), Catch::Contains("does not have 'insert' permission"));
-}
-
-TEST_CASE("a table declaring a write verb on a source whose session has no Write is refused on first use",
-          "[read_only]") {
-	DuckDB db(nullptr);
-	Connection con(db);
-	ExtensionLoader loader(*db.instance, "rodb");
-	readonly::ReadOnlySource::Register(loader);
-
-	auto attached = con.Query("ATTACH 'nowhere' AS ro (TYPE rodb)");
-	REQUIRE(!attached->HasError());
-
-	auto count = con.Query("SELECT count(*) FROM ro.w");
-	REQUIRE(count->HasError());
-	REQUIRE_THAT(count->GetError(), Catch::Contains("'w' declares 'insert' but the session has no Write"));
 }
 
 TEST_CASE("a table declaring a ddl verb on a source whose session has no Ddl is refused on first use", "[read_only]") {

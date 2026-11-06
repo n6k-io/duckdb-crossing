@@ -27,6 +27,8 @@ public:
 	unique_ptr<BaseStatistics> GetStatistics(ClientContext &context, column_t column_id) override;
 	TableFunction GetScanFunction(ClientContext &context, unique_ptr<FunctionData> &bind_data) override;
 	TableStorageInfo GetStorageInfo(ClientContext &context) override;
+	//! Without the source default: what is built from this, such as a local copy, has no source to ask.
+	unique_ptr<CreateInfo> GetInfo() const override;
 
 	//! An update, a delete or a merge addresses rows by the key. The binder only takes row id
 	//! columns from the virtual map, so each key column has a virtual alias there; the pass turns

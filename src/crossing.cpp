@@ -47,10 +47,6 @@ vector<string> CrossingViewColumnNames(const CreateViewInfo &view) {
 	return names;
 }
 
-CrossingWriter CrossingSession::Write(ClientContext &, const CrossingQuery &) {
-	throw NotImplementedException("crossing: this source's session has no Write");
-}
-
 void CrossingSession::Ddl(ClientContext &, const CrossingDdl &) {
 	throw NotImplementedException("crossing: this source's session has no Ddl");
 }

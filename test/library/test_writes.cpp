@@ -1,5 +1,7 @@
 #include "framework/twin.hpp"
 
+#include "duckdb/main/query_result_stream.hpp"
+
 using namespace duckdb;
 
 using Op = LogicalOperatorType;
@@ -278,17 +280,17 @@ TEST_CASE("an update returning rows hands the source keys and values and returns
 	Twin twin(transport);
 	twin.Seed();
 
-	auto result =
-	    twin.Query("UPDATE far.orders SET id = 2, name = 'changed', amt = 1, tenant = 1, score = 1, ts = NULL "
-	               "WHERE id = 2 RETURNING id, name");
+	auto result = twin.Query("UPDATE far.orders SET name = 'changed' WHERE id = 2 RETURNING id, name, amt");
 
 	REQUIRE(result->RowCount() == 1);
 	REQUIRE(result->GetValue(0, 0) == Value::INTEGER(2));
 	REQUIRE(result->GetValue(1, 0) == Value("changed"));
+	REQUIRE(result->GetValue(2, 0) == Value::INTEGER(150));
 	auto &call = twin.LastWrite();
-	REQUIRE(call.rows_only);
+	REQUIRE(call.key_columns == vector<string> {"id"});
+	REQUIRE(call.set_columns == vector<string> {"name"});
 	REQUIRE(call.rows.size() == 1);
-	REQUIRE(call.rows[0].size() == call.key_columns.size() + call.set_columns.size());
+	REQUIRE(call.rows[0].size() == 2);
 	REQUIRE(call.rows[0][0] == Value::INTEGER(2));
 	REQUIRE(Scalar(twin, "SELECT name FROM orders WHERE id = 2") == Value("changed"));
 }
@@ -305,7 +307,6 @@ TEST_CASE("a delete returning rows hands the source keys and returns whole rows"
 	REQUIRE(result->GetValue(0, 0) == Value::INTEGER(2));
 	REQUIRE(result->GetValue(1, 0) == Value("beta"));
 	auto &call = twin.LastWrite();
-	REQUIRE(call.rows_only);
 	REQUIRE(call.rows == vector<vector<Value>> {{Value::INTEGER(2)}});
 	REQUIRE(Scalar(twin, "SELECT count(*) FROM orders") == Value::BIGINT(4));
 }
@@ -756,7 +757,7 @@ TEST_CASE("DEFAULT is refused rather than written as NULL", "[writes]") {
 	INFO(TransportName(transport));
 	auto sql = GENERATE(as<string> {}, "INSERT INTO far.d VALUES (2, DEFAULT)",
 	                    "INSERT INTO far.d(id, v) VALUES (2, DEFAULT)", "UPDATE far.d SET v = DEFAULT",
-	                    "UPDATE far.d SET v = DEFAULT WHERE id = 1", "INSERT INTO far.d(id) VALUES (2) RETURNING *",
+	                    "UPDATE far.d SET v = DEFAULT WHERE id = 1",
 	                    "MERGE INTO far.d t USING (SELECT 1 AS id) s ON t.id = s.id "
 	                    "WHEN MATCHED THEN UPDATE SET v = DEFAULT",
 	                    "MERGE INTO far.d t USING (SELECT 2 AS id) s ON t.id = s.id "
@@ -828,6 +829,22 @@ TEST_CASE("DESCRIBE shows that a column's default belongs to the source", "[writ
 	REQUIRE(result->GetValue(4, 0) == Value("crossing_source_default()"));
 }
 
+TEST_CASE("a local copy of a source's table takes inserts that leave a column out", "[writes]") {
+	auto transport = EACH_TRANSPORT();
+	INFO(TransportName(transport));
+	Twin twin(transport);
+	twin.Far("CREATE TABLE d(id INTEGER, v INTEGER DEFAULT 7)");
+	twin.Far("INSERT INTO d VALUES (1, 10)");
+	twin.Attach();
+	twin.Query("ATTACH ':memory:' AS copied");
+	twin.Query("COPY FROM DATABASE far TO copied");
+
+	twin.Query("INSERT INTO copied.d(id) VALUES (2)");
+
+	REQUIRE(twin.Query("SELECT v FROM copied.d WHERE id = 1")->GetValue(0, 0) == Value::INTEGER(10));
+	REQUIRE(twin.Query("SELECT v FROM copied.d WHERE id = 2")->GetValue(0, 0).IsNull());
+}
+
 TEST_CASE("a merge inserting default values is refused", "[writes]") {
 	auto transport = EACH_TRANSPORT();
 	INFO(TransportName(transport));
@@ -840,6 +857,382 @@ TEST_CASE("a merge inserting default values is refused", "[writes]") {
 	                        "WHEN NOT MATCHED THEN INSERT DEFAULT VALUES");
 
 	REQUIRE_THAT(error, Catch::Contains("cannot insert DEFAULT VALUES"));
+}
+
+TEST_CASE("a write the source runs arrives as a node holding what it writes", "[writes]") {
+	auto transport = EACH_TRANSPORT();
+	INFO(TransportName(transport));
+	Twin twin(transport);
+	twin.Seed();
+
+	twin.Query("UPDATE far.orders SET amt = 0 WHERE id = 1");
+	REQUIRE(twin.LastWrite().kind == CrossingVerb::UPDATE);
+	REQUIRE(twin.LastWrite().key_columns == vector<string> {"id"});
+	REQUIRE(twin.LastWrite().set_columns == vector<string> {"amt"});
+
+	twin.Query("DELETE FROM far.orders");
+	REQUIRE(twin.LastWrite().kind == CrossingVerb::DELETE_);
+	REQUIRE(twin.LastWrite().operators.empty());
+	REQUIRE(Scalar(twin, "SELECT count(*) FROM orders") == Value::BIGINT(0));
+}
+
+TEST_CASE("RETURNING comes from the source, so its defaults and values show", "[writes][returning]") {
+	auto transport = EACH_TRANSPORT();
+	INFO(TransportName(transport));
+	Twin twin(transport);
+	twin.store->keys["d"] = {"id"};
+	twin.store->key_unique["d"] = true;
+	twin.Far("CREATE TABLE d(id INTEGER, v INTEGER DEFAULT 7, w INTEGER DEFAULT 8)");
+	twin.Attach();
+
+	auto inserted = twin.Query("INSERT INTO far.d(id) VALUES (1) RETURNING id, v, w");
+	REQUIRE(inserted->RowCount() == 1);
+	REQUIRE(inserted->GetValue(1, 0) == Value::INTEGER(7));
+	REQUIRE(inserted->GetValue(2, 0) == Value::INTEGER(8));
+	REQUIRE(twin.LastWrite().set_columns == vector<string> {"id"});
+	REQUIRE(twin.LastWrite().returning_columns == vector<string> {"id", "v", "w"});
+
+	auto narrowed = twin.Query("INSERT INTO far.d(id) VALUES (2) RETURNING w");
+	REQUIRE(narrowed->ColumnCount() == 1);
+	REQUIRE(narrowed->GetValue(0, 0) == Value::INTEGER(8));
+
+	auto updated = twin.Query("UPDATE far.d SET v = 0 WHERE id = 1 RETURNING id");
+	REQUIRE(updated->RowCount() == 1);
+	REQUIRE(twin.LastWrite().set_columns == vector<string> {"v"});
+
+	auto whole = twin.Query("UPDATE far.d SET v = v WHERE id = 1 RETURNING *");
+	REQUIRE(whole->GetValue(1, 0) == Value::INTEGER(0));
+	REQUIRE(whole->ColumnCount() == 3);
+
+	auto gone = twin.Query("DELETE FROM far.d WHERE id = 2 RETURNING v, id");
+	REQUIRE(gone->GetValue(0, 0) == Value::INTEGER(7));
+	REQUIRE(gone->GetValue(1, 0) == Value::INTEGER(2));
+
+	auto nothing = twin.Query("DELETE FROM far.d WHERE id = 99 RETURNING *");
+	REQUIRE(nothing->RowCount() == 0);
+}
+
+TEST_CASE("a merge's RETURNING comes from the source", "[writes][returning]") {
+	auto transport = EACH_TRANSPORT();
+	INFO(TransportName(transport));
+	Twin twin(transport);
+	twin.store->keys["d"] = {"id"};
+	twin.store->key_unique["d"] = true;
+	twin.Far("CREATE TABLE d(id INTEGER, v INTEGER DEFAULT 7, w INTEGER DEFAULT 8)");
+	twin.Far("INSERT INTO d VALUES (1, 10, 20)");
+	twin.Attach();
+
+	auto inserted = twin.Query("MERGE INTO far.d t USING (SELECT 2 AS id) s ON t.id = s.id "
+	                           "WHEN NOT MATCHED THEN INSERT (id) VALUES (s.id) RETURNING id, v, w");
+	REQUIRE(inserted->RowCount() == 1);
+	REQUIRE(inserted->GetValue(1, 0) == Value::INTEGER(7));
+	REQUIRE(inserted->GetValue(2, 0) == Value::INTEGER(8));
+	REQUIRE(twin.LastWrite().set_columns == vector<string> {"id"});
+
+	auto updated = twin.Query("MERGE INTO far.d t USING (SELECT 1 AS id, 0 AS v) s ON t.id = s.id "
+	                          "WHEN MATCHED THEN UPDATE SET v = s.v RETURNING id, v, w");
+	REQUIRE(updated->GetValue(1, 0) == Value::INTEGER(0));
+	REQUIRE(updated->GetValue(2, 0) == Value::INTEGER(20));
+	REQUIRE(twin.LastWrite().set_columns == vector<string> {"v"});
+
+	auto deleted = twin.Query("MERGE INTO far.d t USING (SELECT 1 AS id) s ON t.id = s.id "
+	                          "WHEN MATCHED THEN DELETE RETURNING id, w");
+	REQUIRE(deleted->GetValue(1, 0) == Value::INTEGER(20));
+	REQUIRE(Scalar(twin, "SELECT count(*) FROM d") == Value::BIGINT(1));
+
+	auto nothing = twin.Query("MERGE INTO far.d t USING (SELECT 99 AS id) s ON t.id = s.id "
+	                          "WHEN MATCHED THEN DELETE RETURNING id");
+	REQUIRE(nothing->RowCount() == 0);
+}
+
+TEST_CASE("a merge's RETURNING is refused on a source that cannot return rows", "[writes][returning]") {
+	auto transport = EACH_TRANSPORT();
+	INFO(TransportName(transport));
+	Twin twin(transport);
+	twin.store->returning = false;
+	twin.Seed();
+
+	auto error = twin.Error("MERGE INTO far.orders t USING (SELECT 2 AS id) s ON t.id = s.id "
+	                        "WHEN MATCHED THEN UPDATE SET amt = 0 RETURNING id");
+
+	REQUIRE_THAT(error, Catch::Contains("cannot return rows"));
+	REQUIRE(twin.store->writes.empty());
+	REQUIRE(Scalar(twin, "SELECT amt FROM orders WHERE id = 2") == Value::INTEGER(150));
+}
+
+TEST_CASE("a merge's seam over the memory limit spills and lands whole", "[writes]") {
+	auto transport = EACH_TRANSPORT();
+	INFO(TransportName(transport));
+	Twin twin(transport);
+	twin.store->keys["big"] = {"id"};
+	twin.store->key_unique["big"] = true;
+	twin.Far("CREATE TABLE big(id BIGINT, v VARCHAR)");
+	twin.Attach();
+	twin.Query("SET memory_limit = '32MB'");
+
+	auto result = twin.Query("MERGE INTO far.big t USING (SELECT i AS id, repeat(md5(i::VARCHAR), 32) AS v "
+	                         "FROM range(64000) r(i)) s ON t.id = s.id "
+	                         "WHEN NOT MATCHED THEN INSERT VALUES (s.id, s.v)");
+
+	REQUIRE(result->GetValue(0, 0) == Value::BIGINT(64000));
+	REQUIRE(twin.LastWrite().target_swap_bytes > 0);
+	REQUIRE(Scalar(twin, "SELECT count(*) FROM big WHERE v = repeat(md5(id::VARCHAR), 32)") == Value::BIGINT(64000));
+}
+
+TEST_CASE("a conflict clause's RETURNING answers as plain DuckDB does", "[writes][returning][on_conflict]") {
+	auto transport = EACH_TRANSPORT();
+	auto sql = GENERATE(as<string> {},
+	                    "INSERT INTO far.d(id, v) VALUES (1, 5), (2, 6) ON CONFLICT (id) DO UPDATE SET v = excluded.v "
+	                    "RETURNING id, v, w",
+	                    "INSERT INTO far.d(id, v, w) VALUES (1, 5, 0), (2, 6, 0) ON CONFLICT DO NOTHING RETURNING *");
+	if (sql.find("(id, v)") != string::npos) {
+		sql = StringUtil::Replace(sql, "(id, v) VALUES (1, 5), (2, 6)", "(id, v, w) VALUES (1, 5, 0), (2, 6, 0)");
+	}
+	INFO(TransportName(transport) << " " << sql);
+	const string table = "CREATE TABLE d(id INTEGER PRIMARY KEY, v INTEGER, w INTEGER DEFAULT 8)";
+	const string row = "INSERT INTO d VALUES (1, 10, 20)";
+
+	Twin plain(transport);
+	plain.Far(table);
+	plain.Far(row);
+	auto expected = Collected(plain.store->con.Query(Twin::Unprefixed(sql)));
+	REQUIRE(!expected->HasError());
+
+	Twin twin(transport);
+	twin.store->declare_key_constraints = true;
+	twin.store->keys["d"] = {"id"};
+	twin.store->key_unique["d"] = true;
+	twin.Far(table);
+	twin.Far(row);
+	twin.Attach();
+	auto got = twin.Query(sql);
+
+	REQUIRE(got->RowCount() == expected->RowCount());
+	REQUIRE(got->ColumnCount() == expected->ColumnCount());
+	set<string> got_rows;
+	set<string> expected_rows;
+	for (idx_t r = 0; r < got->RowCount(); r++) {
+		string got_row;
+		string expected_row;
+		for (idx_t c = 0; c < got->ColumnCount(); c++) {
+			got_row += got->GetValue(c, r).ToString() + "|";
+			expected_row += expected->GetValue(c, r).ToString() + "|";
+		}
+		got_rows.insert(got_row);
+		expected_rows.insert(expected_row);
+	}
+	REQUIRE(got_rows == expected_rows);
+	const string rows = "SELECT string_agg(d::VARCHAR, ';' ORDER BY id) FROM d";
+	REQUIRE(Scalar(twin, rows) == Scalar(plain, rows));
+}
+
+TEST_CASE("a prepared merge runs again", "[writes]") {
+	auto transport = EACH_TRANSPORT();
+	INFO(TransportName(transport));
+	Twin twin(transport);
+	twin.Seed();
+
+	auto prepared = twin.con.Prepare("MERGE INTO far.orders t USING (SELECT ?::INTEGER AS id, ?::INTEGER AS amt) s "
+	                                 "ON t.id = s.id WHEN MATCHED THEN UPDATE SET amt = s.amt "
+	                                 "WHEN NOT MATCHED THEN INSERT (id, amt) VALUES (s.id, s.amt)");
+	REQUIRE(!prepared->HasError());
+	REQUIRE(!Collected(prepared->Execute(2, 1))->HasError());
+	REQUIRE(!Collected(prepared->Execute(2, 3))->HasError());
+	REQUIRE(!Collected(prepared->Execute(50, 4))->HasError());
+
+	REQUIRE(Scalar(twin, "SELECT amt FROM orders WHERE id = 2") == Value::INTEGER(3));
+	REQUIRE(Scalar(twin, "SELECT amt FROM orders WHERE id = 50") == Value::INTEGER(4));
+}
+
+TEST_CASE("RETURNING over local rows that select nothing makes no call", "[writes][returning]") {
+	auto transport = EACH_TRANSPORT();
+	INFO(TransportName(transport));
+	Twin twin(transport);
+	twin.Seed();
+
+	auto result = twin.Query("INSERT INTO far.orders SELECT i::INTEGER, 'p', 1, 1, 1, NULL FROM range(0) r(i) RETURNING id");
+
+	REQUIRE(result->RowCount() == 0);
+	REQUIRE(twin.store->writes.empty());
+}
+
+TEST_CASE("RETURNING on a source that cannot return rows is refused before it hears of it", "[writes][returning]") {
+	auto transport = EACH_TRANSPORT();
+	auto sql = GENERATE(as<string> {}, "INSERT INTO far.orders VALUES (6, 'z', 1, 1, 1, NULL) RETURNING id",
+	                    "UPDATE far.orders SET amt = 0 RETURNING id", "DELETE FROM far.orders RETURNING id");
+	INFO(TransportName(transport) << " " << sql);
+	Twin twin(transport);
+	twin.store->returning = false;
+	twin.Seed();
+
+	REQUIRE_THAT(twin.Error(sql), Catch::Contains("cannot return rows"));
+	REQUIRE(twin.store->writes.empty());
+	REQUIRE(Scalar(twin, "SELECT count(*) FROM orders WHERE amt = 0") == Value::BIGINT(0));
+}
+
+TEST_CASE("a source whose table changed refuses RETURNING with nothing written", "[writes][returning]") {
+	auto transport = EACH_TRANSPORT();
+	auto change = GENERATE(as<string> {}, "ALTER TABLE d DROP COLUMN w", "ALTER TABLE d ALTER COLUMN w TYPE VARCHAR");
+	INFO(TransportName(transport) << " " << change);
+	Twin twin(transport);
+	twin.store->keys["d"] = {"id"};
+	twin.store->key_unique["d"] = true;
+	twin.Far("CREATE TABLE d(id INTEGER, v INTEGER, w INTEGER)");
+	twin.Far("INSERT INTO d VALUES (1, 10, 20)");
+	twin.Attach();
+	twin.Query("SELECT * FROM far.d");
+	twin.Far(change);
+
+	twin.Error("UPDATE far.d SET v = 0 RETURNING *");
+
+	REQUIRE(Scalar(twin, "SELECT v FROM d") == Value::INTEGER(10));
+}
+
+TEST_CASE("a duplicate key fails a RETURNING before any row and rolls back", "[writes][returning]") {
+	auto transport = EACH_TRANSPORT();
+	INFO(TransportName(transport));
+	Twin twin(transport);
+	twin.store->keys["dup"] = {"k"};
+	twin.store->key_unique["dup"] = false;
+	twin.Far("CREATE TABLE dup(k INTEGER, v INTEGER)");
+	twin.Far("INSERT INTO dup VALUES (1, 1), (1, 2), (2, 3)");
+	twin.Attach();
+
+	auto error = twin.Error("UPDATE far.dup SET v = 9 WHERE k = 1 RETURNING k");
+
+	REQUIRE_THAT(error, Catch::Contains("is not unique on the source"));
+	REQUIRE(twin.store->transaction_ends.back() == "rollback");
+	REQUIRE(Scalar(twin, "SELECT count(*) FROM dup WHERE v = 9") == Value::BIGINT(0));
+}
+
+TEST_CASE("duplicate seam keys against a non-unique key still fail", "[writes][returning]") {
+	auto transport = EACH_TRANSPORT();
+	INFO(TransportName(transport));
+	Twin twin(transport);
+	twin.store->keys["dup"] = {"k"};
+	twin.store->key_unique["dup"] = false;
+	twin.Far("CREATE TABLE dup(k INTEGER, v INTEGER)");
+	twin.Far("INSERT INTO dup VALUES (1, 1), (1, 2), (2, 3)");
+	twin.Attach();
+
+	auto error = twin.Error("UPDATE far.dup SET v = 9 FROM (VALUES (1), (1)) s(k) WHERE dup.k = s.k");
+
+	REQUIRE_THAT(error, Catch::Contains("is not unique on the source"));
+	REQUIRE(Scalar(twin, "SELECT count(*) FROM dup WHERE v = 9") == Value::BIGINT(0));
+}
+
+TEST_CASE("a result abandoned after one chunk leaves what plain DuckDB leaves", "[writes][returning]") {
+	auto transport = EACH_TRANSPORT();
+	INFO(TransportName(transport));
+	const string make = "CREATE TABLE big AS SELECT i::INTEGER AS id, 0 AS v FROM range(5000) r(i)";
+	const string count = "SELECT count(*) FROM big WHERE v = 1";
+	auto abandon = [](Connection &con, const string &sql) {
+		auto result = con.Submit(sql);
+		REQUIRE(!result->HasError());
+		QueryResultStream<ChunkFormat> stream(std::move(result));
+		REQUIRE(stream.Fetch());
+		stream.Close();
+	};
+
+	Twin plain(transport);
+	plain.Far(make);
+	abandon(plain.store->con, "UPDATE big SET v = 1 RETURNING id");
+	auto plain_count = Scalar(plain, count);
+	INFO("plain DuckDB leaves " << plain_count.ToString());
+
+	Twin twin(transport);
+	twin.store->keys["big"] = {"id"};
+	twin.store->key_unique["big"] = true;
+	twin.Far(make);
+	twin.Attach();
+	abandon(twin.con, "UPDATE far.big SET v = 1 RETURNING id");
+	twin.store->JoinArrivals();
+
+	REQUIRE(plain_count == Value::BIGINT(0));
+	REQUIRE(Scalar(twin, count) == plain_count);
+}
+
+TEST_CASE("RETURNING rows over the memory limit spill and all come back", "[writes][returning]") {
+	auto transport = EACH_TRANSPORT();
+	INFO(TransportName(transport));
+	Twin twin(transport);
+	twin.store->keys["big"] = {"id"};
+	twin.store->key_unique["big"] = true;
+	twin.Far("CREATE TABLE big AS SELECT i::BIGINT AS id, repeat(md5(i::VARCHAR), 32) AS v, 0 AS w FROM range(64000) r(i)");
+	twin.Attach();
+	twin.Query("SET memory_limit = '32MB'");
+
+	auto result = twin.con.Submit("UPDATE far.big SET w = 1 RETURNING id, v");
+	REQUIRE(!result->HasError());
+	QueryResultStream<ChunkFormat> stream(std::move(result));
+	idx_t rows = 0;
+	idx_t wrong = 0;
+	while (auto chunk = stream.Fetch()) {
+		for (idx_t r = 0; r < chunk->size(); r++) {
+			rows++;
+			wrong += chunk->GetValue(1, r).ToString().size() == 1024 ? 0 : 1;
+		}
+	}
+	stream.Close();
+
+	REQUIRE(rows == 64000);
+	REQUIRE(wrong == 0);
+	REQUIRE(twin.LastWrite().target_swap_bytes_after_return > 0);
+	REQUIRE(Scalar(twin, "SELECT count(*) FROM big WHERE w = 1") == Value::BIGINT(64000));
+}
+
+TEST_CASE("a write inside a WITH clause is refused and changes nothing", "[writes]") {
+	auto transport = EACH_TRANSPORT();
+	auto sql = GENERATE(as<string> {}, "WITH x AS (DELETE FROM far.orders RETURNING id) SELECT 1",
+	                    "WITH x AS (DELETE FROM far.orders WHERE id = 1 RETURNING id) SELECT * FROM x",
+	                    "WITH x AS (UPDATE far.orders SET amt = 0 RETURNING id) SELECT count(*) FROM x",
+	                    "WITH x AS (INSERT INTO far.orders VALUES (6, 'z', 1, 1, 1, NULL) RETURNING id) SELECT 1");
+	INFO(TransportName(transport) << " " << sql);
+	Twin twin(transport);
+	twin.Seed();
+
+	REQUIRE_THAT(twin.Error(sql), Catch::Contains("inside a WITH clause"));
+	REQUIRE(twin.store->writes.empty());
+	REQUIRE(Scalar(twin, "SELECT count(*) FROM orders") == Value::BIGINT(5));
+}
+
+TEST_CASE("a prepared write runs again", "[writes]") {
+	auto transport = EACH_TRANSPORT();
+	INFO(TransportName(transport));
+	Twin twin(transport);
+	twin.Seed();
+
+	auto prepared = twin.con.Prepare("UPDATE far.orders SET amt = ? WHERE id = ? RETURNING amt");
+	REQUIRE(!prepared->HasError());
+	for (int32_t amount : {1, 2}) {
+		auto result = Collected(prepared->Execute(amount, 3));
+		REQUIRE(!result->HasError());
+		REQUIRE(result->GetValue(0, 0) == Value::INTEGER(amount));
+		REQUIRE(Scalar(twin, "SELECT amt FROM orders WHERE id = 3") == Value::INTEGER(amount));
+	}
+	auto insert = twin.con.Prepare("INSERT INTO far.orders SELECT i, 'p', 1, 1, 1, NULL FROM range(?, ?) r(i)");
+	REQUIRE(!insert->HasError());
+	REQUIRE(!Collected(insert->Execute(10, 12))->HasError());
+	REQUIRE(!Collected(insert->Execute(20, 23))->HasError());
+	REQUIRE(Scalar(twin, "SELECT count(*) FROM orders") == Value::BIGINT(10));
+}
+
+TEST_CASE("an insert keeps the order of its feed", "[writes]") {
+	auto transport = EACH_TRANSPORT();
+	INFO(TransportName(transport));
+	Twin twin(transport);
+	twin.Far("CREATE TABLE seq(id INTEGER)");
+	twin.Attach();
+
+	twin.Query("INSERT INTO far.seq SELECT i::INTEGER FROM range(5000) r(i) ORDER BY i DESC");
+
+	auto &rows = twin.LastWrite().rows;
+	REQUIRE(rows.size() == 5000);
+	for (idx_t r = 0; r < rows.size(); r++) {
+		if (rows[r][0] != Value::INTEGER(NumericCast<int32_t>(4999 - r))) {
+			FAIL("row " << r << " out of order");
+		}
+	}
 }
 
 TEST_CASE("a write returning rows returns what the source now holds", "[writes]") {
@@ -888,7 +1281,7 @@ TEST_CASE("a plan the source declines fails the statement with the source's reas
 	twin.Seed();
 	twin.store->declined = "the source is read only today";
 
-	auto error = twin.Error("INSERT INTO far.orders VALUES (6, 'zeta', 600, 3, 6.5, NULL)");
+	auto error = twin.Error("UPDATE far.orders SET amt = 0");
 
 	REQUIRE_THAT(error, Catch::Contains("the source is read only today"));
 	REQUIRE(twin.store->writes.empty());

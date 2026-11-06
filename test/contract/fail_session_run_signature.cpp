@@ -2,8 +2,8 @@
 
 namespace duckdb {
 
-struct Bad : GoodSession {
-	CrossingWriter Write(ClientContext &) {
+struct Bad {
+	CrossingScan Run(ClientContext &) {
 		return {};
 	}
 };

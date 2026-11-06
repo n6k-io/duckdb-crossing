@@ -9,9 +9,14 @@
 
 namespace duckdb {
 
+//! A crossing write inside a CTE is refused: DuckDB could drop the near node, not seeing a write in it.
+void RefuseWritesInCtes(LogicalOperator &plan, const CrossingIdentity &identity);
+
+//! Drops what an update or merge only sets to itself, which DuckDB adds so a RETURNING has the whole row.
+void NarrowSetsToWhatChanges(LogicalOperator &plan, const CrossingIdentity &identity);
+
 //! Drops the columns an insert did not name from its row and records them in `column_index_map`, so the
-//! source applies its own defaults. RETURNING needs a whole row on the target, so it keeps them, and the
-//! statement fails when they execute.
+//! source applies its own defaults.
 void LeaveInsertDefaultsToSource(LogicalOperator &plan, const CrossingIdentity &identity);
 
 //! Turns every update and delete that reads nothing of the rows it writes into one that names no key.
@@ -19,8 +24,8 @@ void LeaveInsertDefaultsToSource(LogicalOperator &plan, const CrossingIdentity &
 void FillBareWrites(ClientContext &context, unique_ptr<LogicalOperator> &plan, const FreshTableIndex &fresh,
                     const CrossingIdentity &identity);
 
-//! Fills every write's seam from its feed: a fence where the feed crosses whole, otherwise a seam
-//! insert of the remainder.
+//! Fills every write's seam from its feed: a near node with no child where the feed crosses whole,
+//! otherwise one over the remainder.
 void FillWrites(ClientContext &context, unique_ptr<LogicalOperator> &plan, const FreshTableIndex &fresh,
                 const CrossingIdentity &identity);
 

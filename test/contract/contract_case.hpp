@@ -7,7 +7,7 @@
 namespace duckdb {
 
 struct GoodSession {
-	CrossingScan Read(ClientContext &, const CrossingQuery &) {
+	CrossingScan Run(ClientContext &, const CrossingQuery &) {
 		return {};
 	}
 };

@@ -93,6 +93,10 @@ void AdoptFloorIndex(LogicalOperator &root, const LogicalGet &floor_get, const C
 
 void BindFloorsBelow(Binder &binder, unique_ptr<LogicalOperator> &op, const string &catalog,
                      const CrossingFloorResolver &resolver, idx_t &next_index) {
+	if (WriteOf(*op)) {
+		throw InvalidInputException("crossing: a write node reached BindFloors; bind the plan under it and run that "
+		                            "through SubmitWrite");
+	}
 	for (auto &child : op->children) {
 		BindFloorsBelow(binder, child, catalog, resolver, next_index);
 	}
@@ -179,6 +183,14 @@ unique_ptr<ParsedExpression> KeysMatch(const CrossingWriteTarget &target, const 
 		                      : unique_ptr<ParsedExpression>(std::move(same));
 	}
 	return condition;
+}
+
+vector<unique_ptr<ParsedExpression>> ReturningList(const CrossingWriteTarget &target) {
+	vector<unique_ptr<ParsedExpression>> list;
+	for (auto &column : target.returning_columns) {
+		list.push_back(make_uniq<ColumnRefExpression>(Identifier(column)));
+	}
+	return list;
 }
 
 unique_ptr<SQLStatement> InsertOf(const CrossingWriteTarget &target, unique_ptr<TableRef> seam,
@@ -308,7 +320,7 @@ private:
 	vector<ColumnDefinition> columns;
 };
 
-idx_t RunPlanned(ClientContext &context, const CrossingWriteTarget &target, unique_ptr<LogicalOperator> plan) {
+unique_ptr<QueryResult> RunPlanned(ClientContext &context, const CrossingWriteTarget &target, unique_ptr<LogicalOperator> plan) {
 	auto &attached = Catalog::GetCatalog(context, Identifier(target.catalog)).GetAttached();
 	MetaTransaction::Get(context).ModifyDatabase(attached, DatabaseModificationType::UPDATE_DATA);
 
@@ -317,19 +329,24 @@ idx_t RunPlanned(ClientContext &context, const CrossingWriteTarget &target, uniq
 	// Fetching a result that failed while running reports the failure as a fetch error, losing its type.
 	result->Complete();
 	result->ThrowIfError();
-	auto chunk = result->Fetch();
-	if (!chunk || chunk->size() == 0 || chunk->ColumnCount() == 0) {
-		return 0;
-	}
-	return NumericCast<idx_t>(chunk->GetValue(0, 0).GetValue<int64_t>());
+	return result;
 }
 
-idx_t ExecuteBuilt(ClientContext &context, Planner &planner, const CrossingWriteTarget &target,
-                   CrossingWriteStatement built, const CrossingWriteShaper &shape) {
+void RequireReturnedTypes(const CrossingWriteTarget &target, const vector<LogicalType> &types) {
+	if (!target.returning_columns.empty() && types != target.returning_types) {
+		throw CatalogException("crossing: '%s' changed on the source: the write returns other columns than the "
+		                       "description taken at attach says; refresh the attach",
+		                       target.table);
+	}
+}
+
+unique_ptr<QueryResult> SubmitBuilt(ClientContext &context, Planner &planner, const CrossingWriteTarget &target,
+                                    CrossingWriteStatement built, const CrossingWriteShaper &shape) {
 	if (shape) {
 		shape(built);
 	}
 	planner.CreatePlan(std::move(built.statement));
+	RequireReturnedTypes(target, planner.types);
 	return RunPlanned(context, target, std::move(planner.plan));
 }
 
@@ -374,12 +391,15 @@ CrossingWriteStatement BuildWriteStatement(const CrossingWriteTarget &target, un
 	switch (target.verb) {
 	case CrossingVerb::INSERT:
 		built.statement = InsertOf(target, std::move(named), built.seam_columns);
+		built.statement->Cast<InsertStatement>().node->returning_list = ReturningList(target);
 		break;
 	case CrossingVerb::UPDATE:
 		built.statement = UpdateOf(target, std::move(named), built.seam_columns);
+		built.statement->Cast<UpdateStatement>().node->returning_list = ReturningList(target);
 		break;
 	case CrossingVerb::DELETE_:
 		built.statement = DeleteOf(target, std::move(named), built.seam_columns);
+		built.statement->Cast<DeleteStatement>().node->returning_list = ReturningList(target);
 		break;
 	default:
 		throw InvalidInputException("crossing: '%s' is not a write verb", CrossingVerbName(target.verb));
@@ -387,19 +407,33 @@ CrossingWriteStatement BuildWriteStatement(const CrossingWriteTarget &target, un
 	return built;
 }
 
-idx_t ExecuteWrite(ClientContext &context, const CrossingWriteTarget &target, unique_ptr<TableRef> seam,
-                   const CrossingWriteShaper &shape) {
-	RequireTransaction(context, "ExecuteWrite");
-	Planner planner(context);
-	return ExecuteBuilt(context, planner, target, BuildWriteStatement(target, std::move(seam)), shape);
+CrossingWriteTarget CrossingWriteTargetOf(const string &catalog, const CrossingWriteNode &node) {
+	CrossingWriteTarget target;
+	target.catalog = node.catalog.empty() ? catalog : node.catalog;
+	target.schema = node.schema;
+	target.table = node.table;
+	target.verb = node.verb;
+	target.key_columns = node.key_columns;
+	target.set_columns = node.set_columns;
+	target.reads_rows = node.verb == CrossingVerb::INSERT || !node.key_columns.empty();
+	target.returning_columns = node.returning_columns;
+	target.returning_types = node.returning_types;
+	return target;
 }
 
-idx_t ExecuteWrite(ClientContext &context, const CrossingWriteTarget &target, unique_ptr<LogicalOperator> seam,
-                   const CrossingWriteShaper &shape) {
-	RequireTransaction(context, "ExecuteWrite");
+unique_ptr<QueryResult> SubmitWrite(ClientContext &context, const CrossingWriteTarget &target,
+                                    unique_ptr<TableRef> seam, const CrossingWriteShaper &shape) {
+	RequireTransaction(context, "SubmitWrite");
+	Planner planner(context);
+	return SubmitBuilt(context, planner, target, BuildWriteStatement(target, std::move(seam)), shape);
+}
+
+unique_ptr<QueryResult> SubmitWrite(ClientContext &context, const CrossingWriteTarget &target,
+                                    unique_ptr<LogicalOperator> seam, const CrossingWriteShaper &shape) {
+	RequireTransaction(context, "SubmitWrite");
 	Planner planner(context);
 	auto ref = seam ? SeamRefOfPlan(*planner.binder, std::move(seam)) : nullptr;
-	return ExecuteBuilt(context, planner, target, BuildWriteStatement(target, std::move(ref)), shape);
+	return SubmitBuilt(context, planner, target, BuildWriteStatement(target, std::move(ref)), shape);
 }
 
 } // namespace duckdb

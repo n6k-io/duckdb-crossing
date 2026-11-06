@@ -9,8 +9,6 @@ namespace duckdb {
 
 struct CrossingFeed {
 	unique_ptr<LogicalOperator> plan;
-	//! Set when `plan` emits the row image RETURNING needs: where each seam column sits in that image.
-	vector<idx_t> seam_positions;
 };
 
 CrossingFeed FeedOf(LogicalOperator &write, const vector<column_t> &key_columns, unique_ptr<LogicalOperator> feed,
@@ -19,7 +17,6 @@ CrossingFeed FeedOf(LogicalOperator &write, const vector<column_t> &key_columns,
 struct SeamObstacle {
 	bool stays = false;
 	string obstacle;
-	vector<idx_t> seam_positions;
 };
 
 struct SeamFill {

@@ -10,7 +10,7 @@ using namespace duckdb;
 
 struct ReadOnlySource {
 	struct Session {
-		CrossingScan Read(ClientContext &, const CrossingQuery &);
+		CrossingScan Run(ClientContext &, const CrossingQuery &);
 	};
 
 	vector<string> Tables(const string &);

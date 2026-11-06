@@ -8,13 +8,14 @@
 //   identity   what tells one copy of crossing's nodes from another copy's
 //   attach     one ATTACH of a source, and the object that serves it to a catalog
 //   session    one target transaction's side of the source; every read and write in it goes through it
-//   scan       one Read, which opens a reader per partition
-//   waker      what a reader or writer that has nothing yet calls when it does
+//   scan       one Run, which opens a reader per partition
+//   waker      what a reader that has nothing yet calls when it does
 //   fragment   the plan a crossing carries to the source
 //   carrier    the bind data a fragment rides in, hung off a LogicalGet
 //   floor      the source's own scan at the bottom of a read fragment; sealed once built
 //   seam       the hole in a write fragment where the rows go
-//   fence      the logical operator standing in for a write the source runs alone
+//   write node the top of a write fragment, naming the write; what it writes is its child
+//   near node  near's side of a write: gathers any rows, makes the one call, holds what comes back
 //   feed       what a write takes rows from
 //   fold       moving a read subtree into its fragment
 //   fill       moving a feed into a seam
@@ -89,13 +90,15 @@ struct CrossingTable {
 	vector<string> column_names;
 	vector<LogicalType> column_types;
 	//! A verb absent here is refused before the statement runs. An update or delete that reads rows
-	//! (CrossingQuery::reads_rows) also needs SELECT. With UPDATE or DELETE but no SELECT, Plan(SELECT)
+	//! (CrossingWriteTarget::reads_rows) also needs SELECT. With UPDATE or DELETE but no SELECT, Plan(SELECT)
 	//! is still asked at bind, since every update and delete binds a scan.
 	vector<CrossingVerb> verbs;
 	vector<string> key;
 	//! The source vouches `key` is unique. Only then may a keyed write run wholly on the source,
 	//! since nothing counts what the target sent.
 	bool key_unique = false;
+	//! The source can return the rows a write leaves. Without it RETURNING is refused at bind.
+	bool returning = false;
 	//! Constraints the source enforces. Declaring one your source does not enforce claims a
 	//! guarantee nothing keeps, so only pass what is real.
 	vector<unique_ptr<Constraint>> constraints;
@@ -178,42 +181,45 @@ unique_ptr<LogicalOperator> DeserializeCrossingPlan(ClientContext &context, cons
 //! Makes the floor and seam functions resolvable by name, which DeserializeCrossingPlan needs.
 void RegisterCrossingPlanFunctions(DatabaseInstance &db);
 
-//! What a read and a write both carry. Lives as long as the scan or writer it was handed to.
+//! What a read and a write both carry. Lives as long as the scan it was handed to.
 struct CrossingQuery {
-	CrossingQuery(CrossingVerb kind_p, const LogicalOperator &plan_p) : kind(kind_p), plan(plan_p) {
+	explicit CrossingQuery(const LogicalOperator &plan_p) : plan(plan_p) {
 	}
 
-	//! SELECT on a read, the write verb on a write.
-	CrossingVerb kind;
 	//! Not yet optimized by DuckDB. A read is the crossed work on a projection crossing adds, on the
-	//! floor. A write is the statement with its seam already filled: by work reading this source when
-	//! every part of the feed can run on it, otherwise by the rows the target gathered, all the feed's
-	//! work done (see SeamRowsOf). Run it as it is.
+	//! floor. A write has a write node on top (WriteOf); see CrossingWriteNode. Run it as it is.
 	const LogicalOperator &plan;
-	//! The row types: what a read produces, what a write is handed.
+	//! What the readers produce: a read's rows; a write's one BIGINT, the rows it changed; or, with
+	//! `returning_columns`, the rows it left.
 	vector<LogicalType> types;
 	bool ordered = false;
 	//! Every table the plan reads. On a write whose seam the target filled, none.
 	vector<CrossingTableUse> tables;
-	//! The table a write writes, with the columns the seam carries. Empty on a read.
-	CrossingTableUse written;
-	//! What an update or a delete addresses rows by. An insert names none.
-	vector<string> key_columns;
-	//! The columns a write sets. An insert names the columns the statement gave a value, in the order
-	//! Describe declared them; the source applies its own defaults to the rest. `INSERT ... DEFAULT VALUES`
-	//! names none, and takes nothing as a delete below does. An update names the columns it sets. A delete
-	//! names none.
-	vector<string> set_columns;
-	//! False on an update or delete that reads nothing of the rows it writes: no WHERE, no FROM or
-	//! USING, no RETURNING, and every SET value foldable (no column, nothing volatile). It names no key
-	//! columns and addresses every row of the table; the seam carries an update's one row of values. A
-	//! delete takes nothing: `types` is empty, `plan` is a placeholder, and the statement is built with
-	//! a null seam. A source with row policies can use this to tell such a write from one that reads.
-	bool reads_rows = true;
 };
 
-unique_ptr<LogicalOperator> MakeSeamNode(idx_t table_index, vector<LogicalType> types);
-unique_ptr<LogicalOperator> MakeSeamNode(vector<LogicalType> types);
+//! A write the source is asked to run. Its child in the plan is what it writes: work reading this source
+//! when every part of the feed can run on it, otherwise the rows the target gathered, all the feed's work
+//! done (see SeamRowsOf). No child means it takes nothing, as a bare delete and `DEFAULT VALUES` do.
+struct CrossingWriteNode {
+	CrossingVerb verb = CrossingVerb::INSERT;
+	string catalog;
+	string schema;
+	string table;
+	//! What an update or a delete addresses rows by. An insert names none. An update or delete naming
+	//! none reads nothing of the rows it writes and addresses every row of the table.
+	vector<string> key_columns;
+	//! The columns a write sets. An insert names the columns the statement gave a value, in the order
+	//! Describe declared them; the source applies its own defaults to the rest. An update names the
+	//! columns it sets. A delete names none.
+	vector<string> set_columns;
+	//! Non-empty: the write returns the rows it leaves, these columns of them. The types are what the
+	//! target expects them to be.
+	vector<string> returning_columns;
+	vector<LogicalType> returning_types;
+};
+
+//! The write `op` is the node of. Null for any other operator.
+optional_ptr<const CrossingWriteNode> WriteOf(const LogicalOperator &op);
 
 //! The rows a CHUNK_GET holds: the seam the target filled, or a VALUES list. Null for any other operator.
 optional_ptr<const ColumnDataCollection> SeamRowsOf(const LogicalOperator &op);
@@ -242,9 +248,16 @@ struct CrossingWriteTarget {
 	CrossingVerb verb;
 	vector<string> key_columns;
 	vector<string> set_columns;
-	//! As CrossingQuery::reads_rows: false lets an update or delete name no key columns.
+	//! False on an update or delete that reads nothing of the rows it writes: no WHERE, no FROM or USING,
+	//! no RETURNING, and every SET value foldable. It names no key columns and addresses every row of the
+	//! table. A source with row policies can use this to tell such a write from one that reads.
 	bool reads_rows = true;
+	vector<string> returning_columns;
+	vector<LogicalType> returning_types;
 };
+
+//! The target running `node` needs, on `catalog` when the node names none.
+CrossingWriteTarget CrossingWriteTargetOf(const string &catalog, const CrossingWriteNode &node);
 
 //! An INSERT, UPDATE or DELETE of the target reading its rows from the seam, as parser nodes.
 //! `seam_alias` names the seam and `seam_columns` its columns, in BuildWriteStatement's order.
@@ -260,17 +273,19 @@ using CrossingWriteShaper = std::function<void(CrossingWriteStatement &)>;
 //! A seam over rows already in memory. The rows must outlive the statement.
 unique_ptr<TableRef> SeamRefOfRows(const ColumnDataCollection &rows);
 
-//! The statement `ExecuteWrite` binds. `seam` is any TableRef whose columns are, by position, the
+//! The statement `SubmitWrite` binds. `seam` is any TableRef whose columns are, by position, the
 //! key columns then the set columns; null when there are none.
 CrossingWriteStatement BuildWriteStatement(const CrossingWriteTarget &target, unique_ptr<TableRef> seam);
 
-//! Builds, binds and runs the write on `context`, which must have a transaction open. Returns the
-//! rows the target changed. The plan form takes a bound plan already on `context`, such as a
-//! received write plan after BindFloors.
-idx_t ExecuteWrite(ClientContext &context, const CrossingWriteTarget &target, unique_ptr<TableRef> seam,
-                   const CrossingWriteShaper &shape = nullptr);
-idx_t ExecuteWrite(ClientContext &context, const CrossingWriteTarget &target, unique_ptr<LogicalOperator> seam,
-                   const CrossingWriteShaper &shape = nullptr);
+//! Builds, binds and runs the write on `context`, which must have a transaction open. The result is one
+//! row of one BIGINT, the rows the target changed, or with `returning_columns` the rows it left. A table
+//! that no longer has those columns as `returning_types` says is a CatalogException before anything is
+//! written. The plan form takes a bound plan already on `context`,
+//! such as what is under a received write node after BindFloors.
+unique_ptr<QueryResult> SubmitWrite(ClientContext &context, const CrossingWriteTarget &target,
+                                    unique_ptr<TableRef> seam, const CrossingWriteShaper &shape = nullptr);
+unique_ptr<QueryResult> SubmitWrite(ClientContext &context, const CrossingWriteTarget &target,
+                                    unique_ptr<LogicalOperator> seam, const CrossingWriteShaper &shape = nullptr);
 
 struct CrossingParking;
 
@@ -322,7 +337,7 @@ struct CrossingReadResult {
 //! One partition's rows, pulled by one thread at a time; the thread may change after a WAIT.
 using CrossingReader = std::function<CrossingReadResult(ClientContext &context, DataChunk &chunk, CrossingWaker waker)>;
 
-//! One Read. Each partition is opened once, by whichever thread claims it; partitions are claimed
+//! One Run. Each partition is opened once, by whichever thread claims it; partitions are claimed
 //! in increasing order and a thread drains several in turn. An ordered scan must be one partition
 //! unless `batch_indexed`, or it throws InvalidInputException. Unindexed, a partition's rows are
 //! ordered by its number.
@@ -338,42 +353,12 @@ struct CrossingScan {
 	std::function<CrossingReader(ClientContext &context, idx_t partition)> open;
 };
 
-struct CrossingWriteResult {
-	enum class Outcome : uint8_t { DONE, WAIT };
-
-	Outcome outcome = Outcome::DONE;
-	idx_t affected_rows = 0;
-
-	static CrossingWriteResult Done(idx_t affected_rows) {
-		CrossingWriteResult result;
-		result.affected_rows = affected_rows;
-		return result;
-	}
-	static CrossingWriteResult Wait() {
-		CrossingWriteResult result;
-		result.outcome = Outcome::WAIT;
-		return result;
-	}
-};
-
-using CrossingWriter = std::function<CrossingWriteResult(ClientContext &context, CrossingWaker waker)>;
-
-//! `types` is key_columns then set_columns, which are as on CrossingQuery.
-struct CrossingSeam {
-	vector<string> key_columns;
-	vector<string> set_columns;
-	vector<LogicalType> types;
-};
-
-//! What the source is asked to plan. SELECT wants a scan of the table emitting one column per
-//! column of `described`, in that order. A write wants the statement with a seam node
-//! (MakeSeamNode) where the rows go.
+//! What the source is asked to plan: a scan of the table emitting one column per column of `described`,
+//! in that order.
 struct CrossingPlanRequest {
-	CrossingVerb verb;
 	string schema;
 	string table;
 	optional_ptr<const CrossingTable> described;
-	CrossingSeam seam;
 };
 
 struct CrossingPlan {
@@ -402,8 +387,7 @@ class CrossingSession {
 public:
 	virtual ~CrossingSession() = default;
 
-	virtual CrossingScan Read(ClientContext &context, const CrossingQuery &query) = 0;
-	virtual CrossingWriter Write(ClientContext &context, const CrossingQuery &query);
+	virtual CrossingScan Run(ClientContext &context, const CrossingQuery &query) = 0;
 	virtual void Ddl(ClientContext &context, const CrossingDdl &ddl);
 	virtual vector<string> Tables(const string &schema) = 0;
 	virtual CrossingTable Describe(const string &schema, const string &name) = 0;
@@ -553,9 +537,7 @@ CROSSING_MEMBER(AcceptsOperator, "CrossingVerdict AcceptsOperator(const LogicalO
 CROSSING_MEMBER(Begin, "unique_ptr<Session> Begin(ClientContext &context)", unique_ptr<SessionOf<T>>, ClientContext &);
 CROSSING_MEMBER(Detach, "void Detach(ClientContext &context)", void, ClientContext &);
 CROSSING_MEMBER(Group, "const void *Group()", const void *);
-CROSSING_MEMBER(Read, "CrossingScan Read(ClientContext &context, const CrossingQuery &query)", CrossingScan,
-                ClientContext &, const CrossingQuery &);
-CROSSING_MEMBER(Write, "CrossingWriter Write(ClientContext &context, const CrossingQuery &query)", CrossingWriter,
+CROSSING_MEMBER(Run, "CrossingScan Run(ClientContext &context, const CrossingQuery &query)", CrossingScan,
                 ClientContext &, const CrossingQuery &);
 CROSSING_MEMBER(Ddl, "void Ddl(ClientContext &context, const CrossingDdl &ddl)", void, ClientContext &,
                 const CrossingDdl &);
@@ -581,8 +563,7 @@ struct SourceContract : CheckTables<S, true>,
 };
 
 template <class Sess>
-struct SessionContract : CheckRead<Sess, true>,
-                         CheckWrite<Sess, false>,
+struct SessionContract : CheckRun<Sess, true>,
                          CheckDdl<Sess, false>,
                          CheckTables<Sess, false>,
                          CheckDescribe<Sess, false>,
@@ -591,14 +572,6 @@ struct SessionContract : CheckRead<Sess, true>,
 	static_assert(!std::is_final<Sess>::value, "crossing: a session type must not be final");
 };
 
-template <class Sess>
-CrossingWriter WriteOn(Sess &session, ClientContext &context, const CrossingQuery &query, std::true_type) {
-	return session.Write(context, query);
-}
-template <class Sess>
-CrossingWriter WriteOn(Sess &, ClientContext &, const CrossingQuery &, std::false_type) {
-	throw NotImplementedException("crossing: this source's session has no Write");
-}
 template <class Sess>
 void DdlOn(Sess &session, ClientContext &context, const CrossingDdl &ddl, std::true_type) {
 	session.Ddl(context, ddl);
@@ -703,13 +676,8 @@ struct Crossing;
 template <class Sess>
 void CheckDescribedVerbs(const string &name, const CrossingTable &table) {
 	for (auto verb : table.verbs) {
-		if (IsDdlVerb(verb)) {
-			if (!crossing_contract::HasDdl<Sess>::value) {
-				throw NotImplementedException("crossing: '%s' declares '%s' but the session has no Ddl", name,
-				                              CrossingVerbName(verb));
-			}
-		} else if (verb != CrossingVerb::SELECT && !crossing_contract::HasWrite<Sess>::value) {
-			throw NotImplementedException("crossing: '%s' declares '%s' but the session has no Write", name,
+		if (IsDdlVerb(verb) && !crossing_contract::HasDdl<Sess>::value) {
+			throw NotImplementedException("crossing: '%s' declares '%s' but the session has no Ddl", name,
 			                              CrossingVerbName(verb));
 		}
 	}
@@ -722,11 +690,8 @@ public:
 	    : source(source_p), session(std::move(session_p)) {
 	}
 
-	CrossingScan Read(ClientContext &context, const CrossingQuery &query) override {
-		return session->Read(context, query);
-	}
-	CrossingWriter Write(ClientContext &context, const CrossingQuery &query) override {
-		return crossing_contract::WriteOn(*session, context, query, crossing_contract::HasWrite<Sess> {});
+	CrossingScan Run(ClientContext &context, const CrossingQuery &query) override {
+		return session->Run(context, query);
 	}
 	void Ddl(ClientContext &context, const CrossingDdl &ddl) override {
 		crossing_contract::DdlOn(*session, context, ddl, crossing_contract::HasDdl<Sess> {});

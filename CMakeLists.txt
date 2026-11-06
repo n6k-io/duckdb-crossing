@@ -137,11 +137,11 @@ crossing_contract_fail(
 crossing_contract_fail(fail_final_source "source type must not be final")
 crossing_contract_fail(fail_optional_wrong_signature
                        "`AcceptsCall` exists but is not callable")
-crossing_contract_fail(fail_session_missing_read
-                       "missing required member `CrossingScan Read")
+crossing_contract_fail(fail_session_missing_run
+                       "missing required member `CrossingScan Run")
 crossing_contract_fail(fail_session_commit_returns
                        "ReturnCheck<false, void, int>")
-crossing_contract_fail(fail_session_write_signature
-                       "`Write` exists but is not callable")
+crossing_contract_fail(fail_session_run_signature
+                       "`Run` exists but is not callable")
 crossing_contract_fail(fail_session_ddl_signature
                        "`Ddl` exists but is not callable")

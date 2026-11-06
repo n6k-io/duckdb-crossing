@@ -69,9 +69,11 @@ struct FarCall {
 	bool ordered = false;
 	vector<string> key_columns;
 	vector<string> set_columns;
+	vector<string> returning_columns;
 	vector<vector<Value>> rows;
 	bool rows_only = false;
 	idx_t target_swap_bytes = 0;
+	idx_t target_swap_bytes_after_return = 0;
 	string wire;
 	string received_text;
 
@@ -101,6 +103,7 @@ struct FarStore {
 	case_insensitive_map_t<vector<string>> keys;
 	case_insensitive_map_t<bool> key_unique;
 	bool declare_key_constraints = false;
+	bool returning = true;
 	case_insensitive_map_t<vector<CrossingVerb>> verbs;
 	case_insensitive_map_t<vector<CrossingVerb>> schema_verbs;
 	string declined;
@@ -154,8 +157,7 @@ public:
 	FarSession(shared_ptr<FarStore> store, string catalog);
 	~FarSession();
 
-	CrossingScan Read(ClientContext &context, const CrossingQuery &query);
-	CrossingWriter Write(ClientContext &context, const CrossingQuery &query);
+	CrossingScan Run(ClientContext &context, const CrossingQuery &query);
 	void Ddl(ClientContext &context, const CrossingDdl &ddl);
 	vector<string> Tables(const string &schema);
 	CrossingTable Describe(const string &schema, const string &name);
@@ -166,7 +168,9 @@ private:
 	vector<vector<Value>> Evaluate(const LogicalOperator &plan, FarCall &call);
 	vector<vector<Value>> EvaluateNative(const LogicalOperator &plan, FarCall &call);
 	vector<vector<Value>> EvaluateSubstrait(const LogicalOperator &plan, FarCall &call);
-	idx_t Apply(const CrossingQuery &query);
+	CrossingScan Read(const CrossingQuery &query);
+	CrossingScan Write(const CrossingQuery &query);
+	vector<vector<Value>> Apply(const CrossingQuery &query);
 	unique_ptr<CreateViewInfo> ReceiveView(const CreateViewInfo &view, const LogicalOperator &plan);
 	FarCall Record(const CrossingQuery &query);
 

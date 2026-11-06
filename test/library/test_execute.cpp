@@ -1,4 +1,5 @@
 #include "framework/twin.hpp"
+#include "internal/seam.hpp"
 
 #include "duckdb/common/types/column/column_data_collection.hpp"
 #include "duckdb/main/query_result.hpp"
@@ -60,6 +61,14 @@ Value Scalar(Connection &con, const string &sql) {
 	return result->GetValue(0, 0);
 }
 
+template <class SEAM>
+idx_t SubmitAndCount(ClientContext &context, const CrossingWriteTarget &target, SEAM seam,
+                     const CrossingWriteShaper &shape = nullptr) {
+	auto chunk = SubmitWrite(context, target, std::move(seam), shape)->Fetch();
+	Value changed = chunk->GetValue(0, 0);
+	return NumericCast<idx_t>(changed.GetValue<int64_t>());
+}
+
 unique_ptr<ColumnDataCollection> Rows(const vector<LogicalType> &types, const vector<vector<Value>> &values) {
 	auto rows = make_uniq<ColumnDataCollection>(Allocator::DefaultAllocator(), types);
 	DataChunk chunk;
@@ -103,9 +112,6 @@ public:
 	}
 
 	CrossingPlan Plan(const CrossingPlanRequest &request) {
-		if (request.verb != CrossingVerb::SELECT) {
-			return FarSource::Plan(request);
-		}
 		lock_guard<mutex> guard(raw->lock);
 		InTransaction txn(raw->con);
 		Planner planner(*raw->con.context);
@@ -206,7 +212,7 @@ TEST_CASE("SubmitCrossingPlan can be read as a stream", "[execute]") {
 	con.Rollback();
 }
 
-TEST_CASE("ExecuteWrite deletes the rows the seam names", "[execute]") {
+TEST_CASE("SubmitWrite deletes the rows the seam names", "[execute]") {
 	Twin twin(Transport::NATIVE);
 	twin.Seed();
 	auto &con = twin.store->con;
@@ -214,14 +220,14 @@ TEST_CASE("ExecuteWrite deletes the rows the seam names", "[execute]") {
 
 	auto rows = Rows({LogicalType::INTEGER}, {{Value::INTEGER(1)}, {Value::INTEGER(3)}});
 	auto changed =
-	    ExecuteWrite(*con.context, TargetOf(CrossingVerb::DELETE_, "orders", {"id"}, {}), SeamRefOfRows(*rows));
+	    SubmitAndCount(*con.context, TargetOf(CrossingVerb::DELETE_, "orders", {"id"}, {}), SeamRefOfRows(*rows));
 	con.Commit();
 
 	REQUIRE(changed == 2);
 	REQUIRE(Scalar(con, "SELECT count(*) FROM orders") == Value::BIGINT(3));
 }
 
-TEST_CASE("ExecuteWrite matches a NULL key", "[execute]") {
+TEST_CASE("SubmitWrite matches a NULL key", "[execute]") {
 	Twin twin(Transport::NATIVE);
 	twin.Far("CREATE TABLE nk(k INTEGER, v INTEGER)");
 	twin.Far("INSERT INTO nk VALUES (NULL, 1), (2, 1)");
@@ -229,7 +235,7 @@ TEST_CASE("ExecuteWrite matches a NULL key", "[execute]") {
 	con.BeginTransaction();
 
 	auto rows = Rows({LogicalType::INTEGER, LogicalType::INTEGER}, {{Value(LogicalType::INTEGER), Value::INTEGER(5)}});
-	auto changed = ExecuteWrite(*con.context, TargetOf(CrossingVerb::UPDATE, "nk", {"k"}, {"v"}), SeamRefOfRows(*rows));
+	auto changed = SubmitAndCount(*con.context, TargetOf(CrossingVerb::UPDATE, "nk", {"k"}, {"v"}), SeamRefOfRows(*rows));
 	con.Commit();
 
 	REQUIRE(changed == 1);
@@ -237,7 +243,7 @@ TEST_CASE("ExecuteWrite matches a NULL key", "[execute]") {
 	REQUIRE(Scalar(con, "SELECT v FROM nk WHERE k = 2") == Value::INTEGER(1));
 }
 
-TEST_CASE("ExecuteWrite refuses a seam narrower than the write", "[execute]") {
+TEST_CASE("SubmitWrite refuses a seam narrower than the write", "[execute]") {
 	Twin twin(Transport::NATIVE);
 	twin.Seed();
 	auto &con = twin.store->con;
@@ -246,10 +252,10 @@ TEST_CASE("ExecuteWrite refuses a seam narrower than the write", "[execute]") {
 	auto rows = Rows({LogicalType::INTEGER}, {{Value::INTEGER(1)}});
 
 	REQUIRE_THROWS(
-	    ExecuteWrite(*con.context, TargetOf(CrossingVerb::UPDATE, "orders", {"id"}, {"amt"}), SeamRefOfRows(*rows)));
+	    SubmitAndCount(*con.context, TargetOf(CrossingVerb::UPDATE, "orders", {"id"}, {"amt"}), SeamRefOfRows(*rows)));
 }
 
-TEST_CASE("ExecuteWrite refuses a keyed write with no key", "[execute]") {
+TEST_CASE("SubmitWrite refuses a keyed write with no key", "[execute]") {
 	Twin twin(Transport::NATIVE);
 	twin.Seed();
 	auto &con = twin.store->con;
@@ -258,11 +264,77 @@ TEST_CASE("ExecuteWrite refuses a keyed write with no key", "[execute]") {
 	auto rows = Rows({LogicalType::INTEGER}, {{Value::INTEGER(1)}});
 
 	REQUIRE_THROWS_WITH(
-	    ExecuteWrite(*con.context, TargetOf(CrossingVerb::DELETE_, "orders", {}, {}), SeamRefOfRows(*rows)),
+	    SubmitAndCount(*con.context, TargetOf(CrossingVerb::DELETE_, "orders", {}, {}), SeamRefOfRows(*rows)),
 	    Catch::Contains("no key columns"));
 }
 
-TEST_CASE("ExecuteWrite feeds a write from a bound plan whose indices collide with the statement's", "[execute]") {
+TEST_CASE("BindFloors refuses a write node and names SubmitWrite", "[execute]") {
+	Twin twin(Transport::NATIVE);
+	twin.Seed();
+	auto &con = twin.store->con;
+	InTransaction txn(con);
+
+	CrossingWriteNode node;
+	node.verb = CrossingVerb::INSERT;
+	node.schema = "main";
+	node.table = "orders";
+	auto plan = MakeWriteNode(1, node, FloorOver(con, 0, "archive"));
+
+	REQUIRE_THROWS_WITH(BindFloors(*con.context, plan, STORE_CATALOG), Catch::Contains("SubmitWrite"));
+}
+
+TEST_CASE("a write node comes back whole from the wire", "[execute]") {
+	Twin twin(Transport::NATIVE);
+	twin.Seed();
+	auto &con = twin.store->con;
+	InTransaction txn(con);
+
+	CrossingWriteNode node;
+	node.verb = CrossingVerb::UPDATE;
+	node.schema = "main";
+	node.table = "orders";
+	node.key_columns = {"id"};
+	node.set_columns = {"amt"};
+	node.returning_columns = {"id", "amt"};
+	auto plan = MakeWriteNode(1, node, FloorOver(con, 0, "archive"));
+
+	auto received = DeserializeCrossingPlan(*con.context, SerializeCrossingPlan(*plan));
+
+	auto back = WriteOf(*received);
+	REQUIRE(back);
+	REQUIRE(back->verb == CrossingVerb::UPDATE);
+	REQUIRE(back->table == "orders");
+	REQUIRE(back->key_columns == vector<string> {"id"});
+	REQUIRE(back->set_columns == vector<string> {"amt"});
+	REQUIRE(back->returning_columns == vector<string> {"id", "amt"});
+	REQUIRE(received->children.size() == 1);
+	REQUIRE(FloorOf(*received->children[0]));
+}
+
+TEST_CASE("a target takes a node's names, and a keyless update or delete reads no rows", "[execute]") {
+	CrossingWriteNode node;
+	node.verb = CrossingVerb::UPDATE;
+	node.schema = "s";
+	node.table = "t";
+	node.key_columns = {"id"};
+	node.set_columns = {"v"};
+	auto keyed = CrossingWriteTargetOf("c", node);
+	REQUIRE(keyed.catalog == "c");
+	REQUIRE(keyed.schema == "s");
+	REQUIRE(keyed.key_columns == vector<string> {"id"});
+	REQUIRE(keyed.reads_rows);
+
+	node.key_columns.clear();
+	REQUIRE_FALSE(CrossingWriteTargetOf("c", node).reads_rows);
+
+	node.verb = CrossingVerb::INSERT;
+	REQUIRE(CrossingWriteTargetOf("c", node).reads_rows);
+
+	node.catalog = "own";
+	REQUIRE(CrossingWriteTargetOf("c", node).catalog == "own");
+}
+
+TEST_CASE("SubmitWrite feeds a write from a bound plan whose indices collide with the statement's", "[execute]") {
 	Twin twin(Transport::NATIVE);
 	twin.Seed();
 	auto &con = twin.store->con;
@@ -271,14 +343,14 @@ TEST_CASE("ExecuteWrite feeds a write from a bound plan whose indices collide wi
 	auto feed = FloorOver(con, 0, "archive");
 	BindFloors(*con.context, feed, STORE_CATALOG);
 	auto columns = DescribeOn(con, "orders").names;
-	auto changed = ExecuteWrite(*con.context, TargetOf(CrossingVerb::INSERT, "orders", {}, columns), std::move(feed));
+	auto changed = SubmitAndCount(*con.context, TargetOf(CrossingVerb::INSERT, "orders", {}, columns), std::move(feed));
 	con.Commit();
 
 	REQUIRE(changed == 1);
 	REQUIRE(Scalar(con, "SELECT name FROM orders WHERE id = 9") == Value("zeta"));
 }
 
-TEST_CASE("ExecuteWrite lets a shaper narrow the statement before it binds", "[execute]") {
+TEST_CASE("SubmitWrite lets a shaper narrow the statement before it binds", "[execute]") {
 	Twin twin(Transport::NATIVE);
 	twin.Seed();
 	auto &con = twin.store->con;
@@ -295,7 +367,7 @@ TEST_CASE("ExecuteWrite lets a shaper narrow the statement before it binds", "[e
 		set_info.condition = make_uniq<ConjunctionExpression>(ExpressionType::CONJUNCTION_AND,
 		                                                      std::move(set_info.condition), std::move(large));
 	};
-	auto changed = ExecuteWrite(*con.context, TargetOf(CrossingVerb::UPDATE, "orders", {"id"}, {"amt"}),
+	auto changed = SubmitAndCount(*con.context, TargetOf(CrossingVerb::UPDATE, "orders", {"id"}, {"amt"}),
 	                            SeamRefOfRows(*rows), only_large);
 	con.Commit();
 
@@ -304,7 +376,7 @@ TEST_CASE("ExecuteWrite lets a shaper narrow the statement before it binds", "[e
 	REQUIRE(Scalar(con, "SELECT amt FROM orders WHERE id = 2") == Value::INTEGER(0));
 }
 
-TEST_CASE("ExecuteWrite writes into a crossing table, as a middle hop does", "[execute]") {
+TEST_CASE("SubmitWrite writes into a crossing table, as a middle hop does", "[execute]") {
 	Twin twin(Transport::NATIVE);
 	twin.Seed();
 	auto &con = twin.con;
@@ -330,11 +402,11 @@ TEST_CASE("ExecuteWrite writes into a crossing table, as a middle hop does", "[e
 	};
 	auto update = Rows({LogicalType::INTEGER, LogicalType::INTEGER}, {{Value::INTEGER(2), Value::INTEGER(0)}});
 	auto updated =
-	    ExecuteWrite(*con.context, far(CrossingVerb::UPDATE, {"id"}, {"amt"}), SeamRefOfRows(*update), guarded);
+	    SubmitAndCount(*con.context, far(CrossingVerb::UPDATE, {"id"}, {"amt"}), SeamRefOfRows(*update), guarded);
 	auto removed = Rows({LogicalType::INTEGER}, {{Value::INTEGER(3)}});
-	auto deleted = ExecuteWrite(*con.context, far(CrossingVerb::DELETE_, {"id"}, {}), SeamRefOfRows(*removed));
+	auto deleted = SubmitAndCount(*con.context, far(CrossingVerb::DELETE_, {"id"}, {}), SeamRefOfRows(*removed));
 	auto added = Rows({LogicalType::INTEGER, LogicalType::VARCHAR}, {{Value::INTEGER(6), Value("zeta")}});
-	auto inserted = ExecuteWrite(*con.context, far(CrossingVerb::INSERT, {}, {"id", "name"}), SeamRefOfRows(*added));
+	auto inserted = SubmitAndCount(*con.context, far(CrossingVerb::INSERT, {}, {"id", "name"}), SeamRefOfRows(*added));
 	con.Commit();
 	twin.store->JoinArrivals();
 

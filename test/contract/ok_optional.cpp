@@ -3,10 +3,7 @@
 namespace duckdb {
 
 struct FullSession {
-	CrossingScan Read(ClientContext &, const CrossingQuery &) {
-		return {};
-	}
-	CrossingWriter Write(ClientContext &, const CrossingQuery &) {
+	CrossingScan Run(ClientContext &, const CrossingQuery &) {
 		return {};
 	}
 	void Ddl(ClientContext &, const CrossingDdl &) {

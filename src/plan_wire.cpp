@@ -17,7 +17,7 @@ namespace duckdb {
 void RegisterCrossingPlanFunctions(DatabaseInstance &db) {
 	auto &system = Catalog::GetSystemCatalog(db);
 	auto transaction = CatalogTransaction::GetSystemTransaction(db);
-	for (auto &function : {CrossingFloorFunction(), CrossingSeamFunction()}) {
+	for (auto &function : {CrossingFloorFunction(), CrossingSeamFunction(), CrossingWriteNodeFunction()}) {
 		CreateTableFunctionInfo info(function);
 		info.on_conflict = OnCreateConflict::IGNORE_ON_CONFLICT;
 		system.CreateFunction(transaction, info);

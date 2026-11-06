@@ -331,6 +331,7 @@ CrossingTable FarSource::DescribeOn(FarStore &store, Connection &con, const stri
 	}
 	auto unique = store.key_unique.find(name);
 	table.key_unique = unique != store.key_unique.end() ? unique->second : !table.key.empty();
+	table.returning = store.returning;
 	if (store.declare_key_constraints && !table.key.empty()) {
 		vector<Identifier> key_columns;
 		for (auto &column : table.key) {
@@ -372,12 +373,9 @@ CrossingPlan FarSource::Plan(const CrossingPlanRequest &request) {
 			return CrossingPlan::Declined(store->declined);
 		}
 	}
-	if (request.verb == CrossingVerb::SELECT) {
-		auto &described = *request.described;
-		return CrossingPlan::Of(MakeFloorNode(0, request.schema, request.table, described.column_names,
-		                                      described.column_types, floor_catalog));
-	}
-	return CrossingPlan::Of(MakeSeamNode(0, request.seam.types));
+	auto &described = *request.described;
+	return CrossingPlan::Of(MakeFloorNode(0, request.schema, request.table, described.column_names,
+	                                      described.column_types, floor_catalog));
 }
 
 CrossingVerdict FarSource::AcceptsCall(const Expression &expr) {
@@ -535,15 +533,28 @@ unique_ptr<CreateViewInfo> FarSession::ReceiveView(const CreateViewInfo &view, c
 
 FarCall FarSession::Record(const CrossingQuery &query) {
 	FarCall call;
-	call.kind = query.kind;
-	call.plan_text = query.plan.ToString();
+	call.kind = CrossingVerb::SELECT;
 	call.tables = query.tables;
-	call.written = query.written;
-	CollectOperators(query.plan, call.operators);
-	call.types = query.types;
 	call.ordered = query.ordered;
-	call.key_columns = query.key_columns;
-	call.set_columns = query.set_columns;
+	auto node = WriteOf(query.plan);
+	if (!node) {
+		call.plan_text = query.plan.ToString();
+		CollectOperators(query.plan, call.operators);
+		call.types = query.types;
+		return call;
+	}
+	call.kind = node->verb;
+	call.written.schema = node->schema;
+	call.written.table = node->table;
+	call.key_columns = node->key_columns;
+	call.set_columns = node->set_columns;
+	call.returning_columns = node->returning_columns;
+	if (!query.plan.children.empty()) {
+		auto &feed = *query.plan.children[0];
+		call.plan_text = feed.ToString();
+		CollectOperators(feed, call.operators);
+		call.types = feed.types;
+	}
 	return call;
 }
 
@@ -574,7 +585,11 @@ vector<vector<Value>> FarSession::Evaluate(const LogicalOperator &plan, FarCall 
 	return EvaluateSubstrait(plan, call);
 }
 
-CrossingScan FarSession::Read(ClientContext &, const CrossingQuery &query) {
+CrossingScan FarSession::Run(ClientContext &, const CrossingQuery &query) {
+	return WriteOf(query.plan) ? Write(query) : Read(query);
+}
+
+CrossingScan FarSession::Read(const CrossingQuery &query) {
 	auto call = Record(query);
 	auto rows = make_shared_ptr<const vector<vector<Value>>>(Evaluate(query.plan, call));
 	call.rows = *rows;
@@ -593,58 +608,84 @@ CrossingScan FarSession::Read(ClientContext &, const CrossingQuery &query) {
 	return scan;
 }
 
-CrossingWriter FarSession::Write(ClientContext &, const CrossingQuery &query) {
-	return [this, &query](ClientContext &context, CrossingWaker waker) {
-		{
-			lock_guard<mutex> guard(store->lock);
-			if (store->wait_before_write && !store->write_arrived) {
-				auto raw = store.get();
-				ArriveLater(*raw, std::move(waker), [raw]() {
-					raw->write_waits_served++;
-					raw->write_arrived = true;
-				});
-				return CrossingWriteResult::Wait();
+CrossingScan FarSession::Write(const CrossingQuery &query) {
+	CrossingScan scan;
+	scan.open = [this, &query](ClientContext &, idx_t) -> CrossingReader {
+		auto started = make_shared_ptr<bool>(false);
+		auto rows = make_shared_ptr<vector<vector<Value>>>();
+		auto cursor = make_shared_ptr<idx_t>(0);
+		return [this, &query, started, rows, cursor](ClientContext &context, DataChunk &chunk, CrossingWaker waker) {
+			if (!*started) {
+				{
+					lock_guard<mutex> guard(store->lock);
+					if (store->wait_before_write && !store->write_arrived) {
+						auto raw = store.get();
+						ArriveLater(*raw, std::move(waker), [raw]() {
+							raw->write_waits_served++;
+							raw->write_arrived = true;
+						});
+						return CrossingReadResult::Wait();
+					}
+					store->write_arrived = false;
+				}
+				auto call = Record(query);
+				call.target_swap_bytes = BufferManager::GetBufferManager(context).GetUsedSwap();
+				call.rows =
+				    query.plan.children.empty() ? vector<vector<Value>>() : Evaluate(*query.plan.children[0], call);
+				{
+					lock_guard<mutex> guard(store->lock);
+					store->writes.push_back(std::move(call));
+				}
+				lock_guard<mutex> guard(far_lock);
+				*rows = Apply(query);
+				*started = true;
 			}
-			store->write_arrived = false;
-		}
-		auto call = Record(query);
-		call.target_swap_bytes = BufferManager::GetBufferManager(context).GetUsedSwap();
-		auto rows = query.types.empty() ? vector<vector<Value>>() : Evaluate(query.plan, call);
-		call.rows = rows;
-		{
-			lock_guard<mutex> guard(store->lock);
-			store->writes.push_back(std::move(call));
-		}
-		lock_guard<mutex> guard(far_lock);
-		return CrossingWriteResult::Done(Apply(query));
+			if (*cursor >= rows->size()) {
+				lock_guard<mutex> guard(store->lock);
+				store->writes.back().target_swap_bytes_after_return =
+				    BufferManager::GetBufferManager(context).GetUsedSwap();
+				return CrossingReadResult::Done();
+			}
+			auto count = MinValue<idx_t>(rows->size() - *cursor, STANDARD_VECTOR_SIZE);
+			CopyBlock(*rows, *cursor, count, chunk);
+			*cursor += count;
+			return CrossingReadResult::Rows();
+		};
 	};
+	return scan;
 }
 
-idx_t FarSession::Apply(const CrossingQuery &query) {
-	if (query.written.table.empty()) {
-		throw InternalException("far: a write names no table");
+vector<vector<Value>> FarSession::Apply(const CrossingQuery &query) {
+	auto target = CrossingWriteTargetOf(catalog, *WriteOf(query.plan));
+	auto submit = [&]() -> unique_ptr<QueryResult> {
+		if (query.plan.children.empty()) {
+			return SubmitWrite(*far.context, target, unique_ptr<TableRef>());
+		}
+		auto &feed = *query.plan.children[0];
+		if (auto rows = SeamRowsOf(feed)) {
+			return SubmitWrite(*far.context, target, SeamRefOfRows(*rows));
+		}
+		if (store->transport == Transport::NATIVE) {
+			auto received = DeserializeCrossingPlan(*far.context, SerializeCrossingPlan(query.plan));
+			auto plan = std::move(received->children[0]);
+			BindFloors(*far.context, plan, catalog);
+			return SubmitWrite(*far.context, target, std::move(plan));
+		}
+		auto rel = DecodeSubstraitJson(far, catalog, RenderSubstraitJson(feed), store->catalog_check);
+		return SubmitWrite(*far.context, target, rel->GetTableRef());
+	};
+	auto result = submit();
+	vector<vector<Value>> rows;
+	while (auto chunk = result->Fetch()) {
+		for (idx_t r = 0; r < chunk->size(); r++) {
+			vector<Value> row;
+			for (idx_t c = 0; c < chunk->ColumnCount(); c++) {
+				row.push_back(chunk->GetValue(c, r));
+			}
+			rows.push_back(std::move(row));
+		}
 	}
-	CrossingWriteTarget target;
-	target.catalog = catalog;
-	target.schema = query.written.schema;
-	target.table = query.written.table;
-	target.verb = query.kind;
-	target.key_columns = query.key_columns;
-	target.set_columns = query.set_columns;
-	target.reads_rows = query.reads_rows;
-	if (query.types.empty()) {
-		return ExecuteWrite(*far.context, target, unique_ptr<TableRef>());
-	}
-	if (auto rows = SeamRowsOf(query.plan)) {
-		return ExecuteWrite(*far.context, target, SeamRefOfRows(*rows));
-	}
-	if (store->transport == Transport::NATIVE) {
-		auto received = DeserializeCrossingPlan(*far.context, SerializeCrossingPlan(query.plan));
-		BindFloors(*far.context, received, catalog);
-		return ExecuteWrite(*far.context, target, std::move(received));
-	}
-	auto rel = DecodeSubstraitJson(far, catalog, RenderSubstraitJson(query.plan), store->catalog_check);
-	return ExecuteWrite(*far.context, target, rel->GetTableRef());
+	return rows;
 }
 
 } // namespace duckdb

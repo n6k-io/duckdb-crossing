@@ -4,7 +4,7 @@
 
 namespace readonly {
 
-CrossingScan ReadOnlySource::Session::Read(ClientContext &, const CrossingQuery &) {
+CrossingScan ReadOnlySource::Session::Run(ClientContext &, const CrossingQuery &) {
 	CrossingScan scan;
 	scan.open = [](ClientContext &, idx_t) -> CrossingReader {
 		return [](ClientContext &, DataChunk &, CrossingWaker) {
@@ -15,7 +15,7 @@ CrossingScan ReadOnlySource::Session::Read(ClientContext &, const CrossingQuery 
 }
 
 vector<string> ReadOnlySource::Tables(const string &) {
-	return {"t", "w", "a"};
+	return {"t", "a"};
 }
 
 CrossingTable ReadOnlySource::Describe(const string &, const string &name) {
@@ -23,9 +23,6 @@ CrossingTable ReadOnlySource::Describe(const string &, const string &name) {
 	table.name = name;
 	table.Column("id", LogicalType::INTEGER);
 	table.verbs = {CrossingVerb::SELECT};
-	if (name == "w") {
-		table.verbs.push_back(CrossingVerb::INSERT);
-	}
 	if (name == "a") {
 		table.verbs.push_back(CrossingVerb::ALTER);
 	}
@@ -33,10 +30,7 @@ CrossingTable ReadOnlySource::Describe(const string &, const string &name) {
 }
 
 CrossingPlan ReadOnlySource::Plan(const CrossingPlanRequest &request) {
-	if (request.verb == CrossingVerb::SELECT) {
-		return CrossingPlan::Of(MakeFloorNode(0, request.schema, request.table, {"id"}, {LogicalType::INTEGER}));
-	}
-	return CrossingPlan::Of(MakeSeamNode(0, request.seam.types));
+	return CrossingPlan::Of(MakeFloorNode(0, request.schema, request.table, {"id"}, {LogicalType::INTEGER}));
 }
 
 unique_ptr<ReadOnlySource::Session> ReadOnlySource::Begin(ClientContext &) {
