@@ -1,6 +1,7 @@
 #include "catch.hpp"
 #include "crossing.hpp"
 #include "framework/test_link.hpp"
+#include "internal/execute.hpp"
 #include "internal/far_plan.hpp"
 #include "internal/parking.hpp"
 

@@ -11,6 +11,7 @@ namespace duckdb {
 
 constexpr const char *CROSSING_SEAM_FUNCTION = "crossing_seam";
 constexpr const char *CROSSING_WRITE_NODE_FUNCTION = "crossing_write_node";
+constexpr const char *CROSSING_ROW_ID_COLUMN = "rowid";
 
 //! `types` is key_columns then set_columns.
 struct CrossingSeam {
@@ -20,6 +21,22 @@ struct CrossingSeam {
 	vector<string> returning_columns;
 	vector<LogicalType> returning_types;
 };
+
+//! The top of a write's slice: what to write. Its child is what it writes from.
+struct CrossingWriteNode {
+	CrossingVerb verb = CrossingVerb::INSERT;
+	string catalog;
+	string schema;
+	string table;
+	//! `rowid` when the write's rows are addressed through what its child reads; otherwise empty.
+	vector<string> key_columns;
+	vector<string> set_columns;
+	vector<string> returning_columns;
+	vector<LogicalType> returning_types;
+};
+
+//! The write `op` is the node of. Null for any other operator.
+optional_ptr<const CrossingWriteNode> WriteOf(const LogicalOperator &op);
 
 TableFunction CrossingSeamFunction();
 TableFunction CrossingWriteNodeFunction();

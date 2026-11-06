@@ -84,11 +84,8 @@ public:
 	CrossingTable Describe(const string &, const string &) override {
 		throw InternalException("memory: the engine never describes tables");
 	}
-	CrossingPlan Plan(const CrossingPlanRequest &) override {
-		throw InternalException("memory: the engine never plans");
-	}
-	unique_ptr<CrossingSession> Begin(ClientContext &) override {
-		throw InternalException("memory: the engine never begins");
+	unique_ptr<CrossingLink> Connect(ClientContext &) override {
+		throw InternalException("memory: the engine never connects");
 	}
 	CrossingVerdict AcceptsCall(const Expression &expr) override {
 		auto name = FunctionNameOf(expr);

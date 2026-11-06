@@ -2,6 +2,8 @@
 
 #include "crossing_far.hpp"
 #include "framework/test_link.hpp"
+#include "internal/floor.hpp"
+#include "internal/seam.hpp"
 
 #include "crossing.hpp"
 #include "crossing_substrait.hpp"
@@ -16,10 +18,6 @@
 #include <thread>
 
 namespace duckdb {
-
-enum class Transport { NATIVE, SUBSTRAIT, LINK };
-
-const char *TransportName(Transport transport);
 
 class TestResult {
 public:
@@ -75,15 +73,12 @@ struct FarCall {
 	vector<LogicalOperatorType> operators;
 	vector<LogicalType> types;
 	bool ordered = false;
-	vector<string> key_columns;
 	vector<string> set_columns;
 	vector<string> returning_columns;
+	//! A read's rows as far sent them; a write's as near sent them.
 	vector<vector<Value>> rows;
 	bool rows_only = false;
-	idx_t target_swap_bytes = 0;
-	idx_t target_swap_bytes_after_return = 0;
 	string wire;
-	string received_text;
 
 	bool Has(LogicalOperatorType type) const;
 	idx_t Count(LogicalOperatorType type) const;
@@ -92,16 +87,14 @@ struct FarCall {
 
 struct FarDdl {
 	CrossingVerb verb;
-	string schema;
 	string table;
 };
 
 struct FarStore {
-	explicit FarStore(Transport transport);
+	FarStore();
 
 	DuckDB db;
 	Connection con;
-	Transport transport;
 	mutex lock;
 
 	case_insensitive_set_t refused_functions;
@@ -109,17 +102,14 @@ struct FarStore {
 	vector<LogicalTypeId> refused_types;
 	vector<LogicalOperatorType> refused_operators;
 	case_insensitive_map_t<vector<string>> keys;
-	case_insensitive_map_t<bool> key_unique;
 	bool declare_key_constraints = false;
 	bool returning = true;
 	bool takes_seams = false;
 	case_insensitive_map_t<vector<CrossingVerb>> verbs;
 	case_insensitive_map_t<vector<CrossingVerb>> schema_verbs;
-	string declined;
 
 	vector<FarCall> reads;
 	vector<FarCall> writes;
-	idx_t link_seam_rows = 0;
 	vector<FarDdl> ddls;
 	//! Interned `GROUP` attach options; an element's address is the group of every attach naming it.
 	set<string> groups;
@@ -127,98 +117,45 @@ struct FarStore {
 	vector<string> detached_paths;
 	vector<string> transaction_ends;
 	case_insensitive_map_t<idx_t> listings;
-	idx_t sessions_begun = 0;
+	idx_t links_connected = 0;
 
-	idx_t read_partitions = 1;
-	bool partition_ordered_reads = false;
-	//! Non-zero: readers take blocks of this many rows from one counter per scan, block b with batch
-	//! index b.
-	idx_t batch_block_rows = 0;
-	//! Non-zero: block b goes to partition b % partitions with batch index b, which breaks the
-	//! contract once a thread drains a second partition.
-	idx_t round_robin_batch_rows = 0;
-	bool drop_batch_index = false;
-	bool stray_batch_index = false;
-	set<idx_t> partitions_read;
-	bool wait_before_chunks = false;
-	bool wake_before_returning = false;
-	bool keep_wakers = false;
-	set<idx_t> arrived;
-	idx_t waits_served = 0;
-	bool wait_before_write = false;
-	bool write_arrived = false;
-	idx_t write_waits_served = 0;
-	vector<std::thread> arrivals;
-	vector<CrossingWaker> kept_wakers;
-	idx_t readers_open = 0;
-	idx_t readers_closed = 0;
+	idx_t streams = 1;
+	idx_t capacity = 4;
+	idx_t seam_rows = 0;
+	idx_t waits = 0;
+	//! For each slice of the open transaction, whether it is a write and where its call is.
+	vector<std::pair<bool, idx_t>> slices;
 	//! Runs at the start of the source calls that report themselves, with the call's name, outside `lock`.
 	std::function<void(const string &call)> on_source_call;
 	//! Handed to the Substrait decode of every received plan.
 	SubstraitCatalogCheck catalog_check;
+	CrossingFloorResolver floors;
 
-	void JoinArrivals();
 	const FarCall &LastRead();
 	const FarCall &LastWrite();
 };
 
-class FarSession {
+class FarSource : public CrossingSource {
 public:
-	FarSession(shared_ptr<FarStore> store, string catalog);
-	~FarSession();
-
-	CrossingScan Run(ClientContext &context, const CrossingQuery &query);
-	void Ddl(ClientContext &context, const CrossingDdl &ddl);
-	vector<string> Tables(const string &schema);
-	CrossingTable Describe(const string &schema, const string &name);
-	void Commit();
-	void Rollback();
-	optional_ptr<CrossingLink> Link(ClientContext &context);
-	void Planned(const CrossingQuery &query);
-
-private:
-	void EndServing();
-	vector<vector<Value>> Evaluate(const LogicalOperator &plan, FarCall &call);
-	vector<vector<Value>> EvaluateNative(const LogicalOperator &plan, FarCall &call);
-	vector<vector<Value>> EvaluateSubstrait(const LogicalOperator &plan, FarCall &call);
-	CrossingScan Read(ClientContext &context, const CrossingQuery &query);
-	CrossingScan Write(const CrossingQuery &query);
-	vector<vector<Value>> Apply(const CrossingQuery &query);
-	unique_ptr<CreateViewInfo> ReceiveView(const CreateViewInfo &view, const LogicalOperator &plan);
-	FarCall Record(const CrossingQuery &query);
-
-	shared_ptr<FarStore> store;
-	string catalog;
-	mutex far_lock;
-	Connection far;
-	unique_ptr<TestLinkPair> link_pair;
-	unique_ptr<CrossingFar> far_side;
-	std::thread serving;
-};
-
-class FarSource {
-public:
-	using Session = FarSession;
-
 	//! `catalog` is the store's catalog this attach serves; naming one puts it in every floor.
 	FarSource(shared_ptr<FarStore> store, string path, const string &group = "", const string &catalog = "");
 
-	vector<string> Schemas();
-	vector<string> Tables(const string &schema);
-	CrossingTable Describe(const string &schema, const string &name);
-	CrossingSchema DescribeSchema(const string &schema);
+	vector<string> Schemas() override;
+	vector<string> Tables(const string &schema) override;
+	CrossingTable Describe(const string &schema, const string &name) override;
+	CrossingSchema DescribeSchema(const string &schema) override;
 	static vector<string> TablesOn(Connection &con, const string &catalog, const string &schema);
 	static bool IsView(Connection &con, const string &catalog, const string &schema, const string &name);
 	static CrossingTable DescribeOn(FarStore &store, Connection &con, const string &catalog, const string &schema,
-	                                const string &name);
-	CrossingPlan Plan(const CrossingPlanRequest &request);
-	CrossingVerdict AcceptsCall(const Expression &expr);
-	CrossingVerdict AcceptsType(const LogicalType &type);
-	CrossingVerdict AcceptsOperator(const LogicalOperator &op);
-	CrossingVerdict AcceptsSeam(const vector<LogicalType> &types);
-	unique_ptr<FarSession> Begin(ClientContext &context);
-	void Detach(ClientContext &context);
-	const void *Group();
+	                                const string &name, const string &floor_catalog);
+	CrossingVerdict AcceptsCall(const Expression &expr) override;
+	CrossingVerdict AcceptsType(const LogicalType &type) override;
+	CrossingVerdict AcceptsOperator(const LogicalOperator &op) override;
+	CrossingVerdict AcceptsSeam(const vector<LogicalType> &types) override;
+	unique_ptr<CrossingLink> Connect(ClientContext &context) override;
+	void Detach(ClientContext &context) override;
+	const void *Group() const override;
+	void Planned(const LogicalOperator &plan) override;
 
 	static void Register(ExtensionLoader &loader, shared_ptr<FarStore> store);
 
@@ -237,6 +174,8 @@ namespace other {
 class OtherSource : public duckdb::FarSource {
 public:
 	using FarSource::FarSource;
+
+	const duckdb::CrossingIdentity &Identity() const override;
 
 	static void Register(duckdb::ExtensionLoader &loader, duckdb::shared_ptr<duckdb::FarStore> store);
 };

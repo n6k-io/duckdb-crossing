@@ -2,8 +2,6 @@
 
 #include "duckdb.hpp"
 #include "duckdb/catalog/catalog.hpp"
-#include "duckdb/common/types/column/column_data_collection.hpp"
-#include "duckdb/common/types/value_map.hpp"
 #include "duckdb/execution/physical_operator.hpp"
 #include "duckdb/function/table_function.hpp"
 #include "duckdb/main/client_context_state.hpp"
@@ -81,8 +79,6 @@ CrossingSeam SeamOf(TableCatalogEntry &table, const CrossingTable &described, Cr
 
 void RequireVerb(CrossingTableCatalogEntry &table, CrossingVerb verb);
 
-void RequireKey(TableCatalogEntry &table, const CrossingTable &described, const char *what);
-
 shared_ptr<CrossingFragment> PlanWriteFragment(CrossingTableCatalogEntry &table, CrossingVerb verb,
                                                const CrossingSeam &seam);
 
@@ -94,39 +90,6 @@ unique_ptr<CrossingBindData> MakeWriteBindData(CrossingTableCatalogEntry &table,
                                                shared_ptr<CrossingFragment> fragment);
 
 TableFunction CrossingWriteFunction();
-
-//! One pull of a write's readers: done with the rows it changed, or waiting on the waker.
-struct CrossingWritePull {
-	bool done = false;
-	idx_t affected_rows = 0;
-};
-
-class CrossingSeamFilledWrite {
-public:
-	CrossingSeamFilledWrite(const CrossingBindData &write, unique_ptr<ColumnDataCollection> rows);
-	~CrossingSeamFilledWrite();
-
-	CrossingWritePull Pull(ClientContext &context, CrossingWaker waker);
-	//! The rows a write with RETURNING left, once done. Null without RETURNING or when no call was made.
-	unique_ptr<ColumnDataCollection> TakeReturned() {
-		return std::move(returned);
-	}
-
-private:
-	CrossingTableCatalogEntry &table;
-	shared_ptr<CrossingFragment> fragment;
-	unique_ptr<CrossingSeamFilling> filling;
-	bool empty = false;
-	unique_ptr<CrossingQuery> query;
-	bool opened = false;
-	bool returning = false;
-	CrossingScan scan;
-	idx_t next_partition = 0;
-	CrossingReader reader;
-	DataChunk result_chunk;
-	idx_t affected_rows = 0;
-	unique_ptr<ColumnDataCollection> returned;
-};
 
 //! Near's side of a write. Any child is the rows it sends; with none, the source runs all of it.
 class LogicalCrossingNear : public LogicalExtensionOperator {
@@ -160,83 +123,6 @@ protected:
 	void ResolveTypes() override {
 		types = output_types;
 	}
-};
-
-class CrossingNear : public PhysicalOperator {
-public:
-	static constexpr const PhysicalOperatorType TYPE = PhysicalOperatorType::EXTENSION;
-
-	CrossingNear(PhysicalPlan &physical_plan, vector<LogicalType> types, vector<optional_idx> emit,
-	             unique_ptr<CrossingBindData> bind_data, idx_t estimated_cardinality);
-
-	vector<optional_idx> emit;
-	unique_ptr<CrossingBindData> bind_data;
-
-	unique_ptr<GlobalSinkState> GetGlobalSinkState(ClientContext &context) const override;
-	SinkResultType Sink(ExecutionContext &context, DataChunk &chunk, OperatorSinkInput &input) const override;
-	SinkFinalizeType Finalize(Pipeline &pipeline, Event &event, ClientContext &context,
-	                          OperatorSinkFinalizeInput &input) const override;
-	bool IsSink() const override {
-		return !children.empty();
-	}
-	bool ParallelSink() const override {
-		return false;
-	}
-	bool SinkOrderDependent() const override {
-		return true;
-	}
-
-	unique_ptr<GlobalSourceState> GetGlobalSourceState(ClientContext &context) const override;
-	SourceResultType GetDataInternal(ExecutionContext &context, DataChunk &chunk,
-	                                 OperatorSourceInput &input) const override;
-	bool IsSource() const override {
-		return true;
-	}
-
-	string GetName() const override;
-	InsertionOrderPreservingMap<string> ParamsToString() const override;
-};
-
-struct CrossingCreateTableAsState : public GlobalSinkState {
-	unique_ptr<ColumnDataCollection> rows;
-	unique_ptr<CrossingBindData> bind_data;
-	unique_ptr<CrossingSeamFilledWrite> write;
-	idx_t affected_rows = 0;
-	bool created = false;
-};
-
-class CrossingCreateTableAs : public PhysicalOperator {
-public:
-	static constexpr const PhysicalOperatorType TYPE = PhysicalOperatorType::EXTENSION;
-
-	CrossingCreateTableAs(PhysicalPlan &physical_plan, CrossingAttach &attach, SchemaCatalogEntry &owner,
-	                      unique_ptr<BoundCreateTableInfo> info, vector<LogicalType> row_types,
-	                      idx_t estimated_cardinality);
-
-	CrossingAttach &attach;
-	SchemaCatalogEntry &owner;
-	unique_ptr<BoundCreateTableInfo> info;
-	vector<LogicalType> row_types;
-
-	unique_ptr<GlobalSinkState> GetGlobalSinkState(ClientContext &context) const override;
-	SinkResultType Sink(ExecutionContext &context, DataChunk &chunk, OperatorSinkInput &input) const override;
-	SinkFinalizeType Finalize(Pipeline &pipeline, Event &event, ClientContext &context,
-	                          OperatorSinkFinalizeInput &input) const override;
-	bool IsSink() const override {
-		return true;
-	}
-	bool ParallelSink() const override {
-		return false;
-	}
-
-	unique_ptr<GlobalSourceState> GetGlobalSourceState(ClientContext &context) const override;
-	SourceResultType GetDataInternal(ExecutionContext &context, DataChunk &chunk,
-	                                 OperatorSourceInput &input) const override;
-	bool IsSource() const override {
-		return true;
-	}
-
-	string GetName() const override;
 };
 
 } // namespace duckdb

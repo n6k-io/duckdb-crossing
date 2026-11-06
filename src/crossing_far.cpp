@@ -1,10 +1,20 @@
 #include "crossing_far.hpp"
 
 #include "internal/control_frames.hpp"
+#include "internal/execute.hpp"
 #include "internal/far_plan.hpp"
 
 #include "duckdb/catalog/catalog.hpp"
 #include "duckdb/main/query_result.hpp"
+#include "duckdb/common/string_util.hpp"
+#include "duckdb/main/query_parameters.hpp"
+#include "duckdb/parser/parsed_data/alter_info.hpp"
+#include "duckdb/parser/parsed_data/create_view_info.hpp"
+#include "duckdb/parser/parsed_data/drop_info.hpp"
+#include "duckdb/parser/parser.hpp"
+#include "duckdb/parser/statement/alter_statement.hpp"
+#include "duckdb/parser/statement/create_statement.hpp"
+#include "duckdb/parser/statement/drop_statement.hpp"
 #include "duckdb/parser/statement/select_statement.hpp"
 #include "duckdb/planner/planner.hpp"
 #include "duckdb/transaction/meta_transaction.hpp"
@@ -202,13 +212,60 @@ void CrossingFar::RunStatement(CrossingLink &link, CrossingStream &control, cons
 	SendControl(control, run_error.HasError() ? ControlError(run_error) : string(CROSSING_CONTROL_DONE));
 }
 
+void CrossingFar::RunDdl(CrossingStream &control, const string &frame) {
+	try {
+		auto &context = *connection.context;
+		const string view_prefix(CROSSING_CONTROL_VIEW);
+		unique_ptr<SQLStatement> statement;
+		if (frame.compare(0, view_prefix.size(), view_prefix) == 0) {
+			auto lines = StringUtil::Split(frame.substr(view_prefix.size()), '\n');
+			auto json_at = frame.find('\n', view_prefix.size());
+			for (idx_t l = 0; l < 3; l++) {
+				json_at = frame.find('\n', json_at + 1);
+			}
+			auto create = make_uniq<CreateViewInfo>(
+			    QualifiedName(Identifier(catalog), Identifier(lines[0]), Identifier(lines[1])));
+			create->on_conflict = static_cast<OnCreateConflict>(std::stoul(lines[2]));
+			create->query = DecodeSubstraitView(connection, catalog, frame.substr(json_at + 1),
+			                                    StringUtil::Split(lines[3], ','), options.catalogs);
+			auto created = make_uniq<CreateStatement>();
+			created->info = std::move(create);
+			statement = std::move(created);
+		} else {
+			Parser parser(context);
+			parser.ParseQuery(frame);
+			statement = std::move(parser.statements[0]);
+			switch (statement->type) {
+			case StatementType::CREATE_STATEMENT:
+				statement->Cast<CreateStatement>().info->SetCatalog(Identifier(catalog));
+				break;
+			case StatementType::ALTER_STATEMENT: {
+				auto &info = *statement->Cast<AlterStatement>().info;
+				auto name = info.GetQualifiedName();
+				info.SetQualifiedName(Identifier(catalog), name.Schema(), name.Name());
+				break;
+			}
+			case StatementType::DROP_STATEMENT:
+				statement->Cast<DropStatement>().info->SetCatalog(Identifier(catalog));
+				break;
+			default:
+				throw InvalidInputException("crossing: far was sent a DDL frame that is not DDL");
+			}
+		}
+		context.Query(std::move(statement), QueryParameters())->ThrowIfError();
+	} catch (std::exception &ex) {
+		SendControl(control, ControlError(ErrorData(ex)));
+		return;
+	}
+	SendControl(control, CROSSING_CONTROL_DONE);
+}
+
 void CrossingFar::Serve(CrossingLink &link) {
 	auto control = link.Open(0);
-	if (!options.transaction_open) {
-		auto begin = connection.Query("BEGIN");
-		begin->ThrowIfError();
-	}
+	auto begin = connection.Query("BEGIN");
+	begin->ThrowIfError();
 	const string plan_prefix(CROSSING_CONTROL_PLAN);
+	const string ddl_prefix(CROSSING_CONTROL_DDL);
 	string header;
 	while (RecvControl(*control, header)) {
 		if (header.compare(0, plan_prefix.size(), plan_prefix) == 0) {
@@ -217,6 +274,10 @@ void CrossingFar::Serve(CrossingLink &link) {
 			} catch (IOException &) {
 				break;
 			}
+			continue;
+		}
+		if (header.compare(0, ddl_prefix.size(), ddl_prefix) == 0) {
+			RunDdl(*control, header.substr(ddl_prefix.size()));
 			continue;
 		}
 		auto end = connection.Query(header == CROSSING_CONTROL_COMMIT ? "COMMIT" : "ROLLBACK");

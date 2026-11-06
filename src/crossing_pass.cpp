@@ -95,7 +95,7 @@ void CrossingFoldPass(OptimizerExtensionInput &input, unique_ptr<LogicalOperator
 	NarrowSetsToWhatChanges(*plan, identity);
 	ShapeWrites(input.context, plan, fresh, identity);
 	FillBareWrites(input.context, plan, fresh, identity);
-	ResolveKeyAliases(*plan, identity);
+	ResolveRowIds(*plan, identity);
 	FoldCrossableWorkIntoFragments(plan, fresh, identity,
 	                               Settings::Get<ScalarSubqueryErrorOnMultipleRowsSetting>(input.context));
 	FillWrites(input.context, plan, fresh, identity);

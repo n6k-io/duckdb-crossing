@@ -22,6 +22,8 @@ public:
 	CrossingStream &Control() {
 		return *control;
 	}
+	//! One DDL statement on far, in this transaction. Throws what far reported.
+	void RunDdl(const string &frame);
 	//! Unique within the transaction, as a slice's streams are.
 	idx_t NextSliceId() {
 		return next_slice++;
@@ -93,30 +95,19 @@ private:
 
 //! How near's operator turns far's rows into its own.
 struct CrossingRemoteColumns {
-	static constexpr idx_t ROW_ID = DConstants::INVALID_INDEX - 1;
 	static constexpr idx_t NULL_COLUMN = DConstants::INVALID_INDEX;
 
 	vector<LogicalType> received;
-	//! For each output column, its received column; or a row number, or NULL.
+	//! For each output column, its received column, or NULL.
 	vector<idx_t> positions;
 
 	static CrossingRemoteColumns Identity(const vector<LogicalType> &types);
-};
-
-//! A write whose key is not vouched for: it must change no more rows than the keys it sent.
-struct CrossingRemoteKeyCheck {
-	vector<idx_t> key_positions;
-	bool returning = false;
-	string table;
-	vector<string> key_columns;
-	string verb;
 };
 
 struct CrossingRemoteSeamSink {
 	vector<LogicalType> types;
 	bool ordered = false;
 	bool parallel = false;
-	CrossingRemoteKeyCheck keys;
 	//! Nothing reads this operator as a source, as with MERGE's actions: the sink waits out far's answer.
 	bool awaits_result = false;
 };
@@ -134,8 +125,7 @@ bool TryPutWriteOnRemote(PhysicalOperator &plan, CrossingRemoteStatement &statem
                          const vector<LogicalType> &types);
 
 //! How a feed's rows must travel, as a result collector chooses.
-unique_ptr<CrossingRemoteSeamSink> CrossingSeamSinkOf(ClientContext &context, PhysicalOperator &feed,
-                                                      CrossingRemoteKeyCheck keys = CrossingRemoteKeyCheck());
+unique_ptr<CrossingRemoteSeamSink> CrossingSeamSinkOf(ClientContext &context, PhysicalOperator &feed);
 
 //! `crossing[...]` on near: a source of the slice's results, and with `feed`, a sink of its seam's rows.
 unique_ptr<LogicalOperator> MakeCrossingRemote(TableIndex table_index, vector<LogicalType> types,

@@ -1,5 +1,9 @@
 #include "framework/twin.hpp"
 
+#include "duckdb/parser/parser.hpp"
+#include "duckdb/parser/statement/select_statement.hpp"
+#include "duckdb/parser/tableref/subqueryref.hpp"
+
 using namespace duckdb;
 
 namespace {
@@ -13,7 +17,7 @@ Value Scalar(Twin &twin, const string &sql) {
 }
 
 struct NoKeyTable {
-	explicit NoKeyTable(idx_t rows = 5) : twin(Transport::LINK) {
+	explicit NoKeyTable(idx_t rows = 5) : twin() {
 		twin.Far("CREATE TABLE plain(a INTEGER, b INTEGER)");
 		twin.Far("INSERT INTO plain SELECT i::INTEGER, 0 FROM range(" + to_string(rows) + ") r(i)");
 		twin.Far("CREATE TABLE other(a INTEGER, c INTEGER)");
@@ -29,7 +33,7 @@ TEST_CASE("an update with no key runs on far and sends near no rows", "[shaped]"
 	NoKeyTable t;
 	auto result = t.twin.Query("UPDATE far.plain SET b = a + 1 WHERE a > 2");
 	REQUIRE(result->GetValue(0, 0) == Value::BIGINT(2));
-	REQUIRE(t.twin.store->link_seam_rows == 0);
+	REQUIRE(t.twin.store->seam_rows == 0);
 	REQUIRE(Scalar(t.twin, "SELECT sum(b) FROM plain") == Value::HUGEINT(9));
 }
 
@@ -37,7 +41,7 @@ TEST_CASE("a delete with no key runs on far and sends near no rows", "[shaped]")
 	NoKeyTable t;
 	auto result = t.twin.Query("DELETE FROM far.plain WHERE a < 2");
 	REQUIRE(result->GetValue(0, 0) == Value::BIGINT(2));
-	REQUIRE(t.twin.store->link_seam_rows == 0);
+	REQUIRE(t.twin.store->seam_rows == 0);
 	REQUIRE(Scalar(t.twin, "SELECT count(*) FROM plain") == Value::BIGINT(3));
 }
 
@@ -45,7 +49,7 @@ TEST_CASE("an update from another far table crosses whole", "[shaped]") {
 	NoKeyTable t;
 	auto result = t.twin.Query("UPDATE far.plain SET b = o.c FROM far.other o WHERE plain.a = o.a");
 	REQUIRE(result->GetValue(0, 0) == Value::BIGINT(2));
-	REQUIRE(t.twin.store->link_seam_rows == 0);
+	REQUIRE(t.twin.store->seam_rows == 0);
 	REQUIRE(Scalar(t.twin, "SELECT sum(b) FROM plain") == Value::HUGEINT(33));
 }
 
@@ -55,7 +59,7 @@ TEST_CASE("an update from near rows sends only those rows", "[shaped]") {
 	t.twin.Query("INSERT INTO here VALUES (0, 5), (4, 6)");
 	auto result = t.twin.Query("UPDATE far.plain SET b = h.v FROM here h WHERE plain.a = h.a");
 	REQUIRE(result->GetValue(0, 0) == Value::BIGINT(2));
-	REQUIRE(t.twin.store->link_seam_rows == 2);
+	REQUIRE(t.twin.store->seam_rows == 2);
 	REQUIRE(Scalar(t.twin, "SELECT sum(b) FROM plain") == Value::HUGEINT(11));
 }
 
@@ -64,7 +68,7 @@ TEST_CASE("a merge reading far runs on far as one operator", "[shaped]") {
 	auto result = t.twin.Query("MERGE INTO far.plain t USING far.other s ON t.a = s.a "
 	                           "WHEN MATCHED THEN UPDATE SET b = s.c");
 	REQUIRE(result->GetValue(0, 0) == Value::BIGINT(2));
-	REQUIRE(t.twin.store->link_seam_rows == 0);
+	REQUIRE(t.twin.store->seam_rows == 0);
 	REQUIRE(Scalar(t.twin, "SELECT sum(b) FROM plain") == Value::HUGEINT(33));
 }
 
@@ -74,7 +78,7 @@ TEST_CASE("a merge from near rows sends only those rows, and all its actions lan
 	                           "WHEN MATCHED THEN UPDATE SET b = s.c "
 	                           "WHEN NOT MATCHED THEN INSERT (a, b) VALUES (s.a, s.c)");
 	REQUIRE(result->GetValue(0, 0) == Value::BIGINT(2));
-	REQUIRE(t.twin.store->link_seam_rows == 2);
+	REQUIRE(t.twin.store->seam_rows == 2);
 	REQUIRE(Scalar(t.twin, "SELECT count(*) FROM plain") == Value::BIGINT(6));
 	REQUIRE(Scalar(t.twin, "SELECT sum(b) FROM plain") == Value::HUGEINT(18));
 }
@@ -96,4 +100,158 @@ TEST_CASE("a table scanned while written in one statement reads as it was", "[sh
 	REQUIRE(result->GetValue(0, 0) == Value::BIGINT(999));
 	REQUIRE(Scalar(t.twin, "SELECT max(a) FROM plain") == Value::INTEGER(999));
 	REQUIRE(Scalar(t.twin, "SELECT count(*) FROM plain WHERE a = 999") == Value::BIGINT(2));
+}
+
+TEST_CASE("an update reaching two rows with one value changes both, as DuckDB does", "[shaped]") {
+	NoKeyTable t;
+	t.twin.Far("CREATE TABLE dup(k INTEGER, v INTEGER)");
+	t.twin.Far("INSERT INTO dup VALUES (1, 0), (1, 0), (2, 0)");
+	t.twin.store->verbs.clear();
+	t.twin.Query("DETACH far");
+	t.twin.Attach();
+
+	auto result = t.twin.Query("UPDATE far.dup SET v = 9 WHERE k = 1 RETURNING k");
+	REQUIRE(result->RowCount() == 2);
+	REQUIRE(Scalar(t.twin, "SELECT sum(v) FROM dup") == Value::HUGEINT(18));
+}
+
+TEST_CASE("a delete whose condition is a subquery addresses far's rows by row id", "[shaped]") {
+	NoKeyTable t;
+	auto result = t.twin.Query("DELETE FROM far.plain WHERE a IN (SELECT a FROM far.other)");
+	REQUIRE(result->GetValue(0, 0) == Value::BIGINT(2));
+	REQUIRE(Scalar(t.twin, "SELECT count(*) FROM plain") == Value::BIGINT(3));
+}
+
+TEST_CASE("a delete filtered by a function far refuses sends near's row ids back", "[shaped]") {
+	Twin twin;
+	twin.store->refused_functions.insert("upper");
+	twin.Far("CREATE TABLE s(a VARCHAR)");
+	twin.Far("INSERT INTO s VALUES ('x'), ('y'), ('z')");
+	twin.Attach();
+
+	auto result = twin.Query("DELETE FROM far.s WHERE upper(a) = 'Y'");
+	REQUIRE(result->GetValue(0, 0) == Value::BIGINT(1));
+	REQUIRE(twin.store->seam_rows == 1);
+	REQUIRE(Scalar(twin, "SELECT count(*) FROM s") == Value::BIGINT(2));
+}
+
+TEST_CASE("many streams and threads give the same answers through an attach", "[link]") {
+	auto [streams, near_threads] = GENERATE(std::make_pair<idx_t, idx_t>(1, 1), std::make_pair<idx_t, idx_t>(4, 4),
+	                                        std::make_pair<idx_t, idx_t>(4, 1), std::make_pair<idx_t, idx_t>(2, 4));
+	INFO(streams << " streams, " << near_threads << " threads");
+	Twin twin;
+	twin.store->streams = streams;
+	twin.store->capacity = 1;
+	twin.store->takes_seams = true;
+	twin.Far("CREATE TABLE big AS SELECT i::BIGINT AS id, (i % 7)::BIGINT AS v FROM range(50000) r(i)");
+	twin.Attach();
+	twin.Query("SET threads = " + to_string(near_threads));
+	twin.Query("CREATE TABLE loc AS SELECT i::BIGINT AS id FROM range(0, 50000, 5) r(i)");
+
+	auto ordered = twin.Query("SELECT id FROM far.big ORDER BY id DESC");
+	REQUIRE(ordered->RowCount() == 50000);
+	for (idx_t r = 0; r < 50000; r += 997) {
+		REQUIRE(ordered->GetValue(0, r) == Value::BIGINT(NumericCast<int64_t>(49999 - r)));
+	}
+	auto joined = twin.Query("SELECT count(*), sum(b.v) FROM far.big b JOIN loc l ON b.id = l.id");
+	REQUIRE(joined->GetValue(0, 0) == Value::BIGINT(10000));
+
+	twin.Query("CREATE TABLE far.main.copy AS SELECT id FROM far.big ORDER BY id");
+	REQUIRE(Scalar(twin, "SELECT count(*) FROM copy") == Value::BIGINT(50000));
+	twin.Query("INSERT INTO far.main.copy SELECT id FROM loc");
+	REQUIRE(Scalar(twin, "SELECT count(*) FROM copy") == Value::BIGINT(60000));
+	auto limited = twin.Query("SELECT id FROM far.big LIMIT 3");
+	REQUIRE(limited->RowCount() == 3);
+}
+
+TEST_CASE("an insert into a source keeps an ordered feed's order across streams", "[link]") {
+	Twin twin;
+	twin.store->streams = 4;
+	twin.Far("CREATE TABLE seq(id BIGINT)");
+	twin.Attach();
+	twin.Query("SET threads = 4");
+
+	twin.Query("INSERT INTO far.seq SELECT i::BIGINT FROM range(100000) r(i) ORDER BY i DESC");
+
+	auto rows = twin.store->con.Query("SELECT id FROM seq");
+	idx_t r = 0;
+	while (auto chunk = rows->Fetch()) {
+		for (idx_t c = 0; c < chunk->size(); c++, r++) {
+			if (chunk->GetValue(0, c) != Value::BIGINT(NumericCast<int64_t>(99999 - r))) {
+				FAIL("row " << r << " out of order");
+			}
+		}
+	}
+	REQUIRE(r == 100000);
+}
+
+TEST_CASE("a failure rolls back an explicit transaction and leaves the attach usable", "[link]") {
+	Twin twin;
+	twin.Far("CREATE TABLE c(id INTEGER CHECK (id < 100))");
+	twin.Attach();
+
+	twin.Query("BEGIN");
+	twin.Query("INSERT INTO far.c VALUES (1)");
+	REQUIRE_THAT(twin.Error("INSERT INTO far.c SELECT i::INTEGER FROM range(1000) r(i)"), Catch::Contains("CHECK"));
+	REQUIRE_THAT(twin.Error("SELECT * FROM far.c"), Catch::Contains("aborted"));
+	twin.Query("ROLLBACK");
+	REQUIRE(twin.store->transaction_ends.back() == "rollback");
+	REQUIRE(Scalar(twin, "SELECT count(*) FROM c") == Value::BIGINT(0));
+
+	twin.Query("INSERT INTO far.c VALUES (2)");
+	REQUIRE(Scalar(twin, "SELECT count(*) FROM c") == Value::BIGINT(1));
+	REQUIRE(twin.store->transaction_ends.back() == "commit");
+}
+
+TEST_CASE("a feed that fails mid-statement ends far's side of it", "[link]") {
+	Twin twin;
+	twin.Far("CREATE TABLE c(id INTEGER)");
+	twin.Attach();
+
+	REQUIRE_THAT(twin.Error("INSERT INTO far.c SELECT CASE WHEN i = 50000 THEN error('boom') ELSE i::INTEGER END FROM "
+	                        "range(100000) r(i)"),
+	             Catch::Contains("boom"));
+	REQUIRE(Scalar(twin, "SELECT count(*) FROM c") == Value::BIGINT(0));
+	twin.Query("INSERT INTO far.c VALUES (1)");
+	REQUIRE(Scalar(twin, "SELECT count(*) FROM c") == Value::BIGINT(1));
+}
+
+TEST_CASE("two statements in one transaction see each other's writes on far", "[link]") {
+	Twin twin;
+	twin.Far("CREATE TABLE c(id INTEGER)");
+	twin.Attach();
+
+	twin.Query("BEGIN");
+	twin.Query("INSERT INTO far.c VALUES (1), (2)");
+	REQUIRE(twin.Query("SELECT count(*) FROM far.c")->GetValue(0, 0) == Value::BIGINT(2));
+	twin.Query("UPDATE far.c SET id = id + 10");
+	REQUIRE(twin.Query("SELECT sum(id) FROM far.c")->GetValue(0, 0) == Value::HUGEINT(23));
+	twin.Query("COMMIT");
+	REQUIRE(Scalar(twin, "SELECT sum(id) FROM c") == Value::HUGEINT(23));
+}
+
+TEST_CASE("far's floor resolver applies a row policy to reads and writes", "[link]") {
+	Twin twin;
+	twin.Far("CREATE TABLE p(id INTEGER, tenant INTEGER)");
+	twin.Far("INSERT INTO p VALUES (1, 1), (2, 1), (3, 2)");
+	auto &far_context = *twin.store->con.context;
+	twin.store->floors = [&far_context](const CrossingFloor &floor) -> unique_ptr<TableRef> {
+		Parser parser(far_context);
+		parser.ParseQuery("SELECT *, rowid FROM memory.main." + floor.table + " WHERE tenant = 1");
+		auto select = unique_ptr_cast<SQLStatement, SelectStatement>(std::move(parser.statements[0]));
+		return make_uniq<SubqueryRef>(std::move(select), Identifier(floor.table));
+	};
+	twin.Attach();
+
+	REQUIRE(twin.Query("SELECT count(*) FROM far.p")->GetValue(0, 0) == Value::BIGINT(2));
+
+	REQUIRE(twin.Query("UPDATE far.p SET id = 0")->GetValue(0, 0) == Value::BIGINT(2));
+	REQUIRE(Scalar(twin, "SELECT count(*) FROM p WHERE id = 0") == Value::BIGINT(2));
+	REQUIRE(Scalar(twin, "SELECT id FROM p WHERE tenant = 2") == Value::INTEGER(3));
+
+	REQUIRE(twin.Query("DELETE FROM far.p WHERE id = 3 OR id = 0")->GetValue(0, 0) == Value::BIGINT(2));
+	REQUIRE(Scalar(twin, "SELECT count(*) FROM p WHERE tenant = 2") == Value::BIGINT(1));
+
+	REQUIRE_THAT(twin.Error("MERGE INTO far.p t USING (SELECT 3 AS id) s ON t.id = s.id WHEN MATCHED THEN DELETE"),
+	             Catch::Contains("row policy"));
 }

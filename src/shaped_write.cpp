@@ -1,6 +1,5 @@
 #include "internal/shaped_write.hpp"
 
-#include "crossing_attach.hpp"
 #include "internal/crossing_table_entry.hpp"
 #include "internal/crossing_write.hpp"
 #include "internal/fill.hpp"
@@ -19,7 +18,6 @@
 #include "duckdb/planner/operator/logical_merge_into.hpp"
 #include "duckdb/planner/operator/logical_projection.hpp"
 #include "duckdb/planner/operator/logical_update.hpp"
-#include "duckdb/transaction/transaction.hpp"
 
 namespace duckdb {
 
@@ -339,11 +337,6 @@ void ShapeWrites(ClientContext &context, unique_ptr<LogicalOperator> &plan, cons
 	}
 	auto table = CrossingTableOf(*written, identity);
 	if (!table) {
-		return;
-	}
-	auto &catalog = table->ParentCatalog();
-	auto &transaction = Transaction::Get(context, catalog);
-	if (!CrossingAttach::Of(catalog).RemoteStatement(context, transaction)) {
 		return;
 	}
 	auto shaped = make_shared_ptr<ShapedWrite>();

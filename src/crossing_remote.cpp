@@ -2,13 +2,10 @@
 
 #include "internal/control_frames.hpp"
 #include "internal/crossing_read.hpp"
-#include "internal/key_check.hpp"
 #include "internal/parking.hpp"
 #include "internal/seam_inbox.hpp"
 #include "internal/stream_sink.hpp"
 
-#include "duckdb/common/numeric_utils.hpp"
-#include "duckdb/common/types/value_map.hpp"
 #include "duckdb/execution/physical_operator.hpp"
 #include "duckdb/execution/physical_plan_generator.hpp"
 #include "duckdb/parallel/meta_pipeline.hpp"
@@ -55,6 +52,16 @@ void CrossingRemote::End(const char *word) {
 	}
 	if (!replied) {
 		throw IOException("crossing: the link closed before far ended the transaction");
+	}
+	ThrowIfControlError(reply);
+}
+
+void CrossingRemote::RunDdl(const string &frame) {
+	DrainStatement();
+	SendControl(*control, CROSSING_CONTROL_DDL + frame);
+	string reply;
+	if (!RecvControl(*control, reply)) {
+		throw IOException("crossing: the link closed before far ran the DDL");
 	}
 	ThrowIfControlError(reply);
 }
@@ -142,12 +149,25 @@ void CrossingRemoteStatement::Finish() {
 
 namespace {
 
+//! After a WAIT. True with BLOCKED when parked, true with FINISHED when the operator can no longer block; false when
+//! the waker already fired and the source is to be asked again.
+bool ParkSource(CrossingParking &parking, GlobalSourceState &state, SourceResultType &result) {
+	const annotated_lock_guard<annotated_mutex> guard {state.lock};
+	if (parking.Park(state)) {
+		result = SourceResultType::BLOCKED;
+		return true;
+	}
+	if (!state.CanBlock()) {
+		result = SourceResultType::FINISHED;
+		return true;
+	}
+	return false;
+}
+
 struct RemoteSourceGlobal : public GlobalSourceState {
 	shared_ptr<CrossingSeamInbox> inbox;
 	vector<unique_ptr<CrossingStream>> streams;
 	atomic<idx_t> next_stream {0};
-	atomic<idx_t> rows_emitted {0};
-	atomic<idx_t> affected {0};
 
 	~RemoteSourceGlobal() override {
 		for (auto &stream : streams) {
@@ -168,39 +188,15 @@ struct RemoteSourceLocal : public LocalSourceState {
 	DataChunk received;
 };
 
-struct RemoteSinkGlobal : public GlobalSinkState {
-	unique_ptr<GlobalSinkState> streams;
-	value_set_t keys;
-
-	idx_t MaxThreads(idx_t source_max_threads) override {
-		return streams->MaxThreads(source_max_threads);
-	}
-};
-
-struct RemoteSinkLocal : public LocalSinkState {
-	unique_ptr<LocalSinkState> streams;
-	value_set_t keys;
-};
-
-void NoteKeys(value_set_t &keys, DataChunk &chunk, const vector<idx_t> &key_positions) {
-	for (idx_t r = 0; r < chunk.size(); r++) {
-		child_list_t<Value> key;
-		for (idx_t k = 0; k < key_positions.size(); k++) {
-			key.emplace_back(to_string(k), chunk.GetValue(key_positions[k], r));
-		}
-		keys.insert(Value::STRUCT(std::move(key)));
-	}
-}
-
 class PhysicalCrossingRemote : public PhysicalOperator {
 public:
 	PhysicalCrossingRemote(PhysicalPlan &physical_plan, vector<LogicalType> types_p,
 	                       shared_ptr<CrossingRemoteStatement> statement_p, idx_t slice_p, bool ordered_p,
-	                       CrossingRemoteColumns columns_p, unique_ptr<CrossingStreamSink> sink_p,
-	                       CrossingRemoteKeyCheck keys_p, bool awaits_result_p, idx_t estimated_cardinality)
+	                       CrossingRemoteColumns columns_p, unique_ptr<CrossingStreamSink> sink_p, bool awaits_result_p,
+	                       idx_t estimated_cardinality)
 	    : PhysicalOperator(physical_plan, PhysicalOperatorType::EXTENSION, std::move(types_p), estimated_cardinality),
 	      statement(std::move(statement_p)), slice(slice_p), ordered(ordered_p), columns(std::move(columns_p)),
-	      sink(std::move(sink_p)), keys(std::move(keys_p)), awaits_result(awaits_result_p) {
+	      sink(std::move(sink_p)), awaits_result(awaits_result_p) {
 	}
 
 	shared_ptr<CrossingRemoteStatement> statement;
@@ -208,7 +204,6 @@ public:
 	bool ordered;
 	CrossingRemoteColumns columns;
 	unique_ptr<CrossingStreamSink> sink;
-	CrossingRemoteKeyCheck keys;
 	bool awaits_result;
 
 	void BuildPipelines(Pipeline &current, MetaPipeline &meta_pipeline) override {
@@ -219,9 +214,8 @@ public:
 		PhysicalOperator::BuildPipelines(current, meta_pipeline);
 	}
 
-	void AwaitResult(RemoteSinkGlobal &global) const {
+	void AwaitResult() const {
 		auto &link = statement->Remote().Link();
-		idx_t affected = 0;
 		for (idx_t k = 0; k < link.Streams(); k++) {
 			auto stream = link.Open(CrossingSliceStreamId(slice, false, k));
 			CrossingFrame frame;
@@ -234,23 +228,11 @@ public:
 				if (io == CrossingIo::DONE) {
 					break;
 				}
-				if (io == CrossingIo::WAIT) {
-					if (parking->Park()) {
-						signal->Await();
-					}
-					continue;
-				}
-				if (frame.header == CROSSING_IDLE_HEADER) {
-					continue;
-				}
-				for (idx_t r = 0; r < frame.rows.size(); r++) {
-					affected += NumericCast<idx_t>(frame.rows.GetValue(0, r).GetValue<int64_t>());
+				if (io == CrossingIo::WAIT && parking->Park()) {
+					signal->Await();
 				}
 			}
 			stream->Close(nullptr);
-		}
-		if (!keys.key_positions.empty()) {
-			ThrowIfKeyNotUnique(affected, global.keys.size(), keys.table, keys.key_columns, keys.verb.c_str());
 		}
 	}
 
@@ -268,51 +250,24 @@ public:
 	}
 	unique_ptr<GlobalSinkState> GetGlobalSinkState(ClientContext &) const override {
 		statement->Start();
-		auto state = make_uniq<RemoteSinkGlobal>();
-		state->streams = sink->GlobalState();
-		return std::move(state);
+		return sink->GlobalState();
 	}
 	unique_ptr<LocalSinkState> GetLocalSinkState(ExecutionContext &) const override {
-		auto state = make_uniq<RemoteSinkLocal>();
-		state->streams = sink->LocalState();
-		return std::move(state);
+		return sink->LocalState();
 	}
 	SinkResultType Sink(ExecutionContext &, DataChunk &chunk, OperatorSinkInput &input) const override {
-		auto &global = input.global_state.Cast<RemoteSinkGlobal>();
-		auto &local = input.local_state.Cast<RemoteSinkLocal>();
-		local.streams->partition_info = local.partition_info;
-		OperatorSinkInput inner {*global.streams, *local.streams, input.interrupt_state};
-		auto result = sink->Sink(chunk, inner);
-		if (result == SinkResultType::NEED_MORE_INPUT && !keys.key_positions.empty()) {
-			NoteKeys(local.keys, chunk, keys.key_positions);
-		}
-		return result;
+		return sink->Sink(chunk, input);
 	}
 	SinkCombineResultType Combine(ExecutionContext &, OperatorSinkCombineInput &input) const override {
-		auto &global = input.global_state.Cast<RemoteSinkGlobal>();
-		auto &local = input.local_state.Cast<RemoteSinkLocal>();
-		local.streams->partition_info = local.partition_info;
-		OperatorSinkCombineInput inner {*global.streams, *local.streams, input.interrupt_state};
-		auto result = sink->Combine(inner);
-		if (result == SinkCombineResultType::FINISHED && !local.keys.empty()) {
-			annotated_lock_guard<annotated_mutex> guard(global.lock);
-			global.keys.insert(local.keys.begin(), local.keys.end());
-			local.keys.clear();
-		}
-		return result;
+		return sink->Combine(input);
 	}
 	SinkNextBatchType NextBatch(ExecutionContext &, OperatorSinkNextBatchInput &input) const override {
-		auto &global = input.global_state.Cast<RemoteSinkGlobal>();
-		auto &local = input.local_state.Cast<RemoteSinkLocal>();
-		local.streams->partition_info = local.partition_info;
-		OperatorSinkNextBatchInput inner {*global.streams, *local.streams, input.interrupt_state};
-		return sink->NextBatch(inner);
+		return sink->NextBatch(input);
 	}
 	SinkFinalizeType Finalize(Pipeline &, Event &, ClientContext &, OperatorSinkFinalizeInput &input) const override {
-		auto &global = input.global_state.Cast<RemoteSinkGlobal>();
-		sink->Finish(*global.streams);
+		sink->Finish(input.global_state);
 		if (awaits_result) {
-			AwaitResult(global);
+			AwaitResult();
 		}
 		return SinkFinalizeType::READY;
 	}
@@ -351,43 +306,16 @@ public:
 		return std::move(state);
 	}
 
-	void Emit(RemoteSourceGlobal &global, DataChunk &received, DataChunk &chunk) const {
+	void Emit(DataChunk &received, DataChunk &chunk) const {
 		chunk.SetChildCardinality(received.size());
 		for (idx_t c = 0; c < columns.positions.size(); c++) {
 			auto position = columns.positions[c];
-			if (position == CrossingRemoteColumns::ROW_ID) {
-				auto row_ids = FlatVector::GetDataMutable<row_t>(chunk.data[c]);
-				auto first = global.rows_emitted.fetch_add(received.size());
-				for (idx_t r = 0; r < received.size(); r++) {
-					row_ids[r] = static_cast<row_t>(first + r);
-				}
-			} else if (position == CrossingRemoteColumns::NULL_COLUMN) {
+			if (position == CrossingRemoteColumns::NULL_COLUMN) {
 				chunk.data[c].SetVectorType(VectorType::CONSTANT_VECTOR);
 				ConstantVector::SetNull(chunk.data[c], true);
 			} else {
 				chunk.data[c].Reference(received.data[position]);
 			}
-		}
-	}
-
-	void CheckKeys(RemoteSourceGlobal &global) const {
-		if (keys.key_positions.empty() || !sink_state) {
-			return;
-		}
-		auto &sunk = sink_state->Cast<RemoteSinkGlobal>();
-		ThrowIfKeyNotUnique(global.affected.load(), sunk.keys.size(), keys.table, keys.key_columns, keys.verb.c_str());
-	}
-
-	void NoteAffected(RemoteSourceGlobal &global, DataChunk &rows) const {
-		if (keys.key_positions.empty()) {
-			return;
-		}
-		if (keys.returning) {
-			global.affected += rows.size();
-			return;
-		}
-		for (idx_t r = 0; r < rows.size(); r++) {
-			global.affected += NumericCast<idx_t>(rows.GetValue(0, r).GetValue<int64_t>());
 		}
 	}
 
@@ -400,7 +328,7 @@ public:
 				local.received.Reset();
 				local.rows->Scan(local.scan, local.received);
 				if (local.received.size() > 0) {
-					Emit(global, local.received, chunk);
+					Emit(local.received, chunk);
 					return SourceResultType::HAVE_MORE_OUTPUT;
 				}
 				local.rows.reset();
@@ -418,7 +346,6 @@ public:
 			if (!local.stream.IsValid()) {
 				auto took = inbox.Take(local.rows, local.rank, input.interrupt_state);
 				if (took == CrossingSeamInbox::Took::DONE) {
-					CheckKeys(global);
 					return SourceResultType::FINISHED;
 				}
 				if (took == CrossingSeamInbox::Took::PARK) {
@@ -435,7 +362,6 @@ public:
 				if (local.frame.header == CROSSING_IDLE_HEADER) {
 					inbox.Idle(index);
 				} else {
-					NoteAffected(global, local.frame.rows);
 					inbox.Append(index, local.frame.rows, std::stoull(local.frame.header));
 				}
 				break;
@@ -539,13 +465,11 @@ bool TryPutWriteOnRemote(PhysicalOperator &plan, CrossingRemoteStatement &statem
 	return true;
 }
 
-unique_ptr<CrossingRemoteSeamSink> CrossingSeamSinkOf(ClientContext &context, PhysicalOperator &feed,
-                                                      CrossingRemoteKeyCheck keys) {
+unique_ptr<CrossingRemoteSeamSink> CrossingSeamSinkOf(ClientContext &context, PhysicalOperator &feed) {
 	auto seam = make_uniq<CrossingRemoteSeamSink>();
 	seam->types = feed.GetTypes();
 	seam->ordered = PhysicalPlanGenerator::PreserveInsertionOrder(context, feed);
 	seam->parallel = !seam->ordered || PhysicalPlanGenerator::UseBatchIndex(context, feed);
-	seam->keys = std::move(keys);
 	return seam;
 }
 
@@ -557,7 +481,6 @@ PhysicalOperator &PlanCrossingRemote(ClientContext &, PhysicalPlanGenerator &pla
 	unique_ptr<CrossingStreamSink> sink;
 	bool seam_ordered = false;
 	bool awaits_result = false;
-	CrossingRemoteKeyCheck keys;
 	if (seam) {
 		awaits_result = seam->awaits_result;
 		vector<idx_t> positions;
@@ -565,7 +488,6 @@ PhysicalOperator &PlanCrossingRemote(ClientContext &, PhysicalPlanGenerator &pla
 			positions.push_back(c);
 		}
 		seam_ordered = seam->ordered;
-		keys = std::move(seam->keys);
 		sink = make_uniq<CrossingStreamSink>(statement->Remote().Link(), slice.id, true, std::move(positions),
 		                                     std::move(seam->types), seam->ordered, seam->parallel, nullptr);
 	}
@@ -574,7 +496,7 @@ PhysicalOperator &PlanCrossingRemote(ClientContext &, PhysicalPlanGenerator &pla
 	statement->Add(std::move(slice), seam_ordered, seam_estimate);
 	auto &remote =
 	    planner.Make<PhysicalCrossingRemote>(std::move(types), statement, slice_id, ordered, std::move(columns),
-	                                         std::move(sink), std::move(keys), awaits_result, estimated_cardinality);
+	                                         std::move(sink), awaits_result, estimated_cardinality);
 	if (feed) {
 		remote.children.push_back(*feed);
 	}

@@ -2,6 +2,7 @@
 #include "internal/crossing_catalog.hpp"
 #include "internal/crossing_pass.hpp"
 #include "internal/crossing_transactions.hpp"
+#include "internal/far_plan.hpp"
 #include "internal/fill.hpp"
 
 #include "duckdb/main/config.hpp"
@@ -58,12 +59,11 @@ void RegisterCrossingPass(DatabaseInstance &db, const CrossingIdentity &identity
 	pass.optimize_function = CrossingNarrowPass;
 	pass.optimizer_info = make_shared_ptr<CrossingPassInfo>(identity);
 	OptimizerExtension::Register(config, pass);
-	RegisterCrossingPlanFunctions(db);
 	RegisterSourceDefaultFunction(db);
 }
 
-void RegisterCrossing(ExtensionLoader &loader, const string &type, const CrossingIdentity &identity,
-                      CrossingSourceFactory factory) {
+void RegisterCrossing(ExtensionLoader &loader, const string &type, CrossingSourceFactory factory,
+                      const CrossingIdentity &identity) {
 	auto ext = make_shared_ptr<StorageExtension>();
 	ext->attach = AttachCrossingCatalog;
 	ext->create_transaction_manager = CreateCrossingTransactionManager;
@@ -72,6 +72,7 @@ void RegisterCrossing(ExtensionLoader &loader, const string &type, const Crossin
 	auto &db = loader.GetDatabaseInstance();
 	StorageExtension::Register(DBConfig::GetConfig(db), type, std::move(ext));
 	RegisterCrossingPass(db, identity);
+	RegisterCrossingFarFunctions(db);
 }
 
 } // namespace duckdb

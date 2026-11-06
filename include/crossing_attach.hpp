@@ -2,7 +2,7 @@
 
 // What a catalog needs from crossing to serve one attached source. Own one per ATTACH, from
 // whatever Catalog base you choose, and forward table lookups and transaction ends to it. The
-// catalog crossing ships (Crossing<S>::Register) is one such owner; see IMPLEMENTING.md.
+// catalog crossing ships (RegisterCrossing) is one such owner; see IMPLEMENTING.md.
 
 #include "crossing.hpp"
 
@@ -16,6 +16,11 @@ namespace duckdb {
 class AttachedDatabase;
 class CrossingRemote;
 class CrossingRemoteStatement;
+class CrossingLink;
+struct CreateInfo;
+struct CreateViewInfo;
+struct AlterInfo;
+struct DropInfo;
 class Catalog;
 class CatalogEntry;
 class SchemaCatalogEntry;
@@ -32,6 +37,32 @@ public:
 	virtual CrossingAttach &Attach() = 0;
 };
 
+//! A DDL statement, as the attach authorizes it and far runs it.
+struct CrossingDdl {
+	CrossingVerb verb;
+	string schema;
+	string table;
+	optional_ptr<const CreateInfo> create;
+	optional_ptr<const AlterInfo> alter;
+	optional_ptr<const DropInfo> drop;
+	//! A CREATE VIEW's body, floors only, and the view's column names.
+	optional_ptr<const LogicalOperator> plan;
+	vector<string> view_columns;
+};
+
+//! A view's column names: its alias where given, else what its body names.
+vector<string> CrossingViewColumnNames(const CreateViewInfo &view);
+
+//! A transaction's far side, from Release until Commit or Rollback.
+struct CrossingOpenTransaction {
+	CrossingOpenTransaction();
+	~CrossingOpenTransaction();
+
+	unique_ptr<CrossingRemote> remote;
+	unique_ptr<CrossingLink> link;
+	vector<string> altered_schemas;
+};
+
 class CrossingAttach {
 public:
 	CrossingAttach(AttachedDatabase &db, unique_ptr<CrossingSource> source);
@@ -40,10 +71,6 @@ public:
 	CrossingAttach &operator=(const CrossingAttach &) = delete;
 
 	CrossingSource &Source();
-	template <class S>
-	S &Source() {
-		return Crossing<S>::Native(Source());
-	}
 	const CrossingIdentity &Identity() const;
 	AttachedDatabase &Database();
 
@@ -82,15 +109,13 @@ public:
 	PhysicalOperator &PlanCreateTableAs(ClientContext &context, PhysicalPlanGenerator &planner, LogicalCreateTable &op,
 	                                    PhysicalOperator &plan);
 
-	CrossingSession &Session(ClientContext &context, Transaction &transaction);
-	//! The statement `context` is planning, when the session runs over a link; null otherwise.
+	//! The statement `context` is planning.
 	shared_ptr<CrossingRemoteStatement> RemoteStatement(ClientContext &context, Transaction &transaction);
-	//! Hands the source's side back; null when the transaction never touched the source. Call this
-	//! before a base transaction manager frees `transaction`, and hand the result to Commit or
-	//! Rollback: a schema the transaction changed is forgotten once the source has resolved it.
-	unique_ptr<CrossingSession> Release(Transaction &transaction);
-	ErrorData Commit(unique_ptr<CrossingSession> released);
-	void Rollback(unique_ptr<CrossingSession> released);
+	//! Hands the transaction's far side back; null when it never touched far. Call this before a base transaction
+	//! manager frees `transaction`, and hand the result to Commit or Rollback.
+	unique_ptr<CrossingOpenTransaction> Release(Transaction &transaction);
+	ErrorData Commit(unique_ptr<CrossingOpenTransaction> released);
+	void Rollback(unique_ptr<CrossingOpenTransaction> released);
 	ErrorData Commit(Transaction &transaction);
 	void Rollback(Transaction &transaction);
 
@@ -116,7 +141,7 @@ private:
 	};
 	struct Slot {
 		mutex lock;
-		unique_ptr<CrossingSession> session;
+		unique_ptr<CrossingLink> link;
 		unique_ptr<CrossingRemote> remote;
 		shared_ptr<CrossingRemoteStatement> statement;
 		idx_t statement_query = 0;
@@ -129,9 +154,10 @@ private:
 	optional_ptr<Slot> SlotOf(optional_ptr<Transaction> transaction);
 	optional_ptr<Overlay> OverlayOf(optional_ptr<Transaction> transaction, const string &schema);
 	void Authorize(SchemaCatalogEntry &owner, const CrossingDdl &ddl, optional_ptr<Transaction> transaction);
-	void Settled(CrossingSession &released);
+	void Settled(CrossingOpenTransaction &released);
 	void NoteAltered(Transaction &transaction, const string &schema);
-	unique_ptr<CrossingRemote> TakeRemote(CrossingSession &released);
+	CrossingRemote &RemoteOf(ClientContext &context, Transaction &transaction);
+	unique_ptr<CrossingOpenTransaction> TakeOpen(Slot &slot);
 
 	//! Applies queued Refresh calls. Caller holds schemas_lock.
 	void ApplyRefreshes();
@@ -168,8 +194,6 @@ private:
 	case_insensitive_set_t refresh_schemas;
 	mutex transactions_lock;
 	unordered_map<Transaction *, unique_ptr<Slot>> begun;
-	unordered_map<CrossingSession *, vector<string>> settling;
-	unordered_map<CrossingSession *, unique_ptr<CrossingRemote>> released_remotes;
 };
 
 } // namespace duckdb

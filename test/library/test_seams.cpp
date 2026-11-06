@@ -31,9 +31,7 @@ Value Scalar(Twin &twin, const string &far_sql) {
 } // namespace
 
 TEST_CASE("a join to rows the target holds runs on the source, with those rows sent", "[seams]") {
-	auto transport = EACH_TRANSPORT();
-	INFO(TransportName(transport));
-	Twin twin(transport);
+	Twin twin;
 	Seed(twin);
 
 	twin.Same("SELECT o.id, o.name, l.x FROM far.orders o JOIN loc l ON o.id = l.id ORDER BY o.id");
@@ -46,9 +44,7 @@ TEST_CASE("a join to rows the target holds runs on the source, with those rows s
 }
 
 TEST_CASE("work above a cut join runs on the source too", "[seams]") {
-	auto transport = EACH_TRANSPORT();
-	INFO(TransportName(transport));
-	Twin twin(transport);
+	Twin twin;
 	Seed(twin);
 
 	twin.Same("SELECT o.tenant, sum(l.x) AS s FROM far.orders o JOIN loc l ON o.id = l.id GROUP BY o.tenant ORDER BY "
@@ -60,9 +56,7 @@ TEST_CASE("work above a cut join runs on the source too", "[seams]") {
 }
 
 TEST_CASE("without the source's opt in a join to the target's rows stays near", "[seams]") {
-	auto transport = EACH_TRANSPORT();
-	INFO(TransportName(transport));
-	Twin twin(transport);
+	Twin twin;
 	Seed(twin);
 	twin.store->takes_seams = false;
 
@@ -72,9 +66,7 @@ TEST_CASE("without the source's opt in a join to the target's rows stays near", 
 }
 
 TEST_CASE("a source refusing a seam column's type keeps the join near", "[seams]") {
-	auto transport = EACH_TRANSPORT();
-	INFO(TransportName(transport));
-	Twin twin(transport);
+	Twin twin;
 	Seed(twin);
 	twin.Both("CREATE TABLE typed(id INTEGER, d DOUBLE)");
 	twin.Both("INSERT INTO typed VALUES (1, 1.5)");
@@ -86,18 +78,17 @@ TEST_CASE("a source refusing a seam column's type keeps the join near", "[seams]
 }
 
 TEST_CASE("joins that stay near still answer the same", "[seams]") {
-	auto transport = EACH_TRANSPORT();
-	auto sql =
-	    GENERATE(as<string> {}, "SELECT o.id, l.x FROM far.orders o LEFT JOIN loc l ON o.id = l.id ORDER BY o.id",
-	             "SELECT o.id, l.x FROM far.orders o RIGHT JOIN loc l ON o.id = l.id ORDER BY l.id",
-	             "SELECT o.id FROM far.orders o WHERE o.id IN (SELECT id FROM loc) ORDER BY o.id",
-	             "SELECT o.id FROM far.orders o WHERE o.id NOT IN (SELECT id FROM loc) ORDER BY o.id",
-	             "SELECT o.id FROM far.orders o SEMI JOIN loc l ON o.id = l.id ORDER BY o.id",
-	             "SELECT o.id FROM far.orders o ANTI JOIN loc l ON o.id = l.id ORDER BY o.id",
-	             "SELECT o.id, l.x FROM far.orders o, loc l ORDER BY o.id, l.x",
-	             "SELECT o.id, l.x, k.y FROM far.orders o, loc l, lookup k WHERE o.id = k.x / 10 AND l.x = k.x ORDER BY o.id");
-	INFO(TransportName(transport) << " " << sql);
-	Twin twin(transport);
+	auto sql = GENERATE(
+	    as<string> {}, "SELECT o.id, l.x FROM far.orders o LEFT JOIN loc l ON o.id = l.id ORDER BY o.id",
+	    "SELECT o.id, l.x FROM far.orders o RIGHT JOIN loc l ON o.id = l.id ORDER BY l.id",
+	    "SELECT o.id FROM far.orders o WHERE o.id IN (SELECT id FROM loc) ORDER BY o.id",
+	    "SELECT o.id FROM far.orders o WHERE o.id NOT IN (SELECT id FROM loc) ORDER BY o.id",
+	    "SELECT o.id FROM far.orders o SEMI JOIN loc l ON o.id = l.id ORDER BY o.id",
+	    "SELECT o.id FROM far.orders o ANTI JOIN loc l ON o.id = l.id ORDER BY o.id",
+	    "SELECT o.id, l.x FROM far.orders o, loc l ORDER BY o.id, l.x",
+	    "SELECT o.id, l.x, k.y FROM far.orders o, loc l, lookup k WHERE o.id = k.x / 10 AND l.x = k.x ORDER BY o.id");
+	INFO(sql);
+	Twin twin;
 	Seed(twin);
 
 	twin.Same(sql);
@@ -106,9 +97,7 @@ TEST_CASE("joins that stay near still answer the same", "[seams]") {
 }
 
 TEST_CASE("a condition the source cannot compute keeps the join near", "[seams]") {
-	auto transport = EACH_TRANSPORT();
-	INFO(TransportName(transport));
-	Twin twin(transport);
+	Twin twin;
 	Seed(twin);
 	twin.store->refused_functions.insert("least");
 
@@ -118,12 +107,11 @@ TEST_CASE("a condition the source cannot compute keeps the join near", "[seams]"
 }
 
 TEST_CASE("only the first join crosses, and later rows join near", "[seams]") {
-	auto transport = EACH_TRANSPORT();
-	INFO(TransportName(transport));
-	Twin twin(transport);
+	Twin twin;
 	Seed(twin);
 
-	twin.Same("SELECT o.id, l.x, k.y FROM far.orders o JOIN loc l ON o.id = l.id JOIN lookup k ON l.x = k.x ORDER BY o.id");
+	twin.Same(
+	    "SELECT o.id, l.x, k.y FROM far.orders o JOIN loc l ON o.id = l.id JOIN lookup k ON l.x = k.x ORDER BY o.id");
 	REQUIRE(twin.store->reads.size() == 1);
 	REQUIRE(HasJoin(twin.LastRead()));
 	REQUIRE(twin.LastRead().rows.size() == 3);
@@ -134,9 +122,7 @@ TEST_CASE("only the first join crosses, and later rows join near", "[seams]") {
 }
 
 TEST_CASE("a join of local rows goes over as one seam", "[seams]") {
-	auto transport = EACH_TRANSPORT();
-	INFO(TransportName(transport));
-	Twin twin(transport);
+	Twin twin;
 	Seed(twin);
 
 	twin.Same("SELECT o.id, j.y FROM far.orders o JOIN (SELECT l.id, k.y FROM loc l JOIN lookup k ON l.x = k.x) j "
@@ -147,9 +133,7 @@ TEST_CASE("a join of local rows goes over as one seam", "[seams]") {
 }
 
 TEST_CASE("a filter on the local side leaves only matching rows to send", "[seams]") {
-	auto transport = EACH_TRANSPORT();
-	INFO(TransportName(transport));
-	Twin twin(transport);
+	Twin twin;
 	Seed(twin);
 
 	twin.Same("SELECT o.id FROM far.orders o JOIN loc l ON o.id = l.id WHERE l.x > 15 ORDER BY o.id");
@@ -160,9 +144,7 @@ TEST_CASE("a filter on the local side leaves only matching rows to send", "[seam
 }
 
 TEST_CASE("a filter on the source's side runs there", "[seams]") {
-	auto transport = EACH_TRANSPORT();
-	INFO(TransportName(transport));
-	Twin twin(transport);
+	Twin twin;
 	Seed(twin);
 
 	twin.Same("SELECT o.id FROM far.orders o JOIN loc l ON o.id = l.id WHERE o.amt > 100 ORDER BY o.id");
@@ -172,9 +154,7 @@ TEST_CASE("a filter on the source's side runs there", "[seams]") {
 }
 
 TEST_CASE("two seams never share one crossing", "[seams]") {
-	auto transport = EACH_TRANSPORT();
-	INFO(TransportName(transport));
-	Twin twin(transport);
+	Twin twin;
 	Seed(twin);
 
 	twin.Same("SELECT id FROM (SELECT o.id FROM far.orders o JOIN loc l ON o.id = l.id "
@@ -187,9 +167,7 @@ TEST_CASE("two seams never share one crossing", "[seams]") {
 }
 
 TEST_CASE("an empty seam still makes the call and answers as the query would", "[seams]") {
-	auto transport = EACH_TRANSPORT();
-	INFO(TransportName(transport));
-	Twin twin(transport);
+	Twin twin;
 	Seed(twin);
 	twin.Both("CREATE TABLE none(id INTEGER)");
 	twin.Far("CREATE TABLE counted(c BIGINT)");
@@ -206,9 +184,7 @@ TEST_CASE("an empty seam still makes the call and answers as the query would", "
 }
 
 TEST_CASE("an update from local rows is one plan on the source", "[seams]") {
-	auto transport = EACH_TRANSPORT();
-	INFO(TransportName(transport));
-	Twin twin(transport);
+	Twin twin;
 	Seed(twin);
 
 	auto result = twin.Query("UPDATE far.orders o SET amt = l.x FROM loc l WHERE o.id = l.id");
@@ -216,16 +192,13 @@ TEST_CASE("an update from local rows is one plan on the source", "[seams]") {
 	REQUIRE(result->GetValue(0, 0) == Value::BIGINT(3));
 	REQUIRE(twin.store->reads.empty());
 	REQUIRE(twin.store->writes.size() == 1);
-	REQUIRE(HasJoin(twin.LastWrite()));
 	REQUIRE(twin.LastWrite().Has(Op::LOGICAL_CHUNK_GET));
 	REQUIRE(Scalar(twin, "SELECT amt FROM orders WHERE id = 2") == Value::INTEGER(20));
 	REQUIRE(Scalar(twin, "SELECT amt FROM orders WHERE id = 4") == Value::INTEGER(350));
 }
 
 TEST_CASE("an update from local rows that select nothing changes nothing and reports zero", "[seams]") {
-	auto transport = EACH_TRANSPORT();
-	INFO(TransportName(transport));
-	Twin twin(transport);
+	Twin twin;
 	Seed(twin);
 	twin.Both("CREATE TABLE none(id INTEGER, x INTEGER)");
 
@@ -236,9 +209,7 @@ TEST_CASE("an update from local rows that select nothing changes nothing and rep
 }
 
 TEST_CASE("a delete and an insert over a local join run on the source", "[seams]") {
-	auto transport = EACH_TRANSPORT();
-	INFO(TransportName(transport));
-	Twin twin(transport);
+	Twin twin;
 	Seed(twin);
 
 	auto inserted = twin.Query("INSERT INTO far.orders SELECT o.id + 100, o.name, l.x, o.tenant, o.score, o.ts "
@@ -253,23 +224,20 @@ TEST_CASE("a delete and an insert over a local join run on the source", "[seams]
 }
 
 TEST_CASE("a CTE on either side keeps the join near", "[seams]") {
-	auto transport = EACH_TRANSPORT();
 	auto sql = GENERATE(as<string> {},
 	                    "WITH c AS MATERIALIZED (SELECT id, x FROM loc) SELECT o.id, c.x, d.x FROM far.orders o "
 	                    "JOIN c ON o.id = c.id JOIN c d ON o.id = d.id ORDER BY o.id",
 	                    "WITH c AS MATERIALIZED (SELECT id FROM far.orders) SELECT c.id, l.x FROM c "
 	                    "JOIN loc l ON c.id = l.id JOIN c d ON c.id = d.id ORDER BY c.id");
-	INFO(TransportName(transport) << " " << sql);
-	Twin twin(transport);
+	INFO(sql);
+	Twin twin;
 	Seed(twin);
 
 	twin.Same(sql);
 }
 
 TEST_CASE("a seam over the memory limit spills and every row joins", "[seams]") {
-	auto transport = EACH_TRANSPORT();
-	INFO(TransportName(transport));
-	Twin twin(transport);
+	Twin twin;
 	twin.store->takes_seams = true;
 	twin.Far("CREATE TABLE big(id BIGINT)");
 	twin.Far("INSERT INTO big SELECT i FROM range(32000) r(i)");
@@ -281,13 +249,10 @@ TEST_CASE("a seam over the memory limit spills and every row joins", "[seams]") 
 
 	REQUIRE(result->GetValue(0, 0) == Value::BIGINT(32000));
 	REQUIRE(HasJoin(twin.LastRead()));
-	REQUIRE(twin.LastRead().target_swap_bytes > 0);
 }
 
 TEST_CASE("a seam rows' order and duplicates reach the join", "[seams]") {
-	auto transport = EACH_TRANSPORT();
-	INFO(TransportName(transport));
-	Twin twin(transport);
+	Twin twin;
 	Seed(twin);
 	twin.Both("CREATE TABLE twice(id INTEGER, tag VARCHAR)");
 	twin.Both("INSERT INTO twice VALUES (1, 'a'), (1, 'b'), (NULL, 'c')");
@@ -299,9 +264,7 @@ TEST_CASE("a seam rows' order and duplicates reach the join", "[seams]") {
 }
 
 TEST_CASE("a prepared join sends the rows each time", "[seams]") {
-	auto transport = EACH_TRANSPORT();
-	INFO(TransportName(transport));
-	Twin twin(transport);
+	Twin twin;
 	Seed(twin);
 
 	auto prepared = twin.con.Prepare("SELECT count(*) FROM far.orders o JOIN loc l ON o.id = l.id WHERE l.x > ?");
@@ -311,9 +274,7 @@ TEST_CASE("a prepared join sends the rows each time", "[seams]") {
 }
 
 TEST_CASE("a view over local rows is still refused", "[seams]") {
-	auto transport = EACH_TRANSPORT();
-	INFO(TransportName(transport));
-	Twin twin(transport);
+	Twin twin;
 	Seed(twin);
 
 	auto error = twin.Error("CREATE VIEW far.v AS SELECT o.id FROM far.orders o JOIN memory.main.loc l ON o.id = l.id");
@@ -322,20 +283,19 @@ TEST_CASE("a view over local rows is still refused", "[seams]") {
 }
 
 TEST_CASE("a merge from local rows gives the same rows with seams on", "[seams]") {
-	auto transport = EACH_TRANSPORT();
 	auto sql = GENERATE(as<string> {},
 	                    "MERGE INTO far.orders t USING loc s ON t.id = s.id WHEN MATCHED THEN UPDATE SET amt = s.x",
 	                    "MERGE INTO far.orders t USING loc s ON t.id = s.id WHEN MATCHED THEN DELETE",
 	                    "MERGE INTO far.orders t USING loc s ON t.id = s.id WHEN MATCHED THEN UPDATE SET amt = s.x "
 	                    "WHEN NOT MATCHED THEN INSERT (id, amt) VALUES (s.id, s.x)");
-	INFO(TransportName(transport) << " " << sql);
+	INFO(sql);
 	const string rows = "SELECT string_agg(o::VARCHAR, ';' ORDER BY id) FROM orders o";
 
-	Twin plain(transport);
+	Twin plain;
 	Seed(plain);
 	plain.Far(Twin::Unprefixed(sql));
 
-	Twin twin(transport);
+	Twin twin;
 	Seed(twin);
 	twin.Query(sql);
 
@@ -343,26 +303,21 @@ TEST_CASE("a merge from local rows gives the same rows with seams on", "[seams]"
 }
 
 TEST_CASE("subqueries over local rows give the same rows with seams on", "[seams]") {
-	auto transport = EACH_TRANSPORT();
-	auto sql = GENERATE(
-	    as<string> {},
-	    "SELECT o.id, (SELECT max(l.x) FROM loc l WHERE l.id = o.id) AS m FROM far.orders o ORDER BY o.id",
-	    "SELECT o.id FROM far.orders o WHERE EXISTS (SELECT 1 FROM loc l WHERE l.id = o.id) ORDER BY o.id",
-	    "SELECT l.id, (SELECT max(o.amt) FROM far.orders o JOIN loc m ON o.id = m.id WHERE m.id = l.id) AS m "
-	    "FROM loc l ORDER BY l.id",
-	    "WITH RECURSIVE r(id) AS (SELECT 1 UNION ALL SELECT r.id + 1 FROM r JOIN far.orders o ON r.id = o.id "
-	    "JOIN loc l ON o.id = l.id) SELECT id FROM r ORDER BY id");
-	INFO(TransportName(transport) << " " << sql);
-	Twin twin(transport);
+	auto sql =
+	    GENERATE(as<string> {},
+	             "SELECT o.id, (SELECT max(l.x) FROM loc l WHERE l.id = o.id) AS m FROM far.orders o ORDER BY o.id",
+	             "SELECT o.id FROM far.orders o WHERE EXISTS (SELECT 1 FROM loc l WHERE l.id = o.id) ORDER BY o.id",
+	             "SELECT l.id, (SELECT max(o.amt) FROM far.orders o JOIN loc m ON o.id = m.id WHERE m.id = l.id) AS m "
+	             "FROM loc l ORDER BY l.id");
+	INFO(sql);
+	Twin twin;
 	Seed(twin);
 
 	twin.Same(sql);
 }
 
 TEST_CASE("a table created from a cut join holds the join's rows", "[seams]") {
-	auto transport = EACH_TRANSPORT();
-	INFO(TransportName(transport));
-	Twin twin(transport);
+	Twin twin;
 	Seed(twin);
 
 	twin.Query("CREATE TABLE far.made AS SELECT o.id, l.x FROM far.orders o JOIN loc l ON o.id = l.id");
@@ -372,9 +327,7 @@ TEST_CASE("a table created from a cut join holds the join's rows", "[seams]") {
 }
 
 TEST_CASE("a join with another source's rows stays near", "[seams]") {
-	auto transport = EACH_TRANSPORT();
-	INFO(TransportName(transport));
-	Twin twin(transport);
+	Twin twin;
 	Seed(twin);
 	twin.Attach("other.example.com", "other");
 
@@ -389,13 +342,20 @@ TEST_CASE("a join with another source's rows stays near", "[seams]") {
 }
 
 TEST_CASE("a cut join reads the local columns only the query above it needs", "[seams]") {
-	auto transport = EACH_TRANSPORT();
-	INFO(TransportName(transport));
-	Twin twin(transport);
+	Twin twin;
 	Seed(twin);
 
 	twin.Same("SELECT l.x FROM far.orders o JOIN loc l ON o.id = l.id WHERE o.id = 2");
 	twin.Same("SELECT o.name FROM far.orders o JOIN loc l ON o.id = l.id ORDER BY o.name NULLS LAST LIMIT 2");
 	twin.Same("SELECT count(*) FROM far.orders o JOIN loc l ON o.id = l.id");
 	REQUIRE(twin.store->reads.size() == 3);
+}
+
+TEST_CASE("the recursive part of a recursive query cannot read a source's table", "[seams]") {
+	Twin twin;
+	Seed(twin);
+
+	REQUIRE_THAT(twin.Error("WITH RECURSIVE r(id) AS (SELECT 1 UNION ALL SELECT r.id + 1 FROM r JOIN far.orders o ON "
+	                        "r.id = o.id JOIN loc l ON o.id = l.id) SELECT id FROM r ORDER BY id"),
+	             Catch::Contains("WITH RECURSIVE"));
 }

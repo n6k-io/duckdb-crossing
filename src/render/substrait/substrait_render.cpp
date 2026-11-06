@@ -1,5 +1,6 @@
 #include "crossing.hpp"
 #include "crossing_substrait.hpp"
+#include "internal/floor.hpp"
 #include "internal/seam.hpp"
 #include "substrait_types.hpp"
 
@@ -837,7 +838,8 @@ private:
 		auto *items = yyjson_mut_arr(doc);
 		for (auto &column : get.GetColumnIds()) {
 			auto *item = yyjson_mut_obj(doc);
-			yyjson_mut_obj_add_uint(doc, item, "field", column.IsVirtualColumn() ? 0 : column.GetPrimaryIndex());
+			yyjson_mut_obj_add_uint(doc, item, "field",
+			                        column.IsVirtualColumn() ? get.names.size() : column.GetPrimaryIndex());
 			yyjson_mut_arr_add_val(items, item);
 		}
 		yyjson_mut_obj_add_val(doc, select, "structItems", items);
@@ -876,7 +878,7 @@ private:
 
 	yyjson_mut_val *RowsRead(LogicalColumnDataGet &get, vector<ColumnBinding> &out) {
 		auto *rows = yyjson_mut_arr(doc);
-		for (auto &chunk : SeamRowsOf(get)->Chunks()) {
+		for (auto &chunk : get.collection->Chunks()) {
 			for (idx_t r = 0; r < chunk.size(); r++) {
 				auto *fields = yyjson_mut_arr(doc);
 				for (idx_t c = 0; c < chunk.ColumnCount(); c++) {

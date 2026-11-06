@@ -5,6 +5,7 @@
 #include "duckdb/planner/subquery/recursive_dependent_join_planner.hpp"
 
 #include "internal/carrier.hpp"
+#include "internal/control_frames.hpp"
 #include "internal/crossing_remote.hpp"
 #include "internal/crossing_table_entry.hpp"
 #include "internal/crossing_write.hpp"
@@ -14,7 +15,10 @@
 #include "duckdb/catalog/catalog_entry/schema_catalog_entry.hpp"
 #include "duckdb/common/atomic.hpp"
 #include "duckdb/common/exception/catalog_exception.hpp"
+#include "duckdb/common/string_util.hpp"
+#include "duckdb/parser/parsed_data/alter_info.hpp"
 #include "duckdb/parser/parsed_data/create_table_info.hpp"
+#include "duckdb/parser/parsed_data/drop_info.hpp"
 #include "duckdb/parser/parsed_data/create_view_info.hpp"
 #include "duckdb/parser/statement/select_statement.hpp"
 #include "duckdb/planner/binder.hpp"
@@ -23,6 +27,9 @@
 #include <algorithm>
 
 namespace duckdb {
+
+CrossingOpenTransaction::CrossingOpenTransaction() = default;
+CrossingOpenTransaction::~CrossingOpenTransaction() = default;
 
 struct CrossingAttach::SchemaState {
 	mutex lock;
@@ -44,7 +51,7 @@ CrossingAttach::CrossingAttach(AttachedDatabase &db_p, unique_ptr<CrossingSource
 
 CrossingAttach::~CrossingAttach() {
 	for (auto &entry : begun) {
-		Rollback(std::move(entry.second->session));
+		Rollback(TakeOpen(*entry.second));
 	}
 }
 
@@ -137,7 +144,7 @@ auto CrossingAttach::WithTables(const string &schema, optional_ptr<Transaction> 
 		if (it != slot->overlays.end()) {
 			auto &overlay = it->second;
 			if (!overlay.listed) {
-				for (auto &table : slot->session->Tables(schema)) {
+				for (auto &table : slot->link->Tables(schema)) {
 					overlay.tables.insert(table);
 				}
 				overlay.listed = true;
@@ -240,7 +247,7 @@ CrossingTable CrossingAttach::DescribeAs(const string &schema, const string &nam
 	if (slot) {
 		lock_guard<mutex> guard(slot->lock);
 		if (slot->overlays.find(schema) != slot->overlays.end()) {
-			return slot->session->Describe(schema, name);
+			return slot->link->Describe(schema, name);
 		}
 	}
 	return source->Describe(schema, name);
@@ -381,6 +388,27 @@ void CrossingAttach::Authorize(SchemaCatalogEntry &owner, const CrossingDdl &ddl
 	}
 }
 
+namespace {
+
+string DdlFrame(const CrossingDdl &ddl) {
+	if (ddl.plan) {
+		string frame = string(CROSSING_CONTROL_VIEW) + ddl.schema + "\n" + ddl.table + "\n" +
+		               to_string(static_cast<uint8_t>(ddl.create->on_conflict)) + "\n" +
+		               StringUtil::Join(ddl.view_columns, ",") + "\n";
+		return frame + RenderSubstraitJson(*ddl.plan);
+	}
+	switch (ddl.verb) {
+	case CrossingVerb::CREATE:
+		return ddl.create->ToString();
+	case CrossingVerb::ALTER:
+		return ddl.alter->ToString();
+	default:
+		return ddl.drop->ToString();
+	}
+}
+
+} // namespace
+
 void CrossingAttach::Pin(const string &schema, SchemaCatalogEntry &owner, const string &table) {
 	LookupTable(schema, owner, table, nullptr);
 }
@@ -389,7 +417,7 @@ void CrossingAttach::Ddl(ClientContext &context, Transaction &transaction, Schem
                          const CrossingDdl &ddl) {
 	Authorize(owner, ddl, &transaction);
 	Pin(ddl.schema, owner, ddl.table);
-	Session(context, transaction).Ddl(context, ddl);
+	RemoteOf(context, transaction).RunDdl(DdlFrame(ddl));
 	NoteAltered(transaction, ddl.schema);
 }
 
@@ -431,7 +459,7 @@ optional_ptr<CatalogEntry> CrossingAttach::CreateView(ClientContext &context, Tr
 	// A view outlives this statement, so now() in its rows must not be frozen at creation; those rows do not
 	// fold and the view is refused below.
 	MaterialiseConstantRows(context, bound.plan, true);
-	ResolveKeyAliases(*bound.plan, identity);
+	ResolveRowIds(*bound.plan, identity);
 	FoldCrossableWorkIntoFragments(bound.plan, fresh, identity,
 	                               Settings::Get<ScalarSubqueryErrorOnMultipleRowsSetting>(context), false);
 	auto fragment = CrossingReadFragmentOf(*bound.plan, identity);
@@ -449,6 +477,7 @@ optional_ptr<CatalogEntry> CrossingAttach::CreateView(ClientContext &context, Tr
 	ddl.table = view_name;
 	ddl.create = &info;
 	ddl.plan = fragment->plan.get();
+	ddl.view_columns = CrossingViewColumnNames(info);
 	Ddl(context, transaction, owner, ddl);
 	return LookupTable(schema_name, owner, view_name, &transaction);
 }
@@ -462,41 +491,44 @@ CrossingAttach::Slot &CrossingAttach::SlotOf(Transaction &transaction) {
 	return *slot;
 }
 
-shared_ptr<CrossingRemoteStatement> CrossingAttach::RemoteStatement(ClientContext &context, Transaction &transaction) {
-	auto link = Session(context, transaction).Link(context);
-	if (!link) {
-		return nullptr;
-	}
+CrossingRemote &CrossingAttach::RemoteOf(ClientContext &context, Transaction &transaction) {
 	auto &slot = SlotOf(transaction);
 	lock_guard<mutex> guard(slot.lock);
 	if (!slot.remote) {
-		slot.remote = make_uniq<CrossingRemote>(*link);
+		slot.link = source->Connect(context);
+		if (!slot.link) {
+			throw InternalException("crossing: the source connected no link");
+		}
+		slot.remote = make_uniq<CrossingRemote>(*slot.link);
 	}
+	return *slot.remote;
+}
+
+shared_ptr<CrossingRemoteStatement> CrossingAttach::RemoteStatement(ClientContext &context, Transaction &transaction) {
+	auto &remote = RemoteOf(context, transaction);
+	auto &slot = SlotOf(transaction);
+	lock_guard<mutex> guard(slot.lock);
 	auto query = context.transaction.GetActiveQuery();
 	if (!slot.statement || slot.statement_query != query) {
-		slot.remote->DrainStatement();
-		slot.statement = make_shared_ptr<CrossingRemoteStatement>(*slot.remote);
+		remote.DrainStatement();
+		slot.statement = make_shared_ptr<CrossingRemoteStatement>(remote);
 		slot.statement_query = query;
 	}
 	return slot.statement;
 }
 
-CrossingSession &CrossingAttach::Session(ClientContext &context, Transaction &transaction) {
-	auto &slot = SlotOf(transaction);
-	lock_guard<mutex> guard(slot.lock);
-	if (slot.remote && slot.statement_query != context.transaction.GetActiveQuery()) {
-		slot.remote->DrainStatement();
+unique_ptr<CrossingOpenTransaction> CrossingAttach::TakeOpen(Slot &slot) {
+	if (!slot.remote) {
+		return nullptr;
 	}
-	if (!slot.session) {
-		slot.session = source->Begin(context);
-		if (!slot.session) {
-			throw InternalException("crossing: the source began no session");
-		}
-	}
-	return *slot.session;
+	auto open = make_uniq<CrossingOpenTransaction>();
+	open->link = std::move(slot.link);
+	open->remote = std::move(slot.remote);
+	slot.statement = nullptr;
+	return open;
 }
 
-unique_ptr<CrossingSession> CrossingAttach::Release(Transaction &transaction) {
+unique_ptr<CrossingOpenTransaction> CrossingAttach::Release(Transaction &transaction) {
 	unique_ptr<Slot> slot;
 	{
 		lock_guard<mutex> guard(transactions_lock);
@@ -508,16 +540,12 @@ unique_ptr<CrossingSession> CrossingAttach::Release(Transaction &transaction) {
 		begun.erase(it);
 	}
 	lock_guard<mutex> guard(slot->lock);
-	if (!slot->altered_schemas.empty()) {
-		lock_guard<mutex> settling_guard(transactions_lock);
-		settling[slot->session.get()] = std::move(slot->altered_schemas);
+	auto open = TakeOpen(*slot);
+	if (!slot->altered_schemas.empty() && open) {
+		open->altered_schemas = std::move(slot->altered_schemas);
 	}
 	Retire(*slot);
-	if (slot->remote) {
-		lock_guard<mutex> settling_guard(transactions_lock);
-		released_remotes[slot->session.get()] = std::move(slot->remote);
-	}
-	return std::move(slot->session);
+	return open;
 }
 
 void CrossingAttach::Retire(Slot &slot) {
@@ -535,67 +563,33 @@ void CrossingAttach::Retire(Slot &slot) {
 	slot.overlays.clear();
 }
 
-void CrossingAttach::Settled(CrossingSession &released) {
-	vector<string> altered;
-	{
-		lock_guard<mutex> guard(transactions_lock);
-		auto it = settling.find(&released);
-		if (it == settling.end()) {
-			return;
-		}
-		altered = std::move(it->second);
-		settling.erase(it);
-	}
-	for (auto &schema : altered) {
+void CrossingAttach::Settled(CrossingOpenTransaction &released) {
+	for (auto &schema : released.altered_schemas) {
 		Refresh(schema);
 	}
 }
 
-unique_ptr<CrossingRemote> CrossingAttach::TakeRemote(CrossingSession &released) {
-	lock_guard<mutex> guard(transactions_lock);
-	auto it = released_remotes.find(&released);
-	if (it == released_remotes.end()) {
-		return nullptr;
-	}
-	auto remote = std::move(it->second);
-	released_remotes.erase(it);
-	return remote;
-}
-
-ErrorData CrossingAttach::Commit(unique_ptr<CrossingSession> released) {
+ErrorData CrossingAttach::Commit(unique_ptr<CrossingOpenTransaction> released) {
 	if (!released) {
 		return ErrorData();
 	}
 	ErrorData error;
 	try {
-		if (auto remote = TakeRemote(*released)) {
-			remote->Commit();
-		}
-		released->Commit();
+		released->remote->Commit();
 	} catch (std::exception &ex) {
 		ErrorData failure(ex);
 		error = ErrorData(failure.Type(), "crossing: commit on source failed: " + failure.RawMessage());
-		try {
-			released->Rollback();
-		} catch (...) {
-		}
 	}
 	Settled(*released);
 	return error;
 }
 
-void CrossingAttach::Rollback(unique_ptr<CrossingSession> released) {
+void CrossingAttach::Rollback(unique_ptr<CrossingOpenTransaction> released) {
 	if (!released) {
 		return;
 	}
 	try {
-		if (auto remote = TakeRemote(*released)) {
-			remote->Rollback();
-		}
-	} catch (...) {
-	}
-	try {
-		released->Rollback();
+		released->remote->Rollback();
 	} catch (...) {
 	}
 	Settled(*released);

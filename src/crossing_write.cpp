@@ -2,8 +2,6 @@
 
 #include "internal/crossing_remote.hpp"
 #include "internal/fill.hpp"
-#include "internal/key_check.hpp"
-#include "internal/parking.hpp"
 #include "internal/seam.hpp"
 #include "internal/shaped_write.hpp"
 
@@ -14,10 +12,8 @@
 #include "duckdb/execution/physical_plan_generator.hpp"
 #include "duckdb/planner/expression/bound_columnref_expression.hpp"
 #include "duckdb/planner/expression/bound_comparison_expression.hpp"
-#include "duckdb/planner/expression/bound_conjunction_expression.hpp"
 #include "duckdb/planner/expression/bound_reference_expression.hpp"
 #include "duckdb/parser/parsed_data/create_table_info.hpp"
-#include "duckdb/planner/operator/logical_column_data_get.hpp"
 #include "duckdb/planner/operator/logical_create_table.hpp"
 #include "duckdb/planner/operator/logical_projection.hpp"
 #include "duckdb/planner/parsed_data/bound_create_table_info.hpp"
@@ -60,63 +56,6 @@ CrossingWriteNode WriteNodeOf(CrossingTableCatalogEntry &table, CrossingVerb ver
 	node.returning_types = seam.returning_types;
 	return node;
 }
-
-bool FeedIsBareSeam(const LogicalOperator &write_node) {
-	optional_ptr<const LogicalOperator> node = &write_node;
-	while (true) {
-		if (node->children.size() != 1) {
-			return false;
-		}
-		node = node->children[0].get();
-		if (node->type == LogicalOperatorType::LOGICAL_GET) {
-			return node->Cast<LogicalGet>().function.GetName() == CROSSING_SEAM_FUNCTION;
-		}
-		if (node->type != LogicalOperatorType::LOGICAL_PROJECTION) {
-			return false;
-		}
-	}
-}
-
-struct CrossingNearResult {
-	unique_ptr<CrossingSeamFilledWrite> write;
-	bool done = false;
-	idx_t affected_rows = 0;
-	unique_ptr<ColumnDataCollection> returned;
-
-	void Finish(const CrossingWritePull &pull) {
-		affected_rows = pull.affected_rows;
-		returned = write->TakeReturned();
-		write.reset();
-		done = true;
-	}
-};
-
-struct CrossingNearSinkState : public GlobalSinkState {
-	unique_ptr<ColumnDataCollection> rows;
-	value_set_t seen_keys;
-	idx_t keys_sent = 0;
-	CrossingNearResult result;
-};
-
-struct CrossingNearSourceState : public GlobalSourceState {
-	CrossingNearResult result;
-	bool emitted = false;
-	bool scanning = false;
-	ColumnDataScanState scan;
-	DataChunk scanned;
-};
-
-void SeeKey(value_set_t &seen_keys, DataChunk &chunk, const vector<idx_t> &key_positions, idx_t index) {
-	child_list_t<Value> key;
-	for (idx_t k = 0; k < key_positions.size(); k++) {
-		key.emplace_back(to_string(k), chunk.GetValue(key_positions[k], index));
-	}
-	seen_keys.insert(Value::STRUCT(std::move(key)));
-}
-
-struct CrossingWriteSourceState : public GlobalSourceState {
-	bool done = false;
-};
 
 constexpr idx_t REMOTE_TARGET_INDEX = idx_t(1) << 40;
 
@@ -165,17 +104,14 @@ CrossingRemoteSlice RemoteWriteSlice(CrossingRemoteStatement &statement, Crossin
 	}
 	unique_ptr<Expression> condition;
 	if (node.verb != CrossingVerb::INSERT) {
-		auto key_types = ColumnTypesByName(bind_data.table, node.key_columns);
-		for (idx_t k = 0; k < node.key_columns.size(); k++) {
-			auto column = bind_data.table.GetColumns().GetColumn(Identifier(node.key_columns[k])).Logical().index;
+		if (!node.key_columns.empty()) {
+			write->target_columns.push_back(CROSSING_ROW_ID_COLUMN);
 			auto left = make_uniq<BoundColumnRefExpression>(
-			    key_types[k], ColumnBinding(TableIndex(REMOTE_TARGET_INDEX), ProjectionIndex(column)));
-			auto right = make_uniq<BoundColumnRefExpression>(feed_types[k], bindings[k]);
-			auto same = BoundComparisonExpression::Create(ExpressionType::COMPARE_NOT_DISTINCT_FROM, std::move(left),
-			                                              std::move(right));
-			condition = condition ? make_uniq_base<Expression, BoundConjunctionExpression>(
-			                            ExpressionType::CONJUNCTION_AND, std::move(condition), std::move(same))
-			                      : std::move(same);
+			    LogicalType::ROW_TYPE,
+			    ColumnBinding(TableIndex(REMOTE_TARGET_INDEX), ProjectionIndex(write->target_columns.size() - 1)));
+			auto right = make_uniq<BoundColumnRefExpression>(feed_types[0], bindings[0]);
+			condition =
+			    BoundComparisonExpression::Create(ExpressionType::COMPARE_EQUAL, std::move(left), std::move(right));
 		}
 		for (idx_t i = 0; i < node.set_columns.size(); i++) {
 			auto position = node.key_columns.size() + i;
@@ -191,26 +127,6 @@ CrossingRemoteSlice RemoteWriteSlice(CrossingRemoteStatement &statement, Crossin
 	return slice;
 }
 
-CrossingRemoteKeyCheck RemoteKeyCheck(const CrossingBindData &bind_data) {
-	CrossingRemoteKeyCheck keys;
-	keys.key_positions = bind_data.key_positions;
-	keys.returning = !bind_data.seam.returning_columns.empty();
-	keys.table = bind_data.SourceTable();
-	keys.key_columns = bind_data.seam.key_columns;
-	keys.verb = CrossingVerbName(bind_data.verb);
-	return keys;
-}
-
-void TellPlanned(ClientContext &context, const CrossingBindData &bind_data) {
-	auto &catalog = bind_data.table.ParentCatalog();
-	auto &fragment = *bind_data.fragment;
-	CrossingQuery query(*fragment.plan);
-	query.types = bind_data.seam.returning_columns.empty() ? vector<LogicalType> {LogicalType::BIGINT}
-	                                                       : bind_data.seam.returning_types;
-	query.tables = CrossingTablesOf(*fragment.plan);
-	CrossingAttach::Of(catalog).Session(context, Transaction::Get(context, catalog)).Planned(query);
-}
-
 //! `emit` says, for each output column, which of the columns far returns it is.
 CrossingRemoteColumns RemoteWriteColumns(const CrossingBindData &bind_data, const vector<optional_idx> &emit) {
 	CrossingRemoteColumns columns;
@@ -223,8 +139,7 @@ CrossingRemoteColumns RemoteWriteColumns(const CrossingBindData &bind_data, cons
 }
 
 PhysicalOperator &PlanMergeWrite(PhysicalPlanGenerator &planner, LogicalMergeInto &op, ClientContext &context,
-                                 CrossingTableCatalogEntry &table, CrossingVerb verb, CrossingSeam seam,
-                                 vector<idx_t> key_positions) {
+                                 CrossingTableCatalogEntry &table, CrossingVerb verb, CrossingSeam seam) {
 	auto types = op.types;
 	vector<optional_idx> emit;
 	if (op.return_chunk) {
@@ -239,23 +154,17 @@ PhysicalOperator &PlanMergeWrite(PhysicalPlanGenerator &planner, LogicalMergeInt
 	}
 	auto fragment = PlanWriteFragment(table, verb, seam);
 	auto bind_data = MakeWriteBindData(table, verb, std::move(seam), std::move(fragment));
-	bind_data->key_positions = std::move(key_positions);
 	auto &catalog = table.ParentCatalog();
 	auto statement = CrossingAttach::Of(catalog).RemoteStatement(context, Transaction::Get(context, catalog));
-	if (statement) {
-		TellPlanned(context, *bind_data);
-		auto columns = RemoteWriteColumns(*bind_data, emit);
-		auto seam_sink = make_uniq<CrossingRemoteSeamSink>();
-		seam_sink->types = bind_data->fragment->seam_types;
-		seam_sink->keys = RemoteKeyCheck(*bind_data);
-		seam_sink->awaits_result = !op.return_chunk;
-		auto slice = RemoteWriteSlice(*statement, *bind_data);
-		return PlanCrossingRemote(context, planner, std::move(types), std::move(statement), std::move(slice),
-		                          std::move(columns), std::move(seam_sink), nullptr, optional_idx(),
-		                          op.EstimateCardinality(context));
-	}
-	return planner.Make<CrossingNear>(std::move(types), std::move(emit), std::move(bind_data),
-	                                  op.EstimateCardinality(context));
+	table.source.Planned(*bind_data->fragment->plan);
+	auto columns = RemoteWriteColumns(*bind_data, emit);
+	auto seam_sink = make_uniq<CrossingRemoteSeamSink>();
+	seam_sink->types = bind_data->fragment->seam_types;
+	seam_sink->awaits_result = !op.return_chunk;
+	auto slice = RemoteWriteSlice(*statement, *bind_data);
+	return PlanCrossingRemote(context, planner, std::move(types), std::move(statement), std::move(slice),
+	                          std::move(columns), std::move(seam_sink), nullptr, optional_idx(),
+	                          op.EstimateCardinality(context));
 }
 
 unique_ptr<MergeIntoOperator> PlanCrossingMergeAction(ClientContext &context, LogicalMergeInto &op,
@@ -271,14 +180,7 @@ unique_ptr<MergeIntoOperator> PlanCrossingMergeAction(ClientContext &context, Lo
 		auto verb = action.action_type == MergeActionType::MERGE_UPDATE ? CrossingVerb::UPDATE : CrossingVerb::DELETE_;
 		RequireVerb(table, verb);
 		auto seam = SeamOf(table, table.described, verb, SetColumnNames(table, action.columns));
-		auto key_types = ColumnTypesByName(table, seam.key_columns);
-		vector<idx_t> key_positions;
-		for (idx_t k = 0; k < key_types.size(); k++) {
-			result->expressions.push_back(RefAt(key_types[k], op.row_id_start + k));
-			if (!table.described.key_unique) {
-				key_positions.push_back(k);
-			}
-		}
+		result->expressions.push_back(RefAt(LogicalType::ROW_TYPE, op.row_id_start));
 		for (idx_t i = 0; i < action.expressions.size(); i++) {
 			if (action.expressions[i]->GetExpressionType() == ExpressionType::VALUE_DEFAULT) {
 				result->expressions.push_back(op.bound_defaults[action.columns[i].index]->Copy());
@@ -286,7 +188,7 @@ unique_ptr<MergeIntoOperator> PlanCrossingMergeAction(ClientContext &context, Lo
 				result->expressions.push_back(std::move(action.expressions[i]));
 			}
 		}
-		result->op = PlanMergeWrite(planner, op, context, table, verb, std::move(seam), std::move(key_positions));
+		result->op = PlanMergeWrite(planner, op, context, table, verb, std::move(seam));
 		break;
 	}
 	case MergeActionType::MERGE_INSERT: {
@@ -304,7 +206,7 @@ unique_ptr<MergeIntoOperator> PlanCrossingMergeAction(ClientContext &context, Lo
 			                      table.name.GetIdentifierName());
 		}
 		auto seam = SeamOf(table, table.described, CrossingVerb::INSERT, std::move(named));
-		result->op = PlanMergeWrite(planner, op, context, table, CrossingVerb::INSERT, std::move(seam), {});
+		result->op = PlanMergeWrite(planner, op, context, table, CrossingVerb::INSERT, std::move(seam));
 		break;
 	}
 	case MergeActionType::MERGE_ERROR:
@@ -376,9 +278,9 @@ CrossingSeam SeamOf(TableCatalogEntry &table, const CrossingTable &described, Cr
 		seam.set_columns = std::move(set_columns);
 		return seam;
 	}
-	seam.key_columns = described.key;
+	seam.key_columns = {CROSSING_ROW_ID_COLUMN};
 	seam.set_columns = std::move(set_columns);
-	seam.types = ColumnTypesByName(table, seam.key_columns);
+	seam.types = {LogicalType::ROW_TYPE};
 	for (auto &type : ColumnTypesByName(table, seam.set_columns)) {
 		seam.types.push_back(type);
 	}
@@ -389,13 +291,6 @@ void RequireVerb(CrossingTableCatalogEntry &table, CrossingVerb verb) {
 	if (!table.described.Allows(verb)) {
 		throw PermissionException("crossing: '%s' does not have '%s' permission", table.name.GetIdentifierName(),
 		                          CrossingVerbName(verb));
-	}
-}
-
-void RequireKey(TableCatalogEntry &table, const CrossingTable &described, const char *what) {
-	if (described.key.empty()) {
-		throw BinderException("crossing: '%s' has no key, so %s cannot address its rows",
-		                      table.name.GetIdentifierName(), what);
 	}
 }
 
@@ -429,89 +324,6 @@ TableFunction CrossingWriteFunction() {
 	return function;
 }
 
-CrossingSeamFilledWrite::CrossingSeamFilledWrite(const CrossingBindData &write, unique_ptr<ColumnDataCollection> rows)
-    : table(write.table), fragment(write.fragment) {
-	auto slot = fragment->SeamSlot();
-	if (!slot && rows) {
-		throw InternalException("crossing: rows were gathered for a seam a plan already fills");
-	}
-	// Over a bare seam no rows means no write. A join or an aggregate over one still has an answer.
-	if (slot && (!rows || (rows->Count() == 0 && FeedIsBareSeam(*fragment->plan)))) {
-		empty = true;
-		return;
-	}
-	if (slot) {
-		filling = make_uniq<CrossingSeamFilling>(fragment, std::move(rows));
-	}
-	query = make_uniq<CrossingQuery>(*fragment->plan);
-	query->types = write.seam.returning_columns.empty() ? vector<LogicalType> {LogicalType::BIGINT}
-	                                                    : write.seam.returning_types;
-	returning = !write.seam.returning_columns.empty();
-	query->tables = CrossingTablesOf(*fragment->plan);
-}
-
-CrossingSeamFilledWrite::~CrossingSeamFilledWrite() {
-	reader = nullptr;
-	scan = CrossingScan();
-}
-
-CrossingWritePull CrossingSeamFilledWrite::Pull(ClientContext &context, CrossingWaker waker) {
-	CrossingWritePull pull;
-	if (empty) {
-		pull.done = true;
-		return pull;
-	}
-	if (!opened) {
-		auto &catalog = table.ParentCatalog();
-		auto &session = CrossingAttach::Of(catalog).Session(context, Transaction::Get(context, catalog));
-		scan = session.Run(context, *query);
-		result_chunk.Initialize(Allocator::DefaultAllocator(), query->types);
-		if (returning) {
-			returned = make_uniq<ColumnDataCollection>(context, query->types);
-		}
-		opened = true;
-	}
-	while (true) {
-		if (!reader) {
-			if (next_partition >= scan.partitions) {
-				pull.done = true;
-				pull.affected_rows = affected_rows;
-				return pull;
-			}
-			if (!scan.open) {
-				throw InternalException("crossing: the source's write of '%s' opens no reader", table.described.name);
-			}
-			reader = scan.open(context, next_partition++);
-			if (!reader) {
-				throw InternalException("crossing: the source's write of '%s' opened no reader", table.described.name);
-			}
-		}
-		result_chunk.Reset();
-		auto result = reader(context, result_chunk, waker);
-		if (result.outcome == CrossingReadResult::Outcome::WAIT) {
-			return pull;
-		}
-		if (result.outcome == CrossingReadResult::Outcome::DONE || result_chunk.size() == 0) {
-			reader = nullptr;
-			continue;
-		}
-		if (result_chunk.GetTypes() != query->types) {
-			throw InvalidInputException("crossing: the reader for the write of '%s' filled a chunk of other types "
-			                            "than it was asked for",
-			                            table.described.name);
-		}
-		result_chunk.SetChildCardinality(result_chunk.size());
-		if (returning) {
-			returned->Append(result_chunk);
-			affected_rows += result_chunk.size();
-			continue;
-		}
-		for (idx_t r = 0; r < result_chunk.size(); r++) {
-			affected_rows += NumericCast<idx_t>(result_chunk.GetValue(0, r).GetValue<int64_t>());
-		}
-	}
-}
-
 LogicalCrossingNear::LogicalCrossingNear(TableIndex table_index_p, vector<ColumnBinding> bindings_p,
                                          vector<LogicalType> output_types_p, vector<optional_idx> emit_p,
                                          unique_ptr<CrossingBindData> bind_data_p)
@@ -522,26 +334,19 @@ LogicalCrossingNear::LogicalCrossingNear(TableIndex table_index_p, vector<Column
 PhysicalOperator &LogicalCrossingNear::CreatePlan(ClientContext &context, PhysicalPlanGenerator &planner) {
 	auto &catalog = bind_data->table.ParentCatalog();
 	auto statement = CrossingAttach::Of(catalog).RemoteStatement(context, Transaction::Get(context, catalog));
-	if (statement) {
-		TellPlanned(context, *bind_data);
-		optional_ptr<PhysicalOperator> feed;
-		unique_ptr<CrossingRemoteSeamSink> seam;
-		optional_idx estimate;
-		if (!children.empty()) {
-			feed = planner.CreatePlan(*children[0]);
-			seam = CrossingSeamSinkOf(context, *feed, RemoteKeyCheck(*bind_data));
-			estimate = feed->estimated_cardinality;
-		}
-		auto columns = RemoteWriteColumns(*bind_data, emit);
-		auto slice = RemoteWriteSlice(*statement, *bind_data);
-		return PlanCrossingRemote(context, planner, output_types, std::move(statement), std::move(slice),
-		                          std::move(columns), std::move(seam), feed, estimate, estimated_cardinality);
-	}
-	auto &node = planner.Make<CrossingNear>(output_types, emit, std::move(bind_data), estimated_cardinality);
+	bind_data->table.source.Planned(*bind_data->fragment->plan);
+	optional_ptr<PhysicalOperator> feed;
+	unique_ptr<CrossingRemoteSeamSink> seam;
+	optional_idx estimate;
 	if (!children.empty()) {
-		node.children.push_back(planner.CreatePlan(*children[0]));
+		feed = planner.CreatePlan(*children[0]);
+		seam = CrossingSeamSinkOf(context, *feed);
+		estimate = feed->estimated_cardinality;
 	}
-	return node;
+	auto columns = RemoteWriteColumns(*bind_data, emit);
+	auto slice = RemoteWriteSlice(*statement, *bind_data);
+	return PlanCrossingRemote(context, planner, output_types, std::move(statement), std::move(slice),
+	                          std::move(columns), std::move(seam), feed, estimate, estimated_cardinality);
 }
 
 string LogicalCrossingNear::GetName() const {
@@ -558,129 +363,6 @@ string LogicalCrossingNear::GetExtensionName() const {
 
 void LogicalCrossingNear::Serialize(Serializer &) const {
 	throw NotImplementedException("crossing: a near node is planned, never serialized");
-}
-
-CrossingNear::CrossingNear(PhysicalPlan &physical_plan, vector<LogicalType> types_p, vector<optional_idx> emit_p,
-                           unique_ptr<CrossingBindData> bind_data_p, idx_t estimated_cardinality)
-    : PhysicalOperator(physical_plan, PhysicalOperatorType::EXTENSION, std::move(types_p), estimated_cardinality),
-      emit(std::move(emit_p)), bind_data(std::move(bind_data_p)) {
-}
-
-unique_ptr<GlobalSinkState> CrossingNear::GetGlobalSinkState(ClientContext &context) const {
-	auto state = make_uniq<CrossingNearSinkState>();
-	state->rows = make_uniq<ColumnDataCollection>(context, bind_data->fragment->seam_types);
-	return std::move(state);
-}
-
-SinkResultType CrossingNear::Sink(ExecutionContext &, DataChunk &chunk, OperatorSinkInput &input) const {
-	auto &state = input.global_state.Cast<CrossingNearSinkState>();
-	for (idx_t i = 0; i < chunk.size() && !bind_data->key_positions.empty(); i++) {
-		SeeKey(state.seen_keys, chunk, bind_data->key_positions, i);
-	}
-	state.rows->Append(chunk);
-	return SinkResultType::NEED_MORE_INPUT;
-}
-
-SinkFinalizeType CrossingNear::Finalize(Pipeline &, Event &, ClientContext &context,
-                                        OperatorSinkFinalizeInput &input) const {
-	auto &state = input.global_state.Cast<CrossingNearSinkState>();
-	auto &result = state.result;
-	if (!result.write) {
-		state.keys_sent = state.seen_keys.size();
-		result.write = make_uniq<CrossingSeamFilledWrite>(*bind_data, std::move(state.rows));
-	}
-	while (true) {
-		auto parking = CrossingParking::Of(input.interrupt_state);
-		auto pull = result.write->Pull(context, parking->Waker());
-		if (pull.done) {
-			result.Finish(pull);
-			break;
-		}
-		if (parking->Park()) {
-			return SinkFinalizeType::BLOCKED;
-		}
-	}
-	if (!bind_data->key_positions.empty()) {
-		ThrowIfKeyNotUnique(result.affected_rows, state.keys_sent, bind_data->SourceTable(),
-		                    bind_data->seam.key_columns, CrossingVerbName(bind_data->verb));
-	}
-	return SinkFinalizeType::READY;
-}
-
-unique_ptr<GlobalSourceState> CrossingNear::GetGlobalSourceState(ClientContext &) const {
-	return make_uniq<CrossingNearSourceState>();
-}
-
-SourceResultType CrossingNear::GetDataInternal(ExecutionContext &context, DataChunk &chunk,
-                                               OperatorSourceInput &input) const {
-	auto &state = input.global_state.Cast<CrossingNearSourceState>();
-	if (!IsSink() && !state.result.done) {
-		if (!state.result.write) {
-			state.result.write = make_uniq<CrossingSeamFilledWrite>(*bind_data, nullptr);
-		}
-		while (!state.result.done) {
-			auto parking = CrossingParking::Of(input.interrupt_state);
-			auto pull = state.result.write->Pull(context.client, parking->Waker());
-			if (pull.done) {
-				state.result.Finish(pull);
-				break;
-			}
-			SourceResultType parked;
-			if (ParkSource(*parking, state, parked)) {
-				if (parked == SourceResultType::FINISHED) {
-					state.result.write.reset();
-					state.result.done = true;
-				}
-				return parked;
-			}
-		}
-	}
-	auto &result = IsSink() ? sink_state->Cast<CrossingNearSinkState>().result : state.result;
-	if (bind_data->seam.returning_columns.empty()) {
-		if (state.emitted) {
-			return SourceResultType::FINISHED;
-		}
-		state.emitted = true;
-		chunk.SetChildCardinality(1);
-		chunk.data[0].SetValue(0, Value::BIGINT(NumericCast<int64_t>(result.affected_rows)));
-		return SourceResultType::HAVE_MORE_OUTPUT;
-	}
-	if (!result.returned) {
-		return SourceResultType::FINISHED;
-	}
-	if (!state.scanning) {
-		result.returned->InitializeScan(state.scan);
-		result.returned->InitializeScanChunk(state.scanned);
-		state.scanning = true;
-	}
-	state.scanned.Reset();
-	result.returned->Scan(state.scan, state.scanned);
-	if (state.scanned.size() == 0) {
-		return SourceResultType::FINISHED;
-	}
-	chunk.SetChildCardinality(state.scanned.size());
-	for (idx_t c = 0; c < emit.size(); c++) {
-		if (emit[c].IsValid()) {
-			chunk.data[c].Reference(state.scanned.data[emit[c].GetIndex()]);
-			continue;
-		}
-		for (idx_t r = 0; r < state.scanned.size(); r++) {
-			chunk.data[c].SetValue(r, Value(types[c]));
-		}
-	}
-	return SourceResultType::HAVE_MORE_OUTPUT;
-}
-
-string CrossingNear::GetName() const {
-	return "CROSSING_NEAR";
-}
-
-InsertionOrderPreservingMap<string> CrossingNear::ParamsToString() const {
-	auto result = bind_data->Params();
-	if (!bind_data->obstacle.empty()) {
-		result["Not whole because"] = bind_data->obstacle;
-	}
-	return result;
 }
 
 CrossingWriteCatalog::CrossingWriteCatalog(AttachedDatabase &db, CrossingAttach &attach_p)
@@ -815,16 +497,6 @@ PhysicalOperator &CrossingWriteCatalog::PlanMergeInto(ClientContext &context, Ph
 		return PlanShapedMerge(context, planner, op, plan, *table, *shaped, attach);
 	}
 
-	bool addresses_rows = false;
-	for (auto &entry : op.actions) {
-		for (auto &action : entry.second) {
-			addresses_rows |= action->action_type == MergeActionType::MERGE_UPDATE ||
-			                  action->action_type == MergeActionType::MERGE_DELETE;
-		}
-	}
-	if (addresses_rows) {
-		RequireKey(*table, table->described, "a merge");
-	}
 	if (op.return_chunk && !table->described.returning) {
 		throw BinderException("crossing: the source of '%s' cannot return rows, so RETURNING is refused",
 		                      table->name.GetIdentifierName());
@@ -839,9 +511,8 @@ PhysicalOperator &CrossingWriteCatalog::PlanMergeInto(ClientContext &context, Ph
 		actions.emplace(entry.first, std::move(planned_actions));
 	}
 
-	auto remote = attach.RemoteStatement(context, Transaction::Get(context, table->ParentCatalog())) != nullptr;
 	auto &result = planner.Make<PhysicalMergeInto>(op.types, plan, std::move(actions), op.row_id_start,
-	                                               op.source_marker, false, op.return_chunk, remote);
+	                                               op.source_marker, false, op.return_chunk, true);
 	return result;
 }
 
@@ -850,92 +521,6 @@ unique_ptr<LogicalOperator> CrossingWriteCatalog::BindCreateIndex(Binder &, Crea
                                                                   unique_ptr<LogicalOperator>) {
 	throw BinderException("crossing: '%s' is served by a source; CREATE INDEX is not supported",
 	                      table.name.GetIdentifierName());
-}
-
-CrossingCreateTableAs::CrossingCreateTableAs(PhysicalPlan &physical_plan, CrossingAttach &attach_p,
-                                             SchemaCatalogEntry &owner_p, unique_ptr<BoundCreateTableInfo> info_p,
-                                             vector<LogicalType> row_types_p, idx_t estimated_cardinality)
-    : PhysicalOperator(physical_plan, PhysicalOperatorType::EXTENSION, {LogicalType::BIGINT}, estimated_cardinality),
-      attach(attach_p), owner(owner_p), info(std::move(info_p)), row_types(std::move(row_types_p)) {
-}
-
-unique_ptr<GlobalSinkState> CrossingCreateTableAs::GetGlobalSinkState(ClientContext &context) const {
-	auto state = make_uniq<CrossingCreateTableAsState>();
-	state->rows = make_uniq<ColumnDataCollection>(context, row_types);
-	return std::move(state);
-}
-
-SinkResultType CrossingCreateTableAs::Sink(ExecutionContext &, DataChunk &chunk, OperatorSinkInput &input) const {
-	input.global_state.Cast<CrossingCreateTableAsState>().rows->Append(chunk);
-	return SinkResultType::NEED_MORE_INPUT;
-}
-
-SinkFinalizeType CrossingCreateTableAs::Finalize(Pipeline &, Event &, ClientContext &context,
-                                                 OperatorSinkFinalizeInput &input) const {
-	auto &state = input.global_state.Cast<CrossingCreateTableAsState>();
-	if (!state.created) {
-		auto &create = info->Base();
-		CrossingDdl ddl;
-		ddl.verb = CrossingVerb::CREATE;
-		ddl.schema = owner.name.GetIdentifierName();
-		ddl.table = create.GetTableName().GetIdentifierName();
-		ddl.create = info->base.get();
-		auto &transaction = Transaction::Get(context, owner.ParentCatalog());
-		attach.Ddl(context, transaction, owner, ddl);
-		state.created = true;
-
-		auto entry = attach.LookupTable(owner.name.GetIdentifierName(), owner,
-		                                create.GetTableName().GetIdentifierName(), &transaction);
-		if (!entry) {
-			throw InternalException("crossing: '%s' was created but the source does not serve it",
-			                        create.GetTableName().GetIdentifierName());
-		}
-		auto &table = entry->Cast<CrossingTableCatalogEntry>();
-		RequireVerb(table, CrossingVerb::INSERT);
-		auto seam = SeamOf(table, table.described, CrossingVerb::INSERT, TableColumnNames(table));
-		if (seam.types != row_types) {
-			throw BinderException("crossing: the source describes '%s' with columns other than the ones it was "
-			                      "created with",
-			                      create.GetTableName().GetIdentifierName());
-		}
-		auto fragment = PlanWriteFragment(table, CrossingVerb::INSERT, seam);
-		state.bind_data = MakeWriteBindData(table, CrossingVerb::INSERT, std::move(seam), std::move(fragment));
-		state.write = make_uniq<CrossingSeamFilledWrite>(*state.bind_data, std::move(state.rows));
-	}
-	while (true) {
-		auto parking = CrossingParking::Of(input.interrupt_state);
-		auto result = state.write->Pull(context, parking->Waker());
-		if (result.done) {
-			state.affected_rows = result.affected_rows;
-			break;
-		}
-		if (parking->Park()) {
-			return SinkFinalizeType::BLOCKED;
-		}
-	}
-	state.write.reset();
-	return SinkFinalizeType::READY;
-}
-
-unique_ptr<GlobalSourceState> CrossingCreateTableAs::GetGlobalSourceState(ClientContext &) const {
-	return make_uniq<CrossingWriteSourceState>();
-}
-
-SourceResultType CrossingCreateTableAs::GetDataInternal(ExecutionContext &, DataChunk &chunk,
-                                                        OperatorSourceInput &input) const {
-	auto &source_state = input.global_state.Cast<CrossingWriteSourceState>();
-	if (source_state.done) {
-		return SourceResultType::FINISHED;
-	}
-	source_state.done = true;
-	chunk.SetChildCardinality(1);
-	chunk.data[0].SetValue(
-	    0, Value::BIGINT(NumericCast<int64_t>(sink_state->Cast<CrossingCreateTableAsState>().affected_rows)));
-	return SourceResultType::HAVE_MORE_OUTPUT;
-}
-
-string CrossingCreateTableAs::GetName() const {
-	return "CROSSING_CREATE_TABLE_AS";
 }
 
 PhysicalOperator &CrossingAttach::PlanCreateTableAs(ClientContext &context, PhysicalPlanGenerator &planner,
@@ -948,30 +533,26 @@ PhysicalOperator &CrossingAttach::PlanCreateTableAs(ClientContext &context, Phys
 	ddl.create = op.info->base.get();
 	auto &transaction = Transaction::Get(context, schema.ParentCatalog());
 	Authorize(schema, ddl, &transaction);
-	if (auto statement = RemoteStatement(context, transaction)) {
-		auto write = make_uniq<SubstraitWrite>();
-		write->verb = CrossingVerb::CREATE;
-		write->schema = ddl.schema;
-		write->table = ddl.table;
-		for (auto &column : op.info->Base().columns.Logical()) {
-			write->target_columns.push_back(column.GetName().GetIdentifierName());
-		}
-		write->on_conflict = static_cast<uint8_t>(op.info->Base().on_conflict);
-		CrossingRemoteSlice slice;
-		slice.id = statement->Remote().NextSliceId();
-		slice.source = MakeSeamNode(0, plan.types);
-		slice.source->ResolveOperatorTypes();
-		slice.write = std::move(write);
-		NoteAltered(transaction, ddl.schema);
-		auto seam = CrossingSeamSinkOf(context, plan);
-		return PlanCrossingRemote(context, planner, {LogicalType::BIGINT}, std::move(statement), std::move(slice),
-		                          CrossingRemoteColumns::Identity({LogicalType::BIGINT}), std::move(seam), plan,
-		                          plan.estimated_cardinality, op.estimated_cardinality);
+	auto statement = RemoteStatement(context, transaction);
+	source->Planned(*MakeSeamNode(0, plan.types));
+	auto write = make_uniq<SubstraitWrite>();
+	write->verb = CrossingVerb::CREATE;
+	write->schema = ddl.schema;
+	write->table = ddl.table;
+	for (auto &column : op.info->Base().columns.Logical()) {
+		write->target_columns.push_back(column.GetName().GetIdentifierName());
 	}
-	auto &result =
-	    planner.Make<CrossingCreateTableAs>(*this, schema, std::move(op.info), plan.types, op.estimated_cardinality);
-	result.children.push_back(plan);
-	return result;
+	write->on_conflict = static_cast<uint8_t>(op.info->Base().on_conflict);
+	CrossingRemoteSlice slice;
+	slice.id = statement->Remote().NextSliceId();
+	slice.source = MakeSeamNode(0, plan.types);
+	slice.source->ResolveOperatorTypes();
+	slice.write = std::move(write);
+	NoteAltered(transaction, ddl.schema);
+	auto seam = CrossingSeamSinkOf(context, plan);
+	return PlanCrossingRemote(context, planner, {LogicalType::BIGINT}, std::move(statement), std::move(slice),
+	                          CrossingRemoteColumns::Identity({LogicalType::BIGINT}), std::move(seam), plan,
+	                          plan.estimated_cardinality, op.estimated_cardinality);
 }
 
 } // namespace duckdb

@@ -60,14 +60,12 @@ unique_ptr<LogicalOperator> MakeNearNode(TableIndex table_index, unique_ptr<Cros
 
 void FillFromFeed(ClientContext &context, unique_ptr<LogicalOperator> &node, CrossingTableCatalogEntry &table,
                   CrossingVerb verb, CrossingSeam seam, shared_ptr<CrossingFragment> fragment,
-                  unique_ptr<LogicalOperator> feed, const SeamObstacle &stop, vector<idx_t> key_positions,
-                  const FreshTableIndex &fresh) {
+                  unique_ptr<LogicalOperator> feed, const SeamObstacle &stop, const FreshTableIndex &fresh) {
 	auto table_index = TableIndexOf(*node);
 	auto fill = FillSeamFromFeed(std::move(feed), *fragment, table.source, stop, fresh,
 	                             Settings::Get<ScalarSubqueryErrorOnMultipleRowsSetting>(context));
 	auto write = MakeWriteBindData(table, verb, std::move(seam), std::move(fragment));
 	write->obstacle = std::move(fill.obstacle);
-	write->key_positions = std::move(key_positions);
 	node = MakeNearNode(table_index, std::move(write), std::move(fill.remainder), fresh);
 }
 
@@ -117,9 +115,6 @@ void FillWrite(ClientContext &context, unique_ptr<LogicalOperator> &node, const 
 		FillShaped(context, node, *table, std::move(shaped), fresh);
 		return;
 	}
-	if (verb != CrossingVerb::INSERT) {
-		RequireKey(*table, table->described, verb == CrossingVerb::UPDATE ? "an update" : "a delete");
-	}
 	if (node->children.size() != 1) {
 		throw NotImplementedException("crossing: %s without a source of rows", CrossingVerbName(verb));
 	}
@@ -134,22 +129,12 @@ void FillWrite(ClientContext &context, unique_ptr<LogicalOperator> &node, const 
 		seam.returning_types = TableRowTypes(*table);
 	}
 	auto fragment = PlanWriteFragment(*table, verb, seam);
-	auto keys = table->KeyColumnIndexes();
+	vector<column_t> keys {COLUMN_IDENTIFIER_ROW_ID};
 	MaterialiseConstantRows(context, node->children[0]);
 	auto feed = FeedOf(*node, keys, std::move(node->children[0]), fresh);
 
-	SeamObstacle stop;
-	vector<idx_t> key_positions;
-	if (verb != CrossingVerb::INSERT && !table->described.key_unique) {
-		stop.stays = true;
-		stop.obstacle = "the source does not vouch for the key's uniqueness";
-		for (idx_t k = 0; k < keys.size(); k++) {
-			key_positions.push_back(k);
-		}
-	}
-
-	FillFromFeed(context, node, *table, verb, std::move(seam), std::move(fragment), std::move(feed.plan), stop,
-	             std::move(key_positions), fresh);
+	FillFromFeed(context, node, *table, verb, std::move(seam), std::move(fragment), std::move(feed.plan),
+	             SeamObstacle(), fresh);
 }
 
 optional_ptr<LogicalGet> OwnScan(LogicalOperator &op, CrossingTableCatalogEntry &table,
@@ -278,9 +263,8 @@ void NarrowSets(TableCatalogEntry &table, LogicalProjection &projection, vector<
 
 bool HoldsSourceDefault(LogicalOperator &op) {
 	bool found = false;
-	LogicalOperatorVisitor::EnumerateExpressions(op, [&found](unique_ptr<Expression> *expr) {
-		found |= IsSourceDefault(**expr);
-	});
+	LogicalOperatorVisitor::EnumerateExpressions(
+	    op, [&found](unique_ptr<Expression> *expr) { found |= IsSourceDefault(**expr); });
 	for (auto &child : op.children) {
 		found |= HoldsSourceDefault(*child);
 	}
@@ -347,7 +331,7 @@ void FillBareWrite(ClientContext &context, unique_ptr<LogicalOperator> &node, co
 	}
 	auto fragment = PlanWriteFragment(*table, verb, seam);
 	auto feed = OneRowOf(context, std::move(values), seam.types, fresh);
-	FillFromFeed(context, node, *table, verb, std::move(seam), std::move(fragment), std::move(feed), SeamObstacle(), {},
+	FillFromFeed(context, node, *table, verb, std::move(seam), std::move(fragment), std::move(feed), SeamObstacle(),
 	             fresh);
 }
 

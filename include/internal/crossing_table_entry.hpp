@@ -17,10 +17,6 @@ public:
 	string source_schema;
 	CrossingTable described;
 
-	vector<column_t> KeyColumnIndexes() const;
-
-	optional_idx KeyColumnOfAlias(column_t virtual_id) const;
-
 	const ColumnList &GetColumns() const override {
 		return columns;
 	}
@@ -30,12 +26,6 @@ public:
 	//! Without the source default: what is built from this, such as a local copy, has no source to ask.
 	unique_ptr<CreateInfo> GetInfo() const override;
 
-	//! An update, a delete or a merge addresses rows by the key. The binder only takes row id
-	//! columns from the virtual map, so each key column has a virtual alias there; the pass turns
-	//! the aliases back into the real columns before anything crosses.
-	virtual_column_map_t GetVirtualColumns() const override;
-	vector<column_t> GetRowIdColumns() const override;
-
 private:
 	ColumnList columns;
 };
@@ -44,8 +34,8 @@ optional_ptr<CrossingTableCatalogEntry> CrossingTableOf(TableCatalogEntry &table
 
 TableStorageInfo UniqueConstraintStorageInfo(TableCatalogEntry &table);
 
-//! Turns every key alias in a crossing scan's column ids into the key column it stands for. A scan
-//! still reading here is refused unless granted 'select'.
-void ResolveKeyAliases(LogicalOperator &plan, const CrossingIdentity &identity);
+//! Makes far's row id a column of each crossing scan that reads it. A scan still reading here is refused unless
+//! granted 'select'.
+void ResolveRowIds(LogicalOperator &plan, const CrossingIdentity &identity);
 
 } // namespace duckdb

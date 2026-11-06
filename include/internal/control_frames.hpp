@@ -11,6 +11,8 @@
 namespace duckdb {
 
 static constexpr const char *CROSSING_CONTROL_PLAN = "PLAN\n";
+static constexpr const char *CROSSING_CONTROL_DDL = "DDL\n";
+static constexpr const char *CROSSING_CONTROL_VIEW = "VIEW\n";
 static constexpr const char *CROSSING_CONTROL_COMMIT = "COMMIT";
 static constexpr const char *CROSSING_CONTROL_ROLLBACK = "ROLLBACK";
 static constexpr const char *CROSSING_CONTROL_BOUND = "BOUND";

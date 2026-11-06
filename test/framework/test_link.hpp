@@ -6,6 +6,7 @@
 #include "duckdb/common/mutex.hpp"
 #include "duckdb/common/optional_idx.hpp"
 
+#include <functional>
 #include <map>
 #include <set>
 #include <thread>
@@ -26,6 +27,10 @@ public:
 	CrossingLink &Far() {
 		return *far_end;
 	}
+
+	//! Called with each frame of rows sent, and each control frame near sends.
+	std::function<void(idx_t id, int side, DataChunk &rows)> on_rows;
+	std::function<void(const string &header)> on_control;
 
 	std::set<idx_t> UsedStreams() {
 		lock_guard<mutex> guard(lock);
@@ -84,6 +89,12 @@ private:
 					pipe.senders.push_back(std::move(waker));
 					pair.waits++;
 					return CrossingIo::WAIT;
+				}
+				if (pair.on_control && id == 0 && side == 0) {
+					pair.on_control(frame.header);
+				}
+				if (pair.on_rows && frame.rows.ColumnCount() > 0) {
+					pair.on_rows(id, side, frame.rows);
 				}
 				Stored stored;
 				stored.header = frame.header;

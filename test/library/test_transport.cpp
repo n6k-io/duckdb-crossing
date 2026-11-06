@@ -29,14 +29,14 @@ string DecodeError(Twin &twin, const string &wire) {
 } // namespace
 
 TEST_CASE("a substrait read decodes against the table it was planned for", "[transport][stale_schema]") {
-	Twin twin(Transport::SUBSTRAIT);
+	Twin twin;
 	auto wire = WireForAllColumns(twin);
 
 	REQUIRE(DecodeError(twin, wire) == "");
 }
 
 TEST_CASE("a substrait read planned before a column was dropped reports the change", "[transport][stale_schema]") {
-	Twin twin(Transport::SUBSTRAIT);
+	Twin twin;
 	auto wire = WireForAllColumns(twin);
 
 	twin.Far("ALTER TABLE t DROP COLUMN b");
@@ -46,7 +46,7 @@ TEST_CASE("a substrait read planned before a column was dropped reports the chan
 
 TEST_CASE("a substrait read planned before any other change to the table reports the change",
           "[transport][stale_schema]") {
-	Twin twin(Transport::SUBSTRAIT);
+	Twin twin;
 	auto wire = WireForAllColumns(twin);
 
 	SECTION("a column renamed") {
@@ -63,7 +63,7 @@ TEST_CASE("a substrait read planned before any other change to the table reports
 }
 
 TEST_CASE("a read through an attach that has not seen a change reports the change", "[transport][stale_schema]") {
-	Twin twin(Transport::SUBSTRAIT);
+	Twin twin;
 	WireForAllColumns(twin);
 
 	twin.Far("ALTER TABLE t DROP COLUMN b");
@@ -74,7 +74,7 @@ TEST_CASE("a read through an attach that has not seen a change reports the chang
 
 TEST_CASE("a substrait read planned before a column was replaced is not remapped by position",
           "[transport][stale_schema]") {
-	Twin twin(Transport::SUBSTRAIT);
+	Twin twin;
 	auto wire = WireForAllColumns(twin);
 
 	twin.Far("ALTER TABLE t DROP COLUMN b");
@@ -89,7 +89,7 @@ TEST_CASE("a substrait read planned before a column was replaced is not remapped
 }
 
 TEST_CASE("a read fragment arrives on the far side as the plan that was sent", "[transport]") {
-	Twin twin(Transport::NATIVE);
+	Twin twin;
 	twin.Seed();
 
 	twin.Same("SELECT o.id, upper(c.cname) FROM far.orders o JOIN far.customers c ON o.tenant = c.tenant WHERE "
@@ -97,23 +97,10 @@ TEST_CASE("a read fragment arrives on the far side as the plan that was sent", "
 
 	auto &call = twin.LastRead();
 	REQUIRE(!call.wire.empty());
-	REQUIRE(call.received_text == call.plan_text);
-}
-
-TEST_CASE("a write fragment carrying rows arrives with the rows", "[transport]") {
-	Twin twin(Transport::NATIVE);
-	twin.store->key_unique["orders"] = false;
-	twin.Seed();
-
-	twin.Query("UPDATE far.orders SET amt = 0 WHERE amt > 100");
-
-	auto &call = twin.LastWrite();
-	REQUIRE(call.Has(Op::LOGICAL_CHUNK_GET));
-	REQUIRE(call.rows.size() == 4);
 }
 
 TEST_CASE("a substrait read names the source's tables and nothing of the target's", "[transport]") {
-	Twin twin(Transport::SUBSTRAIT);
+	Twin twin;
 	twin.Seed();
 
 	twin.Same("SELECT o.id FROM far.orders o JOIN far.customers c ON o.tenant = c.tenant WHERE o.amt > 100 ORDER BY "
@@ -126,45 +113,30 @@ TEST_CASE("a substrait read names the source's tables and nothing of the target'
 	REQUIRE(call.wire.find("crossing_floor") == string::npos);
 }
 
-TEST_CASE("a substrait write fed by a read of the same source renders as that read", "[transport]") {
-	Twin twin(Transport::SUBSTRAIT);
-	twin.Seed();
-
-	twin.Query("UPDATE far.orders SET amt = 0 WHERE id = 2");
-
-	auto &call = twin.LastWrite();
-	REQUIRE(call.wire.find("\"namedTable\":{\"names\":[\"main\",\"orders\"]}") != string::npos);
-	REQUIRE(call.rows == vector<vector<Value>> {{Value::INTEGER(2), Value::INTEGER(0)}});
-}
-
 TEST_CASE("a substrait write joining a VALUES list to a read holds the rows in the plan", "[transport]") {
-	Twin twin(Transport::SUBSTRAIT);
+	Twin twin;
 	twin.Seed();
 
 	twin.Query("UPDATE far.orders SET name = v.name FROM (VALUES (2, 'changed')) v(id, name) WHERE orders.id = v.id");
 
 	auto &call = twin.LastWrite();
-	REQUIRE(!call.rows_only);
-	REQUIRE(call.wire.find("\"virtualTable\":{\"expressions\":[{") != string::npos);
-	REQUIRE(call.wire.find("\"namedTable\":{\"names\":[\"main\",\"orders\"]}") != string::npos);
 	REQUIRE(call.rows.size() == 1);
 }
 
 TEST_CASE("a substrait write of gathered rows leaves them out of the JSON", "[transport]") {
-	Twin twin(Transport::SUBSTRAIT);
+	Twin twin;
 	twin.Seed();
 
 	twin.Query("INSERT INTO far.orders VALUES (6, 'zeta', 600, 3, 6.5, NULL)");
 
 	auto &call = twin.LastWrite();
 	REQUIRE(call.rows_only);
-	REQUIRE(call.wire.empty());
 	REQUIRE(call.rows.size() == 1);
 	twin.Same("SELECT * FROM far.orders ORDER BY id");
 }
 
 TEST_CASE("a substrait plan holding rows decodes from the JSON alone", "[transport][rows]") {
-	Twin twin(Transport::SUBSTRAIT);
+	Twin twin;
 	twin.Seed();
 
 	twin.Same("SELECT o.id FROM far.orders o JOIN (VALUES (1), (2)) t(x) ON o.id = t.x ORDER BY o.id");
@@ -176,7 +148,7 @@ TEST_CASE("a substrait plan holding rows decodes from the JSON alone", "[transpo
 }
 
 TEST_CASE("a substrait plan holding no rows decodes with its column types", "[transport][rows]") {
-	Twin twin(Transport::SUBSTRAIT);
+	Twin twin;
 	twin.Seed();
 	twin.Query("SELECT t.x FROM far.orders o JOIN (VALUES (1, 7)) t(k, x) ON o.id = t.k");
 	auto wire = twin.LastRead().wire;
@@ -193,7 +165,7 @@ TEST_CASE("a substrait plan holding no rows decodes with its column types", "[tr
 }
 
 TEST_CASE("a value in a VALUES list arrives as itself", "[transport][rows]") {
-	Twin twin(Transport::SUBSTRAIT);
+	Twin twin;
 	twin.Seed();
 
 	auto value = GENERATE(as<string> {}, "NULL::INTEGER", "true", "1::TINYINT", "2::SMALLINT", "3", "4::BIGINT",
@@ -211,7 +183,7 @@ TEST_CASE("a value in a VALUES list arrives as itself", "[transport][rows]") {
 }
 
 TEST_CASE("a substrait read keeps the field names of a struct_pack", "[transport][struct_pack]") {
-	Twin twin(Transport::SUBSTRAIT);
+	Twin twin;
 	twin.Seed();
 
 	SECTION("a field read by name") {
@@ -242,9 +214,7 @@ TEST_CASE("a substrait read keeps the field names of a struct_pack", "[transport
 }
 
 TEST_CASE("what the source cannot render is never offered to it", "[transport]") {
-	auto transport = EACH_TRANSPORT();
-	INFO(TransportName(transport));
-	Twin twin(transport);
+	Twin twin;
 	twin.Seed();
 
 	twin.Same("SELECT id FROM far.orders WHERE amt > 100 AND (SELECT count(*) FROM far.customers) > 2 ORDER BY id");

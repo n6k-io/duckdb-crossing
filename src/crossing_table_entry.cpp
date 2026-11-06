@@ -1,4 +1,5 @@
 #include "internal/crossing_table_entry.hpp"
+#include "internal/seam.hpp"
 
 #include "internal/crossing_read.hpp"
 #include "internal/crossing_write.hpp"
@@ -9,11 +10,7 @@
 
 namespace duckdb {
 
-namespace {
-
-constexpr column_t KEY_ALIAS_BASE = UINT64_C(9223372036854775808) + 1;
-
-} // namespace
+namespace {} // namespace
 
 CrossingTableCatalogEntry::CrossingTableCatalogEntry(Catalog &catalog, SchemaCatalogEntry &schema,
                                                      CreateTableInfo &info, CrossingSource &source_p,
@@ -30,44 +27,6 @@ unique_ptr<CreateInfo> CrossingTableCatalogEntry::GetInfo() const {
 	}
 	info->Cast<CreateTableInfo>().columns = std::move(plain);
 	return info;
-}
-
-vector<column_t> CrossingTableCatalogEntry::KeyColumnIndexes() const {
-	vector<column_t> out;
-	for (auto &key : described.key) {
-		out.push_back(GetColumns().GetColumn(Identifier(key)).Logical().index);
-	}
-	return out;
-}
-
-optional_idx CrossingTableCatalogEntry::KeyColumnOfAlias(column_t virtual_id) const {
-	if (virtual_id < KEY_ALIAS_BASE) {
-		return optional_idx();
-	}
-	auto key = KeyColumnIndexes();
-	auto k = virtual_id - KEY_ALIAS_BASE;
-	if (k >= key.size()) {
-		return optional_idx();
-	}
-	return key[k];
-}
-
-virtual_column_map_t CrossingTableCatalogEntry::GetVirtualColumns() const {
-	auto inherited = TableCatalogEntry::GetVirtualColumns();
-	auto key = KeyColumnIndexes();
-	for (idx_t k = 0; k < key.size(); k++) {
-		auto &column = GetColumns().GetColumn(LogicalIndex(key[k]));
-		inherited.insert(make_pair(KEY_ALIAS_BASE + k, TableColumn(column.Name(), column.Type())));
-	}
-	return inherited;
-}
-
-vector<column_t> CrossingTableCatalogEntry::GetRowIdColumns() const {
-	vector<column_t> out;
-	for (idx_t k = 0; k < described.key.size(); k++) {
-		out.push_back(KEY_ALIAS_BASE + k);
-	}
-	return out;
 }
 
 unique_ptr<BaseStatistics> CrossingTableCatalogEntry::GetStatistics(ClientContext &, column_t) {
@@ -123,9 +82,9 @@ TableStorageInfo UniqueConstraintStorageInfo(TableCatalogEntry &table) {
 	return info;
 }
 
-void ResolveKeyAliases(LogicalOperator &plan, const CrossingIdentity &identity) {
+void ResolveRowIds(LogicalOperator &plan, const CrossingIdentity &identity) {
 	for (auto &child : plan.children) {
-		ResolveKeyAliases(*child, identity);
+		ResolveRowIds(*child, identity);
 	}
 	if (plan.type != LogicalOperatorType::LOGICAL_GET) {
 		return;
@@ -135,16 +94,25 @@ void ResolveKeyAliases(LogicalOperator &plan, const CrossingIdentity &identity) 
 	if (!data || data->verb != CrossingVerb::SELECT) {
 		return;
 	}
-	RequireVerb(data->table, CrossingVerb::SELECT);
+	bool reads = false;
+	for (auto &column_index : get.GetColumnIds()) {
+		reads |= column_index.IsVirtualColumn() || column_index.GetPrimaryIndex() < get.returned_types.size();
+	}
+	if (reads) {
+		RequireVerb(data->table, CrossingVerb::SELECT);
+	}
 	for (auto &column_index : get.GetMutableColumnIds()) {
 		if (!column_index.IsVirtualColumn()) {
 			continue;
 		}
-		auto key = data->table.KeyColumnOfAlias(column_index.GetPrimaryIndex());
-		if (key.IsValid()) {
-			column_index = ColumnIndex(key.GetIndex());
-		} else if (data->fragment) {
-			data->fragment->frozen = true;
+		if (column_index.GetPrimaryIndex() != COLUMN_IDENTIFIER_ROW_ID) {
+			throw NotImplementedException("crossing: '%s' cannot read this virtual column", data->SourceTable());
+		}
+		auto column = data->fragment->IncludeRowId();
+		column_index = ColumnIndex(column);
+		if (column == get.returned_types.size()) {
+			get.returned_types.push_back(LogicalType::ROW_TYPE);
+			get.names.emplace_back(CROSSING_ROW_ID_COLUMN);
 		}
 	}
 }

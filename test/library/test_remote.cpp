@@ -2,7 +2,9 @@
 #include "crossing.hpp"
 #include "crossing_far.hpp"
 #include "framework/test_link.hpp"
+#include "internal/execute.hpp"
 #include "internal/crossing_remote.hpp"
+#include "internal/floor.hpp"
 #include "internal/seam.hpp"
 
 #include "duckdb.hpp"

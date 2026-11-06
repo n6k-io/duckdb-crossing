@@ -18,6 +18,7 @@
 #include "duckdb/parser/expression/function_expression.hpp"
 #include "duckdb/parser/expression/operator_expression.hpp"
 #include "duckdb/parser/expression/star_expression.hpp"
+#include "duckdb/parser/expression/subquery_expression.hpp"
 #include "duckdb/parser/expression/window_expression.hpp"
 #include "duckdb/parser/parsed_data/sample_options.hpp"
 #include "duckdb/parser/parsed_expression_iterator.hpp"
@@ -290,7 +291,7 @@ private:
 		for (auto &column : columns) {
 			out.push_back(alias.empty() || column == "merge_action"
 			                  ? make_uniq<ColumnRefExpression>(Identifier(column))
-			                            : make_uniq<ColumnRefExpression>(Identifier(column), Identifier(alias)));
+			                  : make_uniq<ColumnRefExpression>(Identifier(column), Identifier(alias)));
 		}
 		return out;
 	}
@@ -328,10 +329,45 @@ private:
 			source = AsRef(std::move(built), SOURCE);
 		}
 		auto *condition = yyjson_obj_get(detail, "condition");
+		auto policed = [&](unique_ptr<ParsedExpression> addressed) -> unique_ptr<ParsedExpression> {
+			if (!resolver) {
+				return addressed;
+			}
+			CrossingFloor floor;
+			floor.schema = schema;
+			floor.table = table;
+			auto policy = resolver(floor);
+			if (!policy) {
+				return addressed;
+			}
+			auto select = make_uniq<SelectNode>();
+			select->select_list.push_back(make_uniq<ColumnRefExpression>(Identifier("rowid")));
+			select->from_table = std::move(policy);
+			auto query = make_uniq<SelectStatement>();
+			query->node = std::move(select);
+			auto allowed = make_uniq<SubqueryExpression>();
+			allowed->GetSubqueryTypeMutable() = SubqueryType::ANY;
+			allowed->SubqueryMutable() = std::move(query);
+			allowed->GetChildMutable() = make_uniq<ColumnRefExpression>(Identifier("rowid"), Identifier(TARGET));
+			allowed->GetComparisonTypeMutable() = ExpressionType::COMPARE_EQUAL;
+			if (!addressed) {
+				return std::move(allowed);
+			}
+			return make_uniq<ConjunctionExpression>(ExpressionType::CONJUNCTION_AND, std::move(addressed),
+			                                        std::move(allowed));
+		};
 		auto set_columns = StrArrayOf(detail, "setColumns");
 		auto *values = Require(detail, "values");
 
 		if (yyjson_get_bool(Require(detail, "merge"))) {
+			if (resolver) {
+				CrossingFloor floor;
+				floor.schema = schema;
+				floor.table = table;
+				if (resolver(floor)) {
+					throw NotImplementedException("crossing: a MERGE into '%s' cannot apply its row policy", table);
+				}
+			}
 			auto merge = make_uniq<MergeQueryNode>();
 			merge->target = target_ref();
 			merge->source = std::move(source);
@@ -413,9 +449,7 @@ private:
 			update->table = target_ref();
 			update->from_table = std::move(source);
 			update->set_info = SetInfo(set_columns, values, scope);
-			if (condition) {
-				update->set_info->condition = Expr(condition, scope);
-			}
+			update->set_info->condition = policed(condition ? Expr(condition, scope) : nullptr);
 			update->returning_list = Returning(returning, TARGET);
 			auto statement = make_uniq<UpdateStatement>();
 			statement->node = std::move(update);
@@ -427,9 +461,7 @@ private:
 			if (source) {
 				del->using_clauses.push_back(std::move(source));
 			}
-			if (condition) {
-				del->condition = Expr(condition, scope);
-			}
+			del->condition = policed(condition ? Expr(condition, scope) : nullptr);
 			del->returning_list = Returning(returning, TARGET);
 			auto statement = make_uniq<DeleteStatement>();
 			statement->node = std::move(del);
@@ -812,6 +844,10 @@ private:
 			names.push_back(column.Name().GetIdentifierName());
 			types.push_back(column.Type());
 		}
+		if (names.size() == expected_names.size() + 1 && names.back() == "rowid") {
+			names.pop_back();
+			types.pop_back();
+		}
 		if (names != expected_names || types != expected_types) {
 			throw CatalogException("crossing: '%s.%s' changed on the source: it now has [%s] as [%s], the plan expects "
 			                       "[%s] as [%s]; refresh the attach",
@@ -867,10 +903,11 @@ private:
 		}
 		vector<unique_ptr<ParsedExpression>> exprs;
 		for (auto field : fields) {
-			if (field >= columns.size()) {
+			if (field > columns.size()) {
 				throw InvalidInputException("substrait: field %llu is past the end of the table", field);
 			}
-			exprs.push_back(make_uniq<ColumnRefExpression>(columns[field].Name()));
+			exprs.push_back(field == columns.size() ? make_uniq<ColumnRefExpression>(Identifier("rowid"))
+			                                        : make_uniq<ColumnRefExpression>(columns[field].Name()));
 		}
 		return Numbered(rel->GetTableRef(), std::move(exprs));
 	}

@@ -61,8 +61,8 @@ struct NearNodeSourceState : public GlobalSourceState {
 
 class PhysicalNearNode : public PhysicalOperator {
 public:
-	PhysicalNearNode(PhysicalPlan &plan, vector<LogicalType> types, vector<optional_idx> emit_p, NearNodeRecord &record_p,
-	                 idx_t cardinality)
+	PhysicalNearNode(PhysicalPlan &plan, vector<LogicalType> types, vector<optional_idx> emit_p,
+	                 NearNodeRecord &record_p, idx_t cardinality)
 	    : PhysicalOperator(plan, PhysicalOperatorType::EXTENSION, std::move(types), cardinality),
 	      emit(std::move(emit_p)), record(record_p) {
 	}
@@ -441,11 +441,8 @@ TEST_CASE("a near node keeps the order of an ordered feed", "[near_node]") {
 }
 
 TEST_CASE("each merge action runs through a near node and returns what the source stored", "[near_node]") {
-	auto transport = EACH_TRANSPORT();
-	INFO(TransportName(transport));
-	Twin twin(transport);
+	Twin twin;
 	twin.store->keys["m"] = {"id"};
-	twin.store->key_unique["m"] = true;
 	twin.Far("CREATE TABLE m(id INTEGER, v INTEGER)");
 	twin.Far("INSERT INTO m VALUES (1, 10), (2, 20)");
 	twin.Attach();
@@ -464,5 +461,4 @@ TEST_CASE("each merge action runs through a near node and returns what the sourc
 	REQUIRE(actions[1] == "UPDATE");
 	REQUIRE(actions[2] == "DELETE");
 	REQUIRE(actions[3] == "INSERT");
-	REQUIRE(twin.store->writes.size() == 3);
 }

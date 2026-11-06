@@ -10,20 +10,14 @@
 
 namespace duckdb {
 
-#define EACH_TRANSPORT() GENERATE(Transport::NATIVE, Transport::SUBSTRAIT, Transport::LINK)
-
 struct Twin {
 	shared_ptr<FarStore> store;
 	DuckDB near;
 	Connection con;
 
-	explicit Twin(Transport transport) : store(make_shared_ptr<FarStore>(transport)), near(nullptr), con(near) {
+	Twin() : store(make_shared_ptr<FarStore>()), near(nullptr), con(near) {
 		ExtensionLoader loader(*near.instance, "fardb");
 		FarSource::Register(loader, store);
-	}
-
-	~Twin() {
-		store->JoinArrivals();
 	}
 
 	void Far(const string &sql) {
@@ -66,7 +60,6 @@ struct Twin {
 
 	unique_ptr<TestResult> Query(const string &sql) {
 		auto result = Collected(con.Query(sql));
-		store->JoinArrivals();
 		if (result->HasError()) {
 			FAIL(sql + "\n" + result->GetError());
 		}
@@ -75,7 +68,6 @@ struct Twin {
 
 	string Error(const string &sql) {
 		auto result = con.Query(sql);
-		store->JoinArrivals();
 		if (!result->HasError()) {
 			FAIL("expected an error from: " + sql);
 		}
@@ -158,9 +150,8 @@ struct Pair {
 	DuckDB near;
 	Connection con;
 
-	Pair(Transport transport, bool other_first)
-	    : far(make_shared_ptr<FarStore>(transport)), other(make_shared_ptr<FarStore>(transport)), near(nullptr),
-	      con(near) {
+	explicit Pair(bool other_first)
+	    : far(make_shared_ptr<FarStore>()), other(make_shared_ptr<FarStore>()), near(nullptr), con(near) {
 		ExtensionLoader far_loader(*near.instance, "fardb");
 		ExtensionLoader other_loader(*near.instance, "otherdb");
 		if (other_first) {
@@ -170,11 +161,6 @@ struct Pair {
 			FarSource::Register(far_loader, far);
 			other::OtherSource::Register(other_loader, other);
 		}
-	}
-
-	~Pair() {
-		far->JoinArrivals();
-		other->JoinArrivals();
 	}
 
 	void Seed() {
@@ -188,8 +174,6 @@ struct Pair {
 
 	unique_ptr<TestResult> Query(const string &sql) {
 		auto result = Collected(con.Query(sql));
-		far->JoinArrivals();
-		other->JoinArrivals();
 		if (result->HasError()) {
 			FAIL(sql + "\n" + result->GetError());
 		}

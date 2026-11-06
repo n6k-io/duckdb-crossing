@@ -2,9 +2,9 @@
 #include "internal/floor.hpp"
 #include "internal/names.hpp"
 
-#include "duckdb/common/serializer/deserializer.hpp"
-#include "duckdb/common/serializer/serializer.hpp"
 #include "duckdb/function/table_function.hpp"
+#include "duckdb/catalog/catalog_entry/schema_catalog_entry.hpp"
+#include "duckdb/catalog/catalog_entry/table_catalog_entry.hpp"
 #include "duckdb/planner/operator/logical_get.hpp"
 
 namespace duckdb {
@@ -12,7 +12,7 @@ namespace duckdb {
 namespace {
 
 struct CrossingFloorBindData : public FunctionData {
-	CrossingFloor floor;
+	CrossingFloorNode floor;
 
 	unique_ptr<FunctionData> Copy() const override {
 		auto copy = make_uniq<CrossingFloorBindData>();
@@ -26,29 +26,10 @@ struct CrossingFloorBindData : public FunctionData {
 	}
 };
 
-void SerializeFloor(Serializer &serializer, const optional_ptr<FunctionData> bind_data, const BoundTableFunction &) {
-	auto &floor = bind_data->Cast<CrossingFloorBindData>().floor;
-	serializer.WriteProperty(100, "schema", floor.schema);
-	serializer.WriteProperty(101, "table", floor.table);
-	serializer.WriteProperty(102, "column_names", floor.column_names);
-	serializer.WritePropertyWithDefault(103, "catalog", floor.catalog);
-}
-
-unique_ptr<FunctionData> DeserializeFloor(Deserializer &deserializer, BoundTableFunction &) {
-	auto bind_data = make_uniq<CrossingFloorBindData>();
-	deserializer.ReadProperty(100, "schema", bind_data->floor.schema);
-	deserializer.ReadProperty(101, "table", bind_data->floor.table);
-	deserializer.ReadProperty(102, "column_names", bind_data->floor.column_names);
-	deserializer.ReadPropertyWithDefault(103, "catalog", bind_data->floor.catalog);
-	return std::move(bind_data);
-}
-
 } // namespace
 
 TableFunction CrossingFloorFunction() {
 	TableFunction function(CROSSING_FLOOR_FUNCTION, {}, nullptr);
-	function.serialize = SerializeFloor;
-	function.deserialize = DeserializeFloor;
 	return function;
 }
 
@@ -79,7 +60,7 @@ unique_ptr<LogicalOperator> MakeFloorNode(string schema, string table, vector<st
 	                     std::move(catalog));
 }
 
-optional_ptr<const CrossingFloor> FloorOf(const LogicalOperator &op) {
+optional_ptr<const CrossingFloorNode> FloorOf(const LogicalOperator &op) {
 	if (op.type != LogicalOperatorType::LOGICAL_GET) {
 		return nullptr;
 	}
@@ -92,6 +73,46 @@ optional_ptr<const CrossingFloor> FloorOf(const LogicalOperator &op) {
 		return nullptr;
 	}
 	return &bind_data->floor;
+}
+
+namespace {
+
+void CollectFloors(const LogicalOperator &op, vector<CrossingTableUse> &out) {
+	if (op.type == LogicalOperatorType::LOGICAL_GET) {
+		auto &get = op.Cast<LogicalGet>();
+		CrossingTableUse use;
+		bool named = false;
+		if (auto floor = FloorOf(get)) {
+			use.catalog = floor->catalog;
+			use.schema = floor->schema;
+			use.table = floor->table;
+			named = true;
+		} else if (auto table = get.GetTable()) {
+			use.schema = table->schema.name.GetIdentifierName();
+			use.table = table->name.GetIdentifierName();
+			named = true;
+		}
+		if (named) {
+			for (auto &column_index : get.GetColumnIds()) {
+				if (column_index.IsVirtualColumn()) {
+					continue;
+				}
+				use.columns.push_back(column_index.GetPrimaryIndex());
+			}
+			out.push_back(std::move(use));
+		}
+	}
+	for (auto &child : op.children) {
+		CollectFloors(*child, out);
+	}
+}
+
+} // namespace
+
+vector<CrossingTableUse> CrossingTablesOf(const LogicalOperator &plan) {
+	vector<CrossingTableUse> out;
+	CollectFloors(plan, out);
+	return out;
 }
 
 } // namespace duckdb

@@ -12,8 +12,6 @@ struct CrossingFarOptions {
 	CrossingFloorResolver floors;
 	//! Called with each catalog a plan names; throws to refuse the plan.
 	SubstraitCatalogCheck catalogs;
-	//! `connection` already holds the transaction.
-	bool transaction_open = false;
 };
 
 //! The far side of a link: everything but moving its frames. Serve holds one transaction on `connection`
@@ -26,6 +24,7 @@ public:
 
 private:
 	void RunStatement(CrossingLink &link, CrossingStream &control, const string &plan);
+	void RunDdl(CrossingStream &control, const string &frame);
 
 	Connection &connection;
 	string catalog;

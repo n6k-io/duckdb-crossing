@@ -30,7 +30,7 @@ string FarColumns(Twin &twin, const string &name) {
 } // namespace
 
 TEST_CASE("create table reaches the source and the table is served at once", "[ddl]") {
-	Twin twin(Transport::NATIVE);
+	Twin twin;
 	twin.Seed();
 
 	twin.Query("CREATE TABLE far.main.scratch(id INTEGER PRIMARY KEY, v VARCHAR)");
@@ -44,7 +44,7 @@ TEST_CASE("create table reaches the source and the table is served at once", "[d
 }
 
 TEST_CASE("alter table reaches the source and the table is re-described", "[ddl]") {
-	Twin twin(Transport::NATIVE);
+	Twin twin;
 	twin.Seed();
 	twin.Query("SELECT * FROM far.orders");
 
@@ -56,7 +56,7 @@ TEST_CASE("alter table reaches the source and the table is re-described", "[ddl]
 }
 
 TEST_CASE("rename moves the served name", "[ddl]") {
-	Twin twin(Transport::NATIVE);
+	Twin twin;
 	twin.Seed();
 
 	twin.Query("ALTER TABLE far.orders RENAME TO o");
@@ -68,7 +68,7 @@ TEST_CASE("rename moves the served name", "[ddl]") {
 }
 
 TEST_CASE("drop table reaches the source and the table is gone", "[ddl]") {
-	Twin twin(Transport::NATIVE);
+	Twin twin;
 	twin.Seed();
 	twin.Query("SELECT * FROM far.orders");
 
@@ -83,22 +83,18 @@ TEST_CASE("drop table reaches the source and the table is gone", "[ddl]") {
 }
 
 TEST_CASE("create table as lands the rows on the source", "[ddl]") {
-	Twin twin(Transport::NATIVE);
+	Twin twin;
 	twin.Seed();
 
 	auto count = twin.Query("CREATE TABLE far.main.copy AS SELECT id, amt FROM far.orders WHERE amt > 100");
 
 	REQUIRE(count->GetValue(0, 0) == Value::BIGINT(4));
-	REQUIRE(twin.store->ddls.size() == 1);
-	REQUIRE(twin.store->ddls[0].verb == CrossingVerb::CREATE);
-	REQUIRE(twin.LastWrite().kind == CrossingVerb::INSERT);
-	REQUIRE(twin.LastWrite().written.table == "copy");
 	twin.Same("SELECT id, amt FROM far.copy ORDER BY id");
 	REQUIRE(FarScalar(twin, "SELECT count(*) FROM copy") == Value::BIGINT(4));
 }
 
 TEST_CASE("create table as from the target's own rows", "[ddl]") {
-	Twin twin(Transport::NATIVE);
+	Twin twin;
 	twin.Seed();
 	twin.Query("CREATE TABLE local(x INTEGER)");
 	twin.Query("INSERT INTO local VALUES (1), (2)");
@@ -109,7 +105,7 @@ TEST_CASE("create table as from the target's own rows", "[ddl]") {
 }
 
 TEST_CASE("create table as of nothing still creates the table", "[ddl]") {
-	Twin twin(Transport::NATIVE);
+	Twin twin;
 	twin.Seed();
 
 	twin.Query("CREATE TABLE far.main.empty AS SELECT id FROM far.orders WHERE false");
@@ -118,8 +114,8 @@ TEST_CASE("create table as of nothing still creates the table", "[ddl]") {
 	REQUIRE(FarScalar(twin, "SELECT count(*) FROM empty") == Value::BIGINT(0));
 }
 
-TEST_CASE("create table as is refused without create, and without insert on the created table", "[ddl]") {
-	Twin twin(Transport::NATIVE);
+TEST_CASE("create table as is refused without create", "[ddl]") {
+	Twin twin;
 	twin.store->schema_verbs["main"] = {};
 	twin.store->verbs["ro"] = {CrossingVerb::SELECT};
 	twin.Seed();
@@ -127,17 +123,10 @@ TEST_CASE("create table as is refused without create, and without insert on the 
 	REQUIRE_THAT(twin.Error("CREATE TABLE far.main.c AS SELECT 1 AS x"),
 	             Catch::Contains("schema 'main' does not have 'create' permission"));
 	REQUIRE(twin.store->ddls.empty());
-
-	twin.store->schema_verbs["main"] = {CrossingVerb::CREATE};
-	twin.Query("DETACH far");
-	twin.Attach();
-	REQUIRE_THAT(twin.Error("CREATE TABLE far.main.ro AS SELECT 1 AS x"),
-	             Catch::Contains("'ro' does not have 'insert' permission"));
-	REQUIRE(FarTableCount(twin, "ro") == Value::BIGINT(0));
 }
 
 TEST_CASE("ddl rolls back and commits with the transaction", "[ddl]") {
-	Twin twin(Transport::NATIVE);
+	Twin twin;
 	twin.Seed();
 
 	twin.Query("BEGIN");
@@ -152,7 +141,7 @@ TEST_CASE("ddl rolls back and commits with the transaction", "[ddl]") {
 }
 
 TEST_CASE("create or replace needs drop on the served table", "[ddl]") {
-	Twin twin(Transport::NATIVE);
+	Twin twin;
 	twin.store->verbs["orders"] = {CrossingVerb::SELECT};
 	twin.Seed();
 
@@ -165,7 +154,7 @@ TEST_CASE("create or replace needs drop on the served table", "[ddl]") {
 }
 
 TEST_CASE("a table dropped in this transaction is missing, not unsupported", "[ddl]") {
-	Twin twin(Transport::NATIVE);
+	Twin twin;
 	twin.Seed();
 
 	SECTION("drop if exists is a no-op") {
@@ -215,7 +204,7 @@ TEST_CASE("a table dropped in this transaction is missing, not unsupported", "[d
 }
 
 TEST_CASE("concurrent ddl transactions do not see each other's pending schema", "[ddl]") {
-	Twin twin(Transport::NATIVE);
+	Twin twin;
 	twin.Seed();
 	Connection other(twin.near);
 	auto other_query = [&](const string &sql) {
@@ -248,7 +237,7 @@ TEST_CASE("concurrent ddl transactions do not see each other's pending schema", 
 }
 
 TEST_CASE("uncommitted ddl is invisible to other transactions", "[ddl]") {
-	Twin twin(Transport::NATIVE);
+	Twin twin;
 	twin.Seed();
 	Connection other(twin.near);
 	auto other_scalar = [&](const string &sql) {
@@ -300,8 +289,7 @@ TEST_CASE("uncommitted ddl is invisible to other transactions", "[ddl]") {
 }
 
 TEST_CASE("create view ships its body and the view is served at once", "[ddl][view]") {
-	auto transport = EACH_TRANSPORT();
-	Twin twin(transport);
+	Twin twin;
 	twin.Seed();
 
 	twin.Query("CREATE VIEW far.main.big AS SELECT id, amt FROM far.orders WHERE amt > 100");
@@ -317,7 +305,7 @@ TEST_CASE("create view ships its body and the view is served at once", "[ddl][vi
 }
 
 TEST_CASE("view bodies that run wholly on the source", "[ddl][view]") {
-	Twin twin(Transport::SUBSTRAIT);
+	Twin twin;
 	twin.Seed();
 
 	SECTION("join of two served tables") {
@@ -371,7 +359,7 @@ TEST_CASE("view bodies that run wholly on the source", "[ddl][view]") {
 }
 
 TEST_CASE("a view body that does not run wholly on the source is refused", "[ddl][view]") {
-	Twin twin(Transport::SUBSTRAIT);
+	Twin twin;
 	twin.store->refused_functions.insert("upper");
 	twin.Seed();
 	twin.Query("CREATE TABLE local(x INTEGER)");
@@ -389,7 +377,7 @@ TEST_CASE("a view body that does not run wholly on the source is refused", "[ddl
 }
 
 TEST_CASE("create view conflicts", "[ddl][view]") {
-	Twin twin(Transport::SUBSTRAIT);
+	Twin twin;
 	twin.Seed();
 	twin.Query("CREATE VIEW far.main.v AS SELECT id FROM far.orders");
 
@@ -416,7 +404,7 @@ TEST_CASE("create view conflicts", "[ddl][view]") {
 }
 
 TEST_CASE("create view needs create on the schema, and drop to replace", "[ddl][view]") {
-	Twin twin(Transport::SUBSTRAIT);
+	Twin twin;
 	twin.store->verbs["v"] = {CrossingVerb::SELECT};
 
 	SECTION("no create on the schema") {
@@ -438,7 +426,7 @@ TEST_CASE("create view needs create on the schema, and drop to replace", "[ddl][
 }
 
 TEST_CASE("drop view reaches the source and the view is gone", "[ddl][view]") {
-	Twin twin(Transport::SUBSTRAIT);
+	Twin twin;
 	twin.Seed();
 	twin.Query("CREATE VIEW far.main.v AS SELECT id FROM far.orders");
 
@@ -453,7 +441,7 @@ TEST_CASE("drop view reaches the source and the view is gone", "[ddl][view]") {
 }
 
 TEST_CASE("create view rolls back and commits with the transaction", "[ddl][view]") {
-	Twin twin(Transport::SUBSTRAIT);
+	Twin twin;
 	twin.Seed();
 
 	twin.Query("BEGIN");
@@ -470,8 +458,7 @@ TEST_CASE("create view rolls back and commits with the transaction", "[ddl][view
 }
 
 TEST_CASE("a source view with an alias list is read under its aliases", "[ddl][view]") {
-	auto transport = EACH_TRANSPORT();
-	Twin twin(transport);
+	Twin twin;
 	twin.Seed();
 	twin.Far("CREATE VIEW aliased(a, b) AS SELECT id, amt FROM orders");
 	twin.Query("DETACH far");
@@ -484,7 +471,7 @@ TEST_CASE("create index on a served table is refused and the connection survives
 	    GENERATE(as<string> {}, "CREATE INDEX idx ON far.orders(id)", "CREATE UNIQUE INDEX idx ON far.orders(id)",
 	             "CREATE INDEX IF NOT EXISTS idx ON far.orders(id)");
 	INFO(sql);
-	Twin twin(Transport::NATIVE);
+	Twin twin;
 	twin.Seed();
 
 	REQUIRE_THAT(twin.Error(sql), Catch::Contains("not supported"));

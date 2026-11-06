@@ -15,8 +15,7 @@
 
 namespace duckdb {
 
-//! Complete: rows the plan holds are written into the JSON, so a bare seam of gathered rows, which can be
-//! any size, is better sent through SeamRowsOf.
+//! Complete: rows the plan holds are written into the JSON.
 string RenderSubstraitJson(const LogicalOperator &plan);
 
 bool SubstraitCanRenderCall(const Expression &expr, string &reason);

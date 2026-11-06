@@ -43,6 +43,13 @@ public:
 		return 1;
 	}
 	virtual unique_ptr<CrossingStream> Open(idx_t id) = 0;
+	//! What this transaction sees once it has changed a schema. Needed only if a schema declares a DDL verb.
+	virtual vector<string> Tables(const string &schema) {
+		throw NotImplementedException("crossing: this source's link cannot list a changed schema");
+	}
+	virtual CrossingTable Describe(const string &schema, const string &name) {
+		throw NotImplementedException("crossing: this source's link cannot describe a changed table");
+	}
 };
 
 } // namespace duckdb
