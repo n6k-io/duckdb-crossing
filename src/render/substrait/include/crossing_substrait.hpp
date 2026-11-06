@@ -1,10 +1,15 @@
 #pragma once
 
+#include "duckdb/common/enums/merge_action_type.hpp"
+#include "duckdb/common/optional_idx.hpp"
 #include "duckdb/common/string.hpp"
 #include "duckdb/main/connection.hpp"
 #include "duckdb/main/relation.hpp"
+#include "duckdb/parser/sql_statement.hpp"
 #include "duckdb/parser/statement/select_statement.hpp"
 #include "duckdb/planner/logical_operator.hpp"
+
+#include "crossing.hpp"
 
 #include <functional>
 
@@ -31,5 +36,68 @@ shared_ptr<Relation> DecodeSubstraitJson(Connection &conn, const string &catalog
 unique_ptr<SelectStatement> DecodeSubstraitView(Connection &conn, const string &catalog, const string &json,
                                                 const vector<string> &names,
                                                 const SubstraitCatalogCheck &check = nullptr);
+
+struct SubstraitWriteAction {
+	MergeActionCondition when;
+	MergeActionType type;
+	optional_ptr<const Expression> condition;
+	vector<string> columns;
+	vector<reference<const Expression>> values;
+};
+
+//! A write as its target and what it is asked to do. Its expressions see the target's columns, bound under
+//! `target_index`, then the source's columns.
+struct SubstraitWrite {
+	CrossingVerb verb = CrossingVerb::INSERT;
+	bool merge = false;
+	string catalog;
+	string schema;
+	string table;
+	vector<string> target_columns;
+	idx_t target_index = 0;
+	optional_ptr<const Expression> condition;
+	vector<string> set_columns;
+	vector<reference<const Expression>> values;
+	vector<SubstraitWriteAction> actions;
+	vector<string> returning;
+};
+
+//! One part of a statement's far plan. `source` holds at most one seam, whose rows come in on this slice's
+//! streams. A write's source may be null.
+struct SubstraitSlice {
+	idx_t id = 0;
+	bool ordered = false;
+	bool seam_ordered = false;
+	optional_idx seam_estimate;
+	optional_ptr<const LogicalOperator> source;
+	optional_ptr<const SubstraitWrite> write;
+};
+
+//! A statement's slices as one Substrait plan, one relation each.
+string RenderSubstraitSlices(const vector<SubstraitSlice> &slices);
+
+struct DecodedSeam {
+	idx_t id = 0;
+	vector<LogicalType> types;
+	bool ordered = false;
+	optional_idx estimate;
+};
+
+struct DecodedSlice {
+	idx_t id = 0;
+	bool ordered = false;
+	unique_ptr<SQLStatement> statement;
+	//! Set on a write: the catalog it changes.
+	string write_catalog;
+};
+
+struct DecodedStatement {
+	vector<DecodedSlice> slices;
+	vector<DecodedSeam> seams;
+};
+
+DecodedStatement DecodeSubstraitSlices(Connection &conn, const string &catalog, const string &json,
+                                       const SubstraitCatalogCheck &check = nullptr,
+                                       const CrossingFloorResolver &resolver = nullptr);
 
 } // namespace duckdb

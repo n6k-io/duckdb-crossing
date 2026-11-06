@@ -28,6 +28,9 @@ set(CROSSING_LIBRARY_SOURCE_NAMES
     crossing_table_entry.cpp
     crossing_read.cpp
     parking.cpp
+    seam_inbox.cpp
+    stream_sink.cpp
+    far_plan.cpp
     crossing_write.cpp
     crossing_fill.cpp
     crossing_pass.cpp
@@ -98,6 +101,8 @@ function(crossing_substrait_sources out_var)
       ${CROSSING_SUBSTRAIT_ROOT}/substrait_types.cpp
       ${CROSSING_SUBSTRAIT_ROOT}/substrait_render.cpp
       ${CROSSING_SUBSTRAIT_ROOT}/substrait_decode.cpp
+      ${CROSSING_ROOT}/src/crossing_far.cpp
+      ${CROSSING_ROOT}/src/crossing_remote.cpp
       PARENT_SCOPE)
 endfunction()
 
