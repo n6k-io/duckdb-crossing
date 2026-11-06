@@ -6,7 +6,6 @@ set(CROSSING_ENGINE_SOURCE_NAMES
     fragment.cpp
     seam.cpp
     floor.cpp
-    plan_wire.cpp
     source_evaluation.cpp
     rules.cpp
     labelling.cpp
@@ -17,9 +16,6 @@ set(CROSSING_ENGINE_SOURCE_NAMES
     scan_columns.cpp
     table_indices.cpp
     execute.cpp)
-
-set(CROSSING_EXECUTE_SOURCE_NAMES crossing.cpp floor.cpp seam.cpp plan_wire.cpp table_indices.cpp
-                                  execute.cpp)
 
 set(CROSSING_LIBRARY_SOURCE_NAMES
     ${CROSSING_ENGINE_SOURCE_NAMES}
@@ -60,13 +56,6 @@ function(crossing_engine_sources out_var)
       PARENT_SCOPE)
 endfunction()
 
-function(crossing_execute_sources out_var)
-  _crossing_expand(result ${CROSSING_EXECUTE_SOURCE_NAMES})
-  set(${out_var}
-      ${result}
-      PARENT_SCOPE)
-endfunction()
-
 function(crossing_sources out_var)
   _crossing_expand(result ${CROSSING_LIBRARY_SOURCE_NAMES})
   set(${out_var}
@@ -83,33 +72,11 @@ endfunction()
 function(crossing_add_to_target target)
   crossing_sources(sources)
   target_sources(${target} PRIVATE ${sources})
-  target_include_directories(${target} PRIVATE ${CROSSING_ROOT}/include ${CROSSING_SUBSTRAIT_ROOT}/include
-                                                 ${CROSSING_SUBSTRAIT_ROOT})
+  crossing_substrait_includes(substrait_includes)
+  target_include_directories(${target} PRIVATE ${CROSSING_ROOT}/include ${substrait_includes})
 endfunction()
 
 set(CROSSING_SUBSTRAIT_ROOT ${CROSSING_ROOT}/src/render/substrait)
-
-function(crossing_substrait_render_sources out_var)
-  set(${out_var}
-      ${CROSSING_SUBSTRAIT_ROOT}/substrait_types.cpp
-      ${CROSSING_SUBSTRAIT_ROOT}/substrait_render.cpp
-      PARENT_SCOPE)
-endfunction()
-
-function(crossing_substrait_decode_sources out_var)
-  set(${out_var}
-      ${CROSSING_SUBSTRAIT_ROOT}/substrait_types.cpp
-      ${CROSSING_SUBSTRAIT_ROOT}/substrait_decode.cpp
-      PARENT_SCOPE)
-endfunction()
-
-function(crossing_substrait_sources out_var)
-  set(${out_var}
-      ${CROSSING_SUBSTRAIT_ROOT}/substrait_types.cpp
-      ${CROSSING_SUBSTRAIT_ROOT}/substrait_render.cpp
-      ${CROSSING_SUBSTRAIT_ROOT}/substrait_decode.cpp
-      PARENT_SCOPE)
-endfunction()
 
 function(crossing_substrait_includes out_var)
   set(${out_var}

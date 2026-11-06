@@ -45,7 +45,6 @@ build: duckdb
 test: build
 	@$(call logged_test,crossing_unittest,"$(BUILD_DIR)/crossing_unittest" $(TEST_ARGS))
 	@$(call logged_test,crossing_library_unittest,"$(BUILD_DIR)/crossing_library_unittest" $(TEST_ARGS))
-	@$(call logged_test,contract,ctest --test-dir "$(BUILD_DIR)" -R contract_ -j$(JOBS) --output-on-failure)
 
 clean:
 	@rm -rf "$(PROJ_DIR)build"

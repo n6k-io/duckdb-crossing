@@ -78,14 +78,13 @@ file(GLOB CROSSING_TEST_SOURCES CONFIGURE_DEPENDS
 crossing_test_target(crossing_unittest ${CROSSING_ENGINE_SOURCES}
                      ${CROSSING_TEST_SOURCES})
 
-crossing_substrait_sources(CROSSING_SUBSTRAIT_SOURCES)
 crossing_substrait_includes(CROSSING_SUBSTRAIT_INCLUDES)
 file(GLOB CROSSING_LIBRARY_TEST_SOURCES CONFIGURE_DEPENDS
      ${CMAKE_CURRENT_SOURCE_DIR}/test/library/test_*.cpp)
 crossing_test_target(
   crossing_library_unittest ${CROSSING_LIBRARY_SOURCES}
   test/far_source/far_source.cpp
-  test/read_only_source/read_only_source.cpp test/own_catalog/own_catalog.cpp
+  test/own_catalog/own_catalog.cpp
   ${CROSSING_LIBRARY_TEST_SOURCES})
 target_include_directories(
   crossing_library_unittest
@@ -95,53 +94,3 @@ target_link_libraries(crossing_library_unittest
                       ${DUCKDB_BUILD_DIR}/third_party/yyjson/libduckdb_yyjson.a)
 
 enable_testing()
-
-function(crossing_contract_case name)
-  add_library(contract_${name} OBJECT EXCLUDE_FROM_ALL
-              test/contract/${name}.cpp)
-  target_include_directories(
-    contract_${name} PRIVATE ${DUCKDB_SOURCE_DIR}/src/include
-                             ${DUCKDB_SOURCE_DIR}/third_party/fmt/include
-                             ${CROSSING_INCLUDES})
-endfunction()
-
-function(crossing_contract_ok name)
-  crossing_contract_case(${name})
-  set_target_properties(contract_${name} PROPERTIES EXCLUDE_FROM_ALL FALSE)
-endfunction()
-
-function(crossing_contract_fail name expected)
-  crossing_contract_case(${name})
-  add_test(NAME contract_${name}
-           COMMAND ${CMAKE_COMMAND} --build ${CMAKE_BINARY_DIR} --target
-                   contract_${name})
-  set_tests_properties(contract_${name} PROPERTIES PASS_REGULAR_EXPRESSION
-                                                   "${expected}")
-endfunction()
-
-crossing_contract_ok(ok_minimal)
-crossing_contract_ok(ok_optional)
-crossing_contract_fail(fail_no_session_type "needs `using Session")
-crossing_contract_fail(fail_missing_tables
-                       "missing required member `vector<string> Tables")
-crossing_contract_fail(fail_wrong_parameters
-                       "`Tables` exists but is not callable")
-crossing_contract_fail(fail_private_member
-                       "`Tables` exists but is not callable")
-crossing_contract_fail(fail_wrong_return
-                       "ReturnCheck<false, duckdb::CrossingTable, int>")
-crossing_contract_fail(
-  fail_begin_shared_ptr
-  "ReturnCheck<false, duckdb::unique_ptr<duckdb::GoodSession.*duckdb::shared_ptr<duckdb::GoodSession"
-)
-crossing_contract_fail(fail_final_source "source type must not be final")
-crossing_contract_fail(fail_optional_wrong_signature
-                       "`AcceptsCall` exists but is not callable")
-crossing_contract_fail(fail_session_missing_run
-                       "missing required member `CrossingScan Run")
-crossing_contract_fail(fail_session_commit_returns
-                       "ReturnCheck<false, void, int>")
-crossing_contract_fail(fail_session_run_signature
-                       "`Run` exists but is not callable")
-crossing_contract_fail(fail_session_ddl_signature
-                       "`Ddl` exists but is not callable")

@@ -11,7 +11,7 @@
 
 ## About
 
-DuckDB library that pushes plan fragments to a foreign source. `IMPLEMENTING.md` describes the source interface.
+DuckDB library that runs part of a query on another DuckDB, with a stream between them. `IMPLEMENTING.md` describes the source interface.
 
 ## What runs where
 
@@ -20,7 +20,7 @@ Query shape decides, and table sizes never do.
 - Work on one source's tables runs on that source.
 - The first inner join between a source's table and rows that read nothing from any
   source runs on the source, when the source accepts it and a condition links the two
-  sides. Those rows are read first and sent over. `far JOIN a JOIN b` sends `a`, and
+  sides. Those rows are streamed over. `far JOIN a JOIN b` sends `a`, and
   `far JOIN (a JOIN b)` sends the join's result.
 - Later joins, outer, semi and anti joins, joins with no condition linking the sides,
   and joins using a CTE or inside a correlated subquery run near.
@@ -30,9 +30,9 @@ Refused with an error:
 - `RETURNING` on a table whose source can't return rows.
 - `DEFAULT` as a value on a source's table.
 - `ON CONFLICT` that leaves out a column.
-- `MERGE ... INSERT DEFAULT VALUES`.
 - A write to a source's table inside a `WITH` clause.
 - A view over rows that aren't on its source.
+- A source's table in the recursive part of a `WITH RECURSIVE`.
 
 ## Build and test
 
@@ -42,7 +42,7 @@ Needs cmake and a C++17 compiler.
 make test
 ```
 
-Builds DuckDB from `duckdb/` into `build/duckdb`, the test binaries into `build/crossing`, runs them, then runs the `test/contract/` compile-fail cases via ctest. `TEST_ARGS="[tag]"` filters Catch tags.
+Builds DuckDB from `duckdb/` into `build/duckdb`, the test binaries into `build/crossing`, and runs them. `TEST_ARGS="[tag]"` filters Catch tags.
 
 `local.mk` (gitignored) may set `DUCKDB_SOURCE_DIR` and `DUCKDB_BUILD_DIR`.
 
