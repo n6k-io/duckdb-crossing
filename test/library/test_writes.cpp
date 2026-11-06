@@ -176,6 +176,140 @@ TEST_CASE("an update sets the values its FROM rows carry", "[writes]") {
 	REQUIRE(Scalar(twin, "SELECT count(*) FROM orders WHERE name = 'changed'") == Value::BIGINT(1));
 }
 
+TEST_CASE("an update joined to a table the target holds hands the source only the matching rows", "[writes]") {
+	auto transport = EACH_TRANSPORT();
+	INFO(TransportName(transport));
+	Twin twin(transport);
+	twin.Seed();
+	twin.Query("CREATE TABLE staged AS SELECT 2 AS id, 'changed' AS name");
+
+	auto result = twin.Query("UPDATE far.orders SET name = staged.name FROM staged WHERE orders.id = staged.id");
+
+	REQUIRE(result->GetValue(0, 0) == Value::BIGINT(1));
+	auto &call = twin.LastWrite();
+	REQUIRE(call.rows_only);
+	REQUIRE(!call.Has(Op::LOGICAL_FILTER));
+	REQUIRE(call.rows == vector<vector<Value>> {{Value::INTEGER(2), Value("changed")}});
+	REQUIRE(Scalar(twin, "SELECT name FROM orders WHERE id = 2") == Value("changed"));
+}
+
+TEST_CASE("a delete joined to a table the target holds hands the source only the matching rows", "[writes]") {
+	auto transport = EACH_TRANSPORT();
+	auto sql = GENERATE(as<string> {}, "DELETE FROM far.orders USING staged WHERE orders.id = staged.id",
+	                    "DELETE FROM far.orders WHERE id IN (SELECT id FROM staged)");
+	INFO(TransportName(transport) << " " << sql);
+	Twin twin(transport);
+	twin.Seed();
+	twin.Query("CREATE TABLE staged AS SELECT 2 AS id");
+
+	auto result = twin.Query(sql);
+
+	REQUIRE(result->GetValue(0, 0) == Value::BIGINT(1));
+	auto &call = twin.LastWrite();
+	REQUIRE(call.rows_only);
+	REQUIRE(!call.Has(Op::LOGICAL_FILTER));
+	REQUIRE(call.rows == vector<vector<Value>> {{Value::INTEGER(2)}});
+	REQUIRE(Scalar(twin, "SELECT count(*) FROM orders") == Value::BIGINT(4));
+}
+
+TEST_CASE("an insert's work over rows the target holds stays on the target", "[writes]") {
+	auto transport = EACH_TRANSPORT();
+	auto select = GENERATE(as<string> {}, "SELECT * FROM staged WHERE amt > 0",
+	                       "SELECT id, upper(name), amt, tenant, score, ts FROM staged",
+	                       "SELECT * FROM staged ORDER BY id LIMIT 1",
+	                       "SELECT id, max(name), max(amt), max(tenant), max(score), max(ts) FROM staged GROUP BY id",
+	                       "SELECT * FROM (VALUES (8, 'eta', 800, 3, 8.5, TIMESTAMP '2024-01-08 00:00:00')) "
+	                       "v(id, name, amt, tenant, score, ts) WHERE amt > 0",
+	                       "VALUES (8, 'eta', (random() * 0)::INTEGER + 800, 3, 8.5, NULL)");
+	INFO(TransportName(transport) << " " << select);
+	Twin twin(transport);
+	twin.Seed();
+	twin.Query("CREATE TABLE staged AS SELECT 8 AS id, 'eta' AS name, 800 AS amt, 3 AS tenant, 8.5 AS score, "
+	           "TIMESTAMP '2024-01-08 00:00:00' AS ts");
+
+	auto result = twin.Query("INSERT INTO far.orders " + select);
+
+	REQUIRE(result->GetValue(0, 0) == Value::BIGINT(1));
+	auto &call = twin.LastWrite();
+	REQUIRE(call.rows_only);
+	REQUIRE(!call.Has(Op::LOGICAL_FILTER));
+	REQUIRE(call.rows.size() == 1);
+	REQUIRE(call.tables.empty());
+	REQUIRE(Scalar(twin, "SELECT amt FROM orders WHERE id = 8") == Value::INTEGER(800));
+}
+
+TEST_CASE("an insert selecting nothing from the target's rows does not call the source", "[writes]") {
+	auto transport = EACH_TRANSPORT();
+	auto select = GENERATE(as<string> {}, "SELECT * FROM staged WHERE false",
+	                       "SELECT * FROM (VALUES (8, 'eta', 800, 3, 8.5, NULL)) v WHERE false");
+	INFO(TransportName(transport) << " " << select);
+	Twin twin(transport);
+	twin.Seed();
+	twin.Query("CREATE TABLE staged AS SELECT 8 AS id, 'eta' AS name, 800 AS amt, 3 AS tenant, 8.5 AS score, "
+	           "TIMESTAMP '2024-01-08 00:00:00' AS ts");
+
+	auto result = twin.Query("INSERT INTO far.orders " + select);
+
+	REQUIRE(result->GetValue(0, 0) == Value::BIGINT(0));
+	REQUIRE(twin.store->writes.empty());
+	REQUIRE(Scalar(twin, "SELECT count(*) FROM orders") == Value::BIGINT(5));
+}
+
+TEST_CASE("a function the source refuses still runs over the target's rows", "[writes]") {
+	auto transport = EACH_TRANSPORT();
+	INFO(TransportName(transport));
+	Twin twin(transport);
+	twin.store->refused_functions.insert("upper");
+	twin.Seed();
+	twin.Query("CREATE TABLE staged AS SELECT 8 AS id, 'eta' AS name, 800 AS amt, 3 AS tenant, 8.5 AS score, "
+	           "TIMESTAMP '2024-01-08 00:00:00' AS ts");
+
+	twin.Query("INSERT INTO far.orders SELECT id, upper(name), amt, tenant, score, ts FROM staged");
+
+	auto &call = twin.LastWrite();
+	REQUIRE(call.rows_only);
+	REQUIRE(!call.Mentions("upper"));
+	REQUIRE(Scalar(twin, "SELECT name FROM orders WHERE id = 8") == Value("ETA"));
+}
+
+TEST_CASE("an update returning rows hands the source keys and values and returns whole rows", "[writes]") {
+	auto transport = EACH_TRANSPORT();
+	INFO(TransportName(transport));
+	Twin twin(transport);
+	twin.Seed();
+
+	auto result =
+	    twin.Query("UPDATE far.orders SET id = 2, name = 'changed', amt = 1, tenant = 1, score = 1, ts = NULL "
+	               "WHERE id = 2 RETURNING id, name");
+
+	REQUIRE(result->RowCount() == 1);
+	REQUIRE(result->GetValue(0, 0) == Value::INTEGER(2));
+	REQUIRE(result->GetValue(1, 0) == Value("changed"));
+	auto &call = twin.LastWrite();
+	REQUIRE(call.rows_only);
+	REQUIRE(call.rows.size() == 1);
+	REQUIRE(call.rows[0].size() == call.key_columns.size() + call.set_columns.size());
+	REQUIRE(call.rows[0][0] == Value::INTEGER(2));
+	REQUIRE(Scalar(twin, "SELECT name FROM orders WHERE id = 2") == Value("changed"));
+}
+
+TEST_CASE("a delete returning rows hands the source keys and returns whole rows", "[writes]") {
+	auto transport = EACH_TRANSPORT();
+	INFO(TransportName(transport));
+	Twin twin(transport);
+	twin.Seed();
+
+	auto result = twin.Query("DELETE FROM far.orders WHERE id = 2 RETURNING id, name");
+
+	REQUIRE(result->RowCount() == 1);
+	REQUIRE(result->GetValue(0, 0) == Value::INTEGER(2));
+	REQUIRE(result->GetValue(1, 0) == Value("beta"));
+	auto &call = twin.LastWrite();
+	REQUIRE(call.rows_only);
+	REQUIRE(call.rows == vector<vector<Value>> {{Value::INTEGER(2)}});
+	REQUIRE(Scalar(twin, "SELECT count(*) FROM orders") == Value::BIGINT(4));
+}
+
 TEST_CASE("a delete addresses rows by the key and reports what the source removed", "[writes]") {
 	auto transport = EACH_TRANSPORT();
 	INFO(TransportName(transport));

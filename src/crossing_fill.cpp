@@ -59,7 +59,7 @@ unique_ptr<LogicalOperator> InSeamOrder(unique_ptr<LogicalOperator> rows, const 
 
 unique_ptr<LogicalOperator> SeamInsert(ClientContext &context, TableIndex table_index,
                                        unique_ptr<CrossingBindData> write, bool returning, vector<idx_t> key_positions,
-                                       SeamFill fill, const FreshTableIndex &fresh) {
+                                       vector<idx_t> seam_positions, SeamFill fill, const FreshTableIndex &fresh) {
 	auto &table = write->table;
 	CreateTableInfo info(table.schema, table.name);
 	if (returning) {
@@ -72,11 +72,12 @@ unique_ptr<LogicalOperator> SeamInsert(ClientContext &context, TableIndex table_
 	auto entry = make_shared_ptr<CrossingSeamEntry>(table.catalog, table.schema, info, std::move(write),
 	                                                std::move(fill.obstacle));
 	entry->key_positions = std::move(key_positions);
+	entry->seam_positions = std::move(seam_positions);
 	CrossingSeamEntries::Get(context)->Hold(entry);
 
 	auto insert = make_uniq<LogicalInsert>(*entry, table_index);
 	insert->return_chunk = returning;
-	insert->expected_types = std::move(fill.seam_types);
+	insert->expected_types = fill.remainder->types;
 	insert->children.push_back(InSeamOrder(std::move(fill.remainder), fresh));
 	return std::move(insert);
 }
@@ -93,8 +94,8 @@ void FillFromFeed(ClientContext &context, unique_ptr<LogicalOperator> &node, Cro
 		node = MakeFence(table_index, std::move(write));
 		return;
 	}
-	node =
-	    SeamInsert(context, table_index, std::move(write), returning, std::move(key_positions), std::move(fill), fresh);
+	node = SeamInsert(context, table_index, std::move(write), returning, std::move(key_positions), stop.seam_positions,
+	                  std::move(fill), fresh);
 }
 
 void FillWrite(ClientContext &context, unique_ptr<LogicalOperator> &node, const FreshTableIndex &fresh,
@@ -122,15 +123,16 @@ void FillWrite(ClientContext &context, unique_ptr<LogicalOperator> &node, const 
 	SeamObstacle stop;
 	vector<idx_t> key_positions;
 	if (verb != CrossingVerb::INSERT && !table->described.key_unique) {
-		stop.node = feed.plan.get();
+		stop.stays = true;
 		stop.obstacle = "the source does not vouch for the key's uniqueness";
 		for (idx_t k = 0; k < keys.size(); k++) {
 			key_positions.push_back(returning ? keys[k] : k);
 		}
 	}
 	if (returning) {
-		stop.node = feed.image;
+		stop.stays = true;
 		stop.obstacle = "RETURNING needs the rows on the target";
+		stop.seam_positions = std::move(feed.seam_positions);
 	}
 
 	FillFromFeed(context, node, *table, verb, std::move(seam), std::move(fragment), std::move(feed.plan), stop,

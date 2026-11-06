@@ -596,6 +596,9 @@ PhysicalOperator &CrossingWriteCatalog::PlanInsert(ClientContext &context, Physi
 	crossing.return_chunk = op.return_chunk;
 	crossing.obstacle = entry->obstacle;
 	crossing.key_positions = entry->key_positions;
+	for (idx_t i = 0; i < entry->seam_positions.size(); i++) {
+		crossing.seam_row.push_back(RefAt(write.fragment->seam_types[i], entry->seam_positions[i]));
+	}
 	insert.children.push_back(*plan);
 	return insert;
 }

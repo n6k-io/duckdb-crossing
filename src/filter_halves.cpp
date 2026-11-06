@@ -26,13 +26,12 @@ optional_ptr<CrossingSource> SourceOfFirstScanBelow(LogicalOperator &op, const C
 	return nullptr;
 }
 
-void SplitOneFilter(unique_ptr<LogicalOperator> &node, optional_ptr<CrossingSource> against, bool evaluable_above,
-                    const CrossingIdentity &identity) {
+void SplitOneFilter(unique_ptr<LogicalOperator> &node, const CrossingIdentity &identity) {
 	auto &filter = node->Cast<LogicalFilter>();
 	if (filter.expressions.size() < 2 || filter.children.size() != 1) {
 		return;
 	}
-	auto source = against ? against : SourceOfFirstScanBelow(*filter.children[0], identity);
+	auto source = SourceOfFirstScanBelow(*filter.children[0], identity);
 	if (!source) {
 		return;
 	}
@@ -57,15 +56,12 @@ void SplitOneFilter(unique_ptr<LogicalOperator> &node, optional_ptr<CrossingSour
 		return;
 	}
 
-	auto &upper_half = evaluable_above ? evaluable : kept;
-	auto &lower_half = evaluable_above ? kept : evaluable;
-
 	auto lower = make_uniq<LogicalFilter>();
-	lower->expressions = std::move(lower_half);
+	lower->expressions = std::move(evaluable);
 	lower->children.push_back(std::move(filter.children[0]));
 	lower->ResolveOperatorTypes();
 
-	filter.expressions = std::move(upper_half);
+	filter.expressions = std::move(kept);
 	filter.children[0] = std::move(lower);
 	filter.ResolveOperatorTypes();
 }
@@ -125,16 +121,7 @@ void SplitFiltersAtEvaluableHalf(unique_ptr<LogicalOperator> &plan, const Crossi
 		SplitFiltersAtEvaluableHalf(child, identity);
 	}
 	if (plan->type == LogicalOperatorType::LOGICAL_FILTER) {
-		SplitOneFilter(plan, nullptr, false, identity);
-	}
-}
-
-void SplitFiltersAgainst(unique_ptr<LogicalOperator> &plan, CrossingSource &source) {
-	for (auto &child : plan->children) {
-		SplitFiltersAgainst(child, source);
-	}
-	if (plan->type == LogicalOperatorType::LOGICAL_FILTER) {
-		SplitOneFilter(plan, &source, true, source.Identity());
+		SplitOneFilter(plan, identity);
 	}
 }
 

@@ -325,6 +325,13 @@ TEST_CASE("view bodies that run wholly on the source", "[ddl][view]") {
 		           "o.tenant = c.tenant");
 		twin.Same("SELECT id, cname FROM far.v ORDER BY id");
 	}
+	SECTION("a join over a VALUES list") {
+		twin.Query("CREATE VIEW far.main.v AS SELECT o.id, t.y FROM far.orders o JOIN (VALUES (1, 'a'), (2, NULL)) "
+		           "t(x, y) ON o.id = t.x");
+		twin.Same(
+		    "SELECT id, y FROM far.v ORDER BY id",
+		    "SELECT o.id, t.y FROM orders o JOIN (VALUES (1, 'a'), (2, NULL)) t(x, y) ON o.id = t.x ORDER BY o.id");
+	}
 	SECTION("IN over another served table") {
 		twin.Query("CREATE VIEW far.main.v AS SELECT id FROM far.orders WHERE tenant IN (SELECT tenant FROM "
 		           "far.customers)");
@@ -372,7 +379,7 @@ TEST_CASE("a view body that does not run wholly on the source is refused", "[ddl
 	for (auto sql :
 	     {"CREATE VIEW far.main.v AS SELECT 1 AS x",
 	      "CREATE VIEW far.main.v AS SELECT o.id FROM far.orders o JOIN local l ON o.id = l.x",
-	      "CREATE VIEW far.main.v AS SELECT o.id FROM far.orders o JOIN (VALUES (1), (2)) t(x) ON o.id = t.x",
+	      "CREATE VIEW far.main.v AS SELECT o.id FROM far.orders o JOIN (VALUES (1, now())) t(x, y) ON o.id = t.x",
 	      "CREATE VIEW far.main.v AS SELECT upper(name) AS u FROM far.orders"}) {
 		INFO(sql);
 		REQUIRE_THAT(twin.Error(sql), Catch::Contains("does not run wholly on the source"));
