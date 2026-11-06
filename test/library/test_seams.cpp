@@ -272,15 +272,16 @@ TEST_CASE("a seam over the memory limit spills and every row joins", "[seams]") 
 	Twin twin(transport);
 	twin.store->takes_seams = true;
 	twin.Far("CREATE TABLE big(id BIGINT)");
-	twin.Far("INSERT INTO big SELECT i FROM range(64000) r(i)");
+	twin.Far("INSERT INTO big SELECT i FROM range(32000) r(i)");
 	twin.Attach();
-	twin.Query("CREATE TABLE near_rows AS SELECT i AS id, repeat(md5(i::VARCHAR), 32) AS v FROM range(64000) r(i)");
-	twin.Query("SET memory_limit = '32MB'");
+	twin.Query("CREATE TABLE near_rows AS SELECT i AS id, repeat(md5(i::VARCHAR), 32) AS v FROM range(32000) r(i)");
+	twin.Query("SET memory_limit = '16MB'");
 
 	auto result = twin.Query("SELECT count(*), sum(strlen(n.v)) FROM far.big g JOIN near_rows n ON g.id = n.id");
 
-	REQUIRE(result->GetValue(0, 0) == Value::BIGINT(64000));
+	REQUIRE(result->GetValue(0, 0) == Value::BIGINT(32000));
 	REQUIRE(HasJoin(twin.LastRead()));
+	REQUIRE(twin.LastRead().target_swap_bytes > 0);
 }
 
 TEST_CASE("a seam rows' order and duplicates reach the join", "[seams]") {

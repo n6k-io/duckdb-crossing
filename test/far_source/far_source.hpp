@@ -45,7 +45,10 @@ public:
 		return result->RowCount();
 	}
 	Value GetValue(idx_t column, idx_t row) {
-		return result->Collection().GetValue(column, row);
+		if (!rows) {
+			rows = make_uniq<ColumnDataRowCollection>(result->Collection());
+		}
+		return rows->GetValue(column, row);
 	}
 
 	vector<LogicalType> types;
@@ -53,6 +56,8 @@ public:
 
 private:
 	unique_ptr<QueryResult> result;
+	//! ColumnDataCollection::GetValue rescans the whole collection on every call.
+	unique_ptr<ColumnDataRowCollection> rows;
 };
 
 inline unique_ptr<TestResult> Collected(unique_ptr<QueryResult> result) {
@@ -169,7 +174,7 @@ private:
 	vector<vector<Value>> Evaluate(const LogicalOperator &plan, FarCall &call);
 	vector<vector<Value>> EvaluateNative(const LogicalOperator &plan, FarCall &call);
 	vector<vector<Value>> EvaluateSubstrait(const LogicalOperator &plan, FarCall &call);
-	CrossingScan Read(const CrossingQuery &query);
+	CrossingScan Read(ClientContext &context, const CrossingQuery &query);
 	CrossingScan Write(const CrossingQuery &query);
 	vector<vector<Value>> Apply(const CrossingQuery &query);
 	unique_ptr<CreateViewInfo> ReceiveView(const CreateViewInfo &view, const LogicalOperator &plan);

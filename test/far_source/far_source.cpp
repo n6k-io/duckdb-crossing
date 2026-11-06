@@ -31,22 +31,6 @@ namespace {
 
 constexpr const char *FAR_CATALOG = "memory";
 
-vector<vector<Value>> RowsOf(QueryResult &result) {
-	if (result.HasError()) {
-		result.ThrowError();
-	}
-	auto &rows = result.Collection();
-	vector<vector<Value>> out;
-	for (idx_t r = 0; r < rows.Count(); r++) {
-		vector<Value> row;
-		for (idx_t c = 0; c < rows.ColumnCount(); c++) {
-			row.push_back(rows.GetValue(c, r));
-		}
-		out.push_back(std::move(row));
-	}
-	return out;
-}
-
 vector<vector<Value>> RowsOf(const ColumnDataCollection &collection) {
 	vector<vector<Value>> out;
 	for (auto &chunk : collection.Chunks()) {
@@ -59,6 +43,13 @@ vector<vector<Value>> RowsOf(const ColumnDataCollection &collection) {
 		}
 	}
 	return out;
+}
+
+vector<vector<Value>> RowsOf(QueryResult &result) {
+	if (result.HasError()) {
+		result.ThrowError();
+	}
+	return RowsOf(result.Collection());
 }
 
 void CollectOperators(const LogicalOperator &op, vector<LogicalOperatorType> &out) {
@@ -600,12 +591,13 @@ vector<vector<Value>> FarSession::Evaluate(const LogicalOperator &plan, FarCall 
 	return EvaluateSubstrait(plan, call);
 }
 
-CrossingScan FarSession::Run(ClientContext &, const CrossingQuery &query) {
-	return WriteOf(query.plan) ? Write(query) : Read(query);
+CrossingScan FarSession::Run(ClientContext &context, const CrossingQuery &query) {
+	return WriteOf(query.plan) ? Write(query) : Read(context, query);
 }
 
-CrossingScan FarSession::Read(const CrossingQuery &query) {
+CrossingScan FarSession::Read(ClientContext &context, const CrossingQuery &query) {
 	auto call = Record(query);
+	call.target_swap_bytes = BufferManager::GetBufferManager(context).GetUsedSwap();
 	auto rows = make_shared_ptr<const vector<vector<Value>>>(Evaluate(query.plan, call));
 	call.rows = *rows;
 	lock_guard<mutex> guard(store->lock);

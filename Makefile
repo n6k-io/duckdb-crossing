@@ -39,6 +39,7 @@ build: duckdb
 	@$(call logged_build,crossing,cmake -S "$(PROJ_DIR)" -B "$(BUILD_DIR)" \
 		-DDUCKDB_SOURCE_DIR="$(DUCKDB_SOURCE_DIR)" \
 		-DDUCKDB_BUILD_DIR="$(DUCKDB_BUILD_DIR)" \
+		-DCMAKE_CXX_FLAGS=-O2 \
 		&& cmake --build "$(BUILD_DIR)" -j$(JOBS))
 
 test: build
