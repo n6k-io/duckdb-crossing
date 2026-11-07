@@ -3,6 +3,7 @@
 #include "duckdb/common/error_data.hpp"
 #include "duckdb/common/mutex.hpp"
 #include "duckdb/main/connection.hpp"
+#include "duckdb/parser/sql_statement.hpp"
 
 #include "crossing_link.hpp"
 #include "crossing_substrait.hpp"
@@ -17,6 +18,13 @@ struct CrossingFarOptions {
 	CrossingFloorResolver floors;
 	//! Called with each catalog a plan names; throws to refuse the plan.
 	SubstraitCatalogCheck catalogs;
+	//! Called with each INSERT, UPDATE, DELETE or MERGE before it binds. It may change the statement, such as to
+	//! check the values written, or throw to refuse it. The target is aliased `crossing_target`, except on an INSERT,
+	//! and the rows written from are `crossing_source`, with columns c0, c1, ...
+	std::function<void(SQLStatement &)> writes;
+	//! Called with each CREATE, ALTER or DROP before it runs, CREATE TABLE AS included. It may change the statement
+	//! or throw to refuse it.
+	std::function<void(SQLStatement &)> ddl;
 };
 
 //! The far side of a link: everything but moving its frames. Serve holds one transaction on `connection`

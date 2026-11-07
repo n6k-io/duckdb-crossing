@@ -146,6 +146,8 @@ struct FarStore {
 	//! Handed to the Substrait decode of every received plan.
 	SubstraitCatalogCheck catalog_check;
 	CrossingFloorResolver floors;
+	std::function<void(SQLStatement &)> write_shaper;
+	std::function<void(SQLStatement &)> ddl_shaper;
 
 	const FarCall &LastRead();
 	const FarCall &LastWrite();

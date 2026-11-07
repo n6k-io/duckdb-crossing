@@ -1,7 +1,11 @@
 #include "framework/twin.hpp"
 
 #include "duckdb/parser/parser.hpp"
+#include "duckdb/parser/query_node/select_node.hpp"
+#include "duckdb/parser/query_node/update_query_node.hpp"
+#include "duckdb/parser/statement/insert_statement.hpp"
 #include "duckdb/parser/statement/select_statement.hpp"
+#include "duckdb/parser/statement/update_statement.hpp"
 #include "duckdb/parser/tableref/subqueryref.hpp"
 
 using namespace duckdb;
@@ -419,4 +423,61 @@ TEST_CASE("a table created in the transaction keeps the constraints it was creat
 	twin.Query("COMMIT");
 
 	REQUIRE(Scalar(twin, "SELECT v FROM n WHERE id = 1") == Value::INTEGER(2));
+}
+
+TEST_CASE("far's write hook checks the values a write sets", "[link]") {
+	Twin twin;
+	twin.Far("CREATE TABLE p(id INTEGER, tenant INTEGER)");
+	twin.Far("INSERT INTO p VALUES (1, 1)");
+	auto &far_context = *twin.store->con.context;
+	twin.store->write_shaper = [&far_context](SQLStatement &statement) {
+		auto refused = [&far_context](const string &value) {
+			Parser parser(far_context);
+			auto parsed = parser.ParseExpressionList("CASE WHEN " + value + " = 1 THEN " + value +
+			                                         " ELSE error('tenant must be 1') END");
+			return std::move(parsed[0]);
+		};
+		if (statement.type == StatementType::INSERT_STATEMENT) {
+			auto &select = statement.Cast<InsertStatement>().node->select_statement->node->Cast<SelectNode>();
+			select.select_list[1] = refused("c1");
+		} else if (statement.type == StatementType::UPDATE_STATEMENT) {
+			auto &set = *statement.Cast<UpdateStatement>().node->set_info;
+			for (idx_t c = 0; c < set.columns.size(); c++) {
+				if (set.columns[c].GetIdentifierName() == "tenant") {
+					set.expressions[c] = refused("(" + set.expressions[c]->ToString() + ")");
+				}
+			}
+		}
+	};
+	twin.Attach();
+
+	twin.Query("INSERT INTO far.p VALUES (2, 1)");
+	REQUIRE_THAT(twin.Error("INSERT INTO far.p VALUES (3, 2)"), Catch::Contains("tenant must be 1"));
+	REQUIRE_THAT(twin.Error("UPDATE far.p SET tenant = 2 WHERE id = 1"), Catch::Contains("tenant must be 1"));
+	twin.Query("UPDATE far.p SET tenant = 1, id = 9 WHERE id = 1");
+	REQUIRE(Scalar(twin, "SELECT count(*) FROM p WHERE tenant = 1") == Value::BIGINT(2));
+	REQUIRE(Scalar(twin, "SELECT count(*) FROM p WHERE id = 9") == Value::BIGINT(1));
+}
+
+TEST_CASE("far's DDL hook sees every CREATE, ALTER and DROP, and can refuse one", "[link]") {
+	Twin twin;
+	twin.Far("CREATE TABLE t(id INTEGER)");
+	vector<StatementType> seen;
+	twin.store->ddl_shaper = [&seen](SQLStatement &statement) {
+		seen.push_back(statement.type);
+		if (statement.type == StatementType::DROP_STATEMENT) {
+			throw PermissionException("no dropping");
+		}
+	};
+	twin.Attach();
+
+	twin.Query("CREATE TABLE far.main.made(a INTEGER)");
+	twin.Query("ALTER TABLE far.main.made ADD COLUMN b INTEGER");
+	twin.Query("CREATE TABLE far.main.copied AS SELECT id FROM far.t");
+	REQUIRE_THAT(twin.Error("DROP TABLE far.main.t"), Catch::Contains("no dropping"));
+
+	REQUIRE(seen == vector<StatementType> {StatementType::CREATE_STATEMENT, StatementType::ALTER_STATEMENT,
+	                                       StatementType::CREATE_STATEMENT, StatementType::DROP_STATEMENT});
+	REQUIRE(Scalar(twin, "SELECT count(*) FROM duckdb_tables() WHERE table_name IN ('t', 'made', 'copied')") ==
+	        Value::BIGINT(3));
 }

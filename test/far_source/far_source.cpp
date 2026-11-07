@@ -134,62 +134,60 @@ class FarLink : public CrossingLink {
 public:
 	FarLink(shared_ptr<FarStore> store_p, string catalog_p, string floor_catalog_p)
 	    : store(std::move(store_p)), catalog(std::move(catalog_p)), floor_catalog(std::move(floor_catalog_p)),
-	      pair(store->streams, store->capacity, store->far_streams), far(store->db) {
-		pair.on_rows = [this](idx_t id, int side, DataChunk &rows) {
+	      parsing(store->db) {
+		auto instrumented = make_uniq<TestLinkPair>(store->streams, store->capacity, store->far_streams);
+		pair = instrumented.get();
+		pair->on_rows = [this](idx_t id, int side, DataChunk &rows) {
 			if (side == 1) {
 				store->far_rows_sent += rows.size();
 			}
 			Observe(id, side, rows);
 		};
-		pair.on_control = [this](const string &header) {
+		pair->on_control = [this](const string &header) {
 			end_word = header == CROSSING_CONTROL_COMMIT ? "commit" : end_word;
 			if (header.compare(0, 5, CROSSING_CONTROL_PLAN) == 0 && header[5] == '1') {
 				end_word = "commit";
 			}
 			if (header.compare(0, 4, CROSSING_CONTROL_DDL) == 0) {
-				auto ddl = DdlOfFrame(*far.context, header.substr(4));
+				auto ddl = DdlOfFrame(*parsing.context, header.substr(4));
 				lock_guard<mutex> guard(store->lock);
 				store->ddls.push_back(std::move(ddl));
 			}
 		};
-		pair.stall = [this](idx_t id) {
+		pair->stall = [this](idx_t id) {
 			return id == 0 ? store->stall_replies.load() : store->stall_results.load();
 		};
 		{
 			lock_guard<mutex> guard(store->lock);
 			store->release_link = [this]() {
-				pair.Release();
+				pair->Release();
 			};
 		}
 		CrossingFarOptions options;
 		options.catalogs = store->catalog_check;
 		options.floors = store->floors;
-		far_side = make_uniq<CrossingFar>(far, catalog, options);
-		serving = std::thread([this]() {
-			try {
-				far_side->Serve(pair.Far());
-			} catch (...) {
-			}
-		});
+		options.writes = store->write_shaper;
+		options.ddl = store->ddl_shaper;
+		link = make_uniq<CrossingInProcessLink>(*store->db.instance, catalog, options, std::move(instrumented));
 	}
 
 	~FarLink() override {
-		serving.join();
+		link->Wait();
 		lock_guard<mutex> guard(store->lock);
 		store->transaction_ends.push_back(end_word);
-		store->seam_rows += pair.SeamRows();
-		store->waits += pair.Waits();
-		store->near_control_replies += pair.NearControlReplies();
-		store->near_recv_streams = pair.NearRecvStreams().size();
-		store->most_held_for_near = MaxValue(store->most_held_for_near, pair.MostHeldForNear());
+		store->seam_rows += pair->SeamRows();
+		store->waits += pair->Waits();
+		store->near_control_replies += pair->NearControlReplies();
+		store->near_recv_streams = pair->NearRecvStreams().size();
+		store->most_held_for_near = MaxValue(store->most_held_for_near, pair->MostHeldForNear());
 		store->release_link = nullptr;
 	}
 
 	idx_t Streams() override {
-		return pair.Near().Streams();
+		return link->Streams();
 	}
 	unique_ptr<CrossingStream> Open(idx_t id, optional_ptr<CrossingReceiver> receiver) override {
-		return pair.Near().Open(id, receiver);
+		return link->Open(id, receiver);
 	}
 
 private:
@@ -216,10 +214,9 @@ private:
 	shared_ptr<FarStore> store;
 	string catalog;
 	string floor_catalog;
-	TestLinkPair pair;
-	Connection far;
-	unique_ptr<CrossingFar> far_side;
-	std::thread serving;
+	Connection parsing;
+	optional_ptr<TestLinkPair> pair;
+	unique_ptr<CrossingInProcessLink> link;
 	string end_word = "rollback";
 };
 

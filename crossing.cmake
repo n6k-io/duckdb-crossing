@@ -34,6 +34,7 @@ set(CROSSING_LIBRARY_SOURCE_NAMES
     crossing_register.cpp
     crossing_far.cpp
     crossing_remote.cpp
+    crossing_in_process.cpp
     shaped_write.cpp
     render/substrait/substrait_types.cpp
     render/substrait/substrait_render.cpp
@@ -64,8 +65,9 @@ function(crossing_sources out_var)
 endfunction()
 
 function(crossing_includes out_var)
+  crossing_substrait_includes(result)
   set(${out_var}
-      ${CROSSING_ROOT}/include
+      ${result}
       PARENT_SCOPE)
 endfunction()
 

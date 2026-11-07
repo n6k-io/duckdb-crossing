@@ -22,7 +22,6 @@
 #include "duckdb/planner/planner.hpp"
 #include "duckdb/transaction/meta_transaction.hpp"
 
-
 namespace duckdb {
 
 CrossingFar::CrossingFar(Connection &connection_p, string catalog_p, CrossingFarOptions options_p)
@@ -91,6 +90,10 @@ bool CrossingFar::RunStatement(CrossingLink &link, CrossingStream &control, cons
 			if (!slice.write_catalog.empty()) {
 				auto &attached = Catalog::GetCatalog(context, Identifier(slice.write_catalog)).GetAttached();
 				MetaTransaction::Get(context).ModifyDatabase(attached, DatabaseModificationType::UPDATE_DATA);
+				auto &shape = slice.statement->type == StatementType::CREATE_STATEMENT ? options.ddl : options.writes;
+				if (shape) {
+					shape(*slice.statement);
+				}
 			}
 			CrossingFarSlice far_slice;
 			far_slice.id = slice.id;
@@ -194,6 +197,9 @@ void CrossingFar::RunDdl(CrossingStream &control, const string &frame) {
 			default:
 				throw InvalidInputException("crossing: far was sent a DDL frame that is not DDL");
 			}
+		}
+		if (options.ddl) {
+			options.ddl(*statement);
 		}
 		context.Query(std::move(statement), QueryParameters())->ThrowIfError();
 	} catch (std::exception &ex) {
