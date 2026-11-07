@@ -22,17 +22,23 @@ class CrossingFailure {
 public:
 	void Hold(vector<unique_ptr<CrossingStream>> streams);
 	void CloseHeld(const ErrorData &error);
+	//! Wakes every sink waiting to send; each throws `error` when it goes on.
+	void Cancel(const ErrorData &error);
+	void WakeOnCancel(CrossingWaker waker);
+	void ThrowIfCancelled();
 
 private:
 	mutex lock;
 	vector<unique_ptr<CrossingStream>> held;
+	ErrorData cancelled;
+	vector<CrossingWaker> waiting;
 };
 
 //! What sending rows into a slice's streams takes, on either side of the wire.
 class CrossingStreamSink {
 public:
-	CrossingStreamSink(CrossingLink &link, idx_t slice, bool into_far, vector<idx_t> columns, vector<LogicalType> types,
-	                   bool ordered, bool parallel, shared_ptr<CrossingFailure> failure);
+	CrossingStreamSink(CrossingLink &link, idx_t streams, idx_t slice, bool into_far, vector<idx_t> columns,
+	                   vector<LogicalType> types, bool ordered, bool parallel, shared_ptr<CrossingFailure> failure);
 
 	bool OrderDependent() const {
 		return ordered && !parallel;
@@ -48,6 +54,7 @@ public:
 	void Finish(GlobalSinkState &state) const;
 
 	CrossingLink *link;
+	idx_t streams;
 	idx_t slice;
 	bool into_far;
 	vector<idx_t> columns;

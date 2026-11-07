@@ -47,6 +47,15 @@ vector<string> CrossingViewColumnNames(const CreateViewInfo &view) {
 	return names;
 }
 
+void CrossingSource::DescribeChanged(const string &, CrossingTable &table) {
+	table.returning = true;
+	table.verbs = {CrossingVerb::SELECT, CrossingVerb::DROP};
+	if (table.row_ids) {
+		table.verbs.insert(table.verbs.end(),
+		                   {CrossingVerb::INSERT, CrossingVerb::UPDATE, CrossingVerb::DELETE_, CrossingVerb::ALTER});
+	}
+}
+
 const CrossingIdentity &CrossingDefaultIdentity() {
 	static const CrossingIdentity identity;
 	return identity;

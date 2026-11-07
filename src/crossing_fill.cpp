@@ -118,6 +118,10 @@ void FillWrite(ClientContext &context, unique_ptr<LogicalOperator> &node, const 
 	if (node->children.size() != 1) {
 		throw NotImplementedException("crossing: %s without a source of rows", CrossingVerbName(verb));
 	}
+	if (verb != CrossingVerb::INSERT && !table->described.row_ids) {
+		throw BinderException("crossing: '%s' has no row ids, so this %s cannot address its rows",
+		                      table->name.GetIdentifierName(), CrossingVerbName(verb));
+	}
 
 	auto seam = SeamOf(*table, table->described, verb, SetColumnsOf(*node, *table));
 	if (ReturnsRows(*node)) {

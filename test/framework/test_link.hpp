@@ -16,9 +16,9 @@ namespace duckdb {
 //! Two ends of one link in one process. A pipe holds `capacity` frames, then Send returns WAIT.
 class TestLinkPair {
 public:
-	explicit TestLinkPair(idx_t streams_p = 1, idx_t capacity_p = 4)
+	explicit TestLinkPair(idx_t streams_p = 1, idx_t capacity_p = 4, idx_t far_streams_p = 0)
 	    : near_end(make_uniq<End>(*this, 0)), far_end(make_uniq<End>(*this, 1)), streams(streams_p),
-	      capacity(capacity_p) {
+	      far_streams(far_streams_p ? far_streams_p : streams_p), capacity(capacity_p) {
 	}
 
 	CrossingLink &Near() {
@@ -39,6 +39,10 @@ public:
 	std::set<std::thread::id> SendingThreads() {
 		lock_guard<mutex> guard(lock);
 		return sending_threads;
+	}
+	idx_t NearControlReplies() {
+		lock_guard<mutex> guard(lock);
+		return near_control_replies;
 	}
 	idx_t SeamRows() {
 		lock_guard<mutex> guard(lock);
@@ -130,6 +134,9 @@ private:
 				if (!pipe.frames.empty()) {
 					auto stored = std::move(pipe.frames.front());
 					pipe.frames.pop_front();
+					if (id == 0 && side == 0) {
+						pair.near_control_replies++;
+					}
 					frame.header = stored.header;
 					if (stored.has_rows) {
 						frame.rows.Reset();
@@ -186,7 +193,7 @@ private:
 		End(TestLinkPair &pair_p, int side_p) : pair(pair_p), side(side_p) {
 		}
 		idx_t Streams() override {
-			return pair.streams;
+			return side == 0 ? pair.streams : pair.far_streams;
 		}
 		unique_ptr<CrossingStream> Open(idx_t id) override {
 			return make_uniq<Stream>(pair, id, side);
@@ -200,7 +207,9 @@ private:
 	unique_ptr<End> near_end;
 	unique_ptr<End> far_end;
 	idx_t streams;
+	idx_t far_streams;
 	idx_t capacity;
+	idx_t near_control_replies = 0;
 	mutex lock;
 	std::map<std::pair<idx_t, int>, Pipe> pipes;
 	std::set<idx_t> used_streams;

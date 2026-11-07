@@ -134,12 +134,15 @@ class FarLink : public CrossingLink {
 public:
 	FarLink(shared_ptr<FarStore> store_p, string catalog_p, string floor_catalog_p)
 	    : store(std::move(store_p)), catalog(std::move(catalog_p)), floor_catalog(std::move(floor_catalog_p)),
-	      pair(store->streams, store->capacity), far(store->db) {
+	      pair(store->streams, store->capacity, store->far_streams), far(store->db) {
 		pair.on_rows = [this](idx_t id, int side, DataChunk &rows) {
 			Observe(id, side, rows);
 		};
 		pair.on_control = [this](const string &header) {
 			end_word = header == CROSSING_CONTROL_COMMIT ? "commit" : end_word;
+			if (header.compare(0, 5, CROSSING_CONTROL_PLAN) == 0 && header[5] == '1') {
+				end_word = "commit";
+			}
 			if (header.compare(0, 4, CROSSING_CONTROL_DDL) == 0) {
 				auto ddl = DdlOfFrame(*far.context, header.substr(4));
 				lock_guard<mutex> guard(store->lock);
@@ -164,6 +167,7 @@ public:
 		store->transaction_ends.push_back(end_word);
 		store->seam_rows += pair.SeamRows();
 		store->waits += pair.Waits();
+		store->near_control_replies += pair.NearControlReplies();
 	}
 
 	idx_t Streams() override {
@@ -171,12 +175,6 @@ public:
 	}
 	unique_ptr<CrossingStream> Open(idx_t id) override {
 		return pair.Near().Open(id);
-	}
-	vector<string> Tables(const string &schema) override {
-		return FarSource::TablesOn(far, catalog, schema);
-	}
-	CrossingTable Describe(const string &schema, const string &name) override {
-		return FarSource::DescribeOn(*store, far, catalog, schema, name, floor_catalog);
 	}
 
 private:
@@ -318,6 +316,7 @@ CrossingTable FarSource::DescribeOn(FarStore &store, Connection &con, const stri
 		auto verbs = store.verbs.find(name);
 		table.verbs = verbs != store.verbs.end() ? verbs->second
 		                                         : vector<CrossingVerb> {CrossingVerb::SELECT, CrossingVerb::DROP};
+		table.row_ids = false;
 		return table;
 	}
 	auto description = con.TableInfo(Identifier(catalog), Identifier(schema), Identifier(name));
@@ -453,6 +452,25 @@ unique_ptr<CrossingLink> FarSource::Connect(ClientContext &) {
 		store->slices.clear();
 	}
 	return make_uniq<FarLink>(store, catalog, floor_catalog);
+}
+
+void FarSource::DescribeChanged(const string &schema, CrossingTable &table) {
+	CrossingSource::DescribeChanged(schema, table);
+	table.catalog = floor_catalog;
+	lock_guard<mutex> guard(store->lock);
+	table.returning = store->returning;
+	auto verbs = store->verbs.find(table.name);
+	if (verbs != store->verbs.end()) {
+		table.verbs = verbs->second;
+	}
+	auto key = store->keys.find(table.name);
+	if (store->declare_key_constraints && key != store->keys.end()) {
+		vector<Identifier> key_columns;
+		for (auto &column : key->second) {
+			key_columns.emplace_back(column);
+		}
+		table.constraints.push_back(make_uniq<UniqueConstraint>(std::move(key_columns), true));
+	}
 }
 
 void FarSource::Planned(const LogicalOperator &plan) {

@@ -108,6 +108,9 @@ void ResolveRowIds(LogicalOperator &plan, const CrossingIdentity &identity) {
 		if (column_index.GetPrimaryIndex() != COLUMN_IDENTIFIER_ROW_ID) {
 			throw NotImplementedException("crossing: '%s' cannot read this virtual column", data->SourceTable());
 		}
+		if (!data->table.described.row_ids) {
+			throw BinderException("crossing: '%s' has no row ids", data->SourceTable());
+		}
 		auto column = data->fragment->IncludeRowId();
 		column_index = ColumnIndex(column);
 		if (column == get.returned_types.size()) {

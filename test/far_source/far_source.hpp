@@ -123,6 +123,9 @@ struct FarStore {
 	idx_t capacity = 4;
 	idx_t seam_rows = 0;
 	idx_t waits = 0;
+	idx_t near_control_replies = 0;
+	//! Non-zero: what far's end of the link reports, which crossing must not ask.
+	idx_t far_streams = 0;
 	//! For each slice of the open transaction, whether it is a write and where its call is.
 	vector<std::pair<bool, idx_t>> slices;
 	//! Runs at the start of the source calls that report themselves, with the call's name, outside `lock`.
@@ -153,6 +156,7 @@ public:
 	CrossingVerdict AcceptsOperator(const LogicalOperator &op) override;
 	CrossingVerdict AcceptsSeam(const vector<LogicalType> &types) override;
 	unique_ptr<CrossingLink> Connect(ClientContext &context) override;
+	void DescribeChanged(const string &schema, CrossingTable &table) override;
 	void Detach(ClientContext &context) override;
 	const void *Group() const override;
 	void Planned(const LogicalOperator &plan) override;

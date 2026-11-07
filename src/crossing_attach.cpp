@@ -144,7 +144,7 @@ auto CrossingAttach::WithTables(const string &schema, optional_ptr<Transaction> 
 		if (it != slot->overlays.end()) {
 			auto &overlay = it->second;
 			if (!overlay.listed) {
-				for (auto &table : slot->link->Tables(schema)) {
+				for (auto &table : slot->remote->Tables(schema)) {
 					overlay.tables.insert(table);
 				}
 				overlay.listed = true;
@@ -247,7 +247,9 @@ CrossingTable CrossingAttach::DescribeAs(const string &schema, const string &nam
 	if (slot) {
 		lock_guard<mutex> guard(slot->lock);
 		if (slot->overlays.find(schema) != slot->overlays.end()) {
-			return slot->link->Describe(schema, name);
+			auto table = slot->remote->Describe(*transaction->context.lock(), schema, name);
+			source->DescribeChanged(schema, table);
+			return table;
 		}
 	}
 	return source->Describe(schema, name);
@@ -494,6 +496,13 @@ CrossingAttach::Slot &CrossingAttach::SlotOf(Transaction &transaction) {
 CrossingRemote &CrossingAttach::RemoteOf(ClientContext &context, Transaction &transaction) {
 	auto &slot = SlotOf(transaction);
 	lock_guard<mutex> guard(slot.lock);
+	if (slot.remote && slot.remote->EndedByFar()) {
+		auto finished = make_uniq<CrossingOpenTransaction>();
+		finished->link = std::move(slot.link);
+		finished->remote = std::move(slot.remote);
+		slot.finished.push_back(std::move(finished));
+		slot.statement = nullptr;
+	}
 	if (!slot.remote) {
 		slot.link = source->Connect(context);
 		if (!slot.link) {
@@ -512,6 +521,7 @@ shared_ptr<CrossingRemoteStatement> CrossingAttach::RemoteStatement(ClientContex
 	if (!slot.statement || slot.statement_query != query) {
 		remote.DrainStatement();
 		slot.statement = make_shared_ptr<CrossingRemoteStatement>(remote);
+		slot.statement->SetAutoCommit(context.transaction.IsAutoCommit());
 		slot.statement_query = query;
 	}
 	return slot.statement;
@@ -524,6 +534,7 @@ unique_ptr<CrossingOpenTransaction> CrossingAttach::TakeOpen(Slot &slot) {
 	auto open = make_uniq<CrossingOpenTransaction>();
 	open->link = std::move(slot.link);
 	open->remote = std::move(slot.remote);
+	open->finished = std::move(slot.finished);
 	slot.statement = nullptr;
 	return open;
 }

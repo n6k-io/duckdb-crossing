@@ -6,6 +6,7 @@
 #include "internal/seam_inbox.hpp"
 #include "internal/stream_sink.hpp"
 
+#include "duckdb/common/string_util.hpp"
 #include "duckdb/execution/physical_operator.hpp"
 #include "duckdb/execution/physical_plan_generator.hpp"
 #include "duckdb/parallel/meta_pipeline.hpp"
@@ -42,6 +43,10 @@ ErrorData CrossingRemote::DrainStatement() {
 
 void CrossingRemote::End(const char *word) {
 	ended = true;
+	if (ended_by_far) {
+		control->Close(nullptr);
+		return;
+	}
 	auto failed = DrainStatement();
 	SendControl(*control, failed.HasError() ? CROSSING_CONTROL_ROLLBACK : word);
 	string reply;
@@ -57,13 +62,35 @@ void CrossingRemote::End(const char *word) {
 }
 
 void CrossingRemote::RunDdl(const string &frame) {
+	Ask(CROSSING_CONTROL_DDL + frame);
+}
+
+vector<string> CrossingRemote::Tables(const string &schema) {
+	auto reply = Ask(CROSSING_CONTROL_TABLES + schema);
+	return reply.empty() ? vector<string>() : StringUtil::Split(reply, '\n');
+}
+
+CrossingTable CrossingRemote::Describe(ClientContext &context, const string &schema, const string &name) {
+	auto lines = StringUtil::Split(Ask(CROSSING_CONTROL_DESCRIBE + schema + "\n" + name), '\n');
+	CrossingTable table;
+	table.name = name;
+	table.row_ids = lines[0] == "table";
+	for (idx_t l = 1; l + 1 < lines.size(); l += 2) {
+		table.Column(lines[l], TransformStringToLogicalType(lines[l + 1], context));
+	}
+	return table;
+}
+
+string CrossingRemote::Ask(const string &question) {
 	DrainStatement();
-	SendControl(*control, CROSSING_CONTROL_DDL + frame);
+	used = true;
+	SendControl(*control, question);
 	string reply;
 	if (!RecvControl(*control, reply)) {
-		throw IOException("crossing: the link closed before far ran the DDL");
+		throw IOException("crossing: the link closed before far answered");
 	}
 	ThrowIfControlError(reply);
+	return reply;
 }
 
 void CrossingRemote::Commit() {
@@ -106,6 +133,9 @@ void CrossingRemoteStatement::Start() {
 		started = true;
 		try {
 			vector<SubstraitSlice> slices;
+			CrossingPlanFrame frame;
+			frame.streams = remote.Link().Streams();
+			bool writes = false;
 			for (auto &entry : added) {
 				SubstraitSlice slice;
 				slice.id = entry.slice.id;
@@ -114,15 +144,14 @@ void CrossingRemoteStatement::Start() {
 				slice.seam_estimate = entry.seam_estimate;
 				slice.source = entry.slice.Source();
 				slice.write = entry.slice.write.get();
+				writes |= entry.slice.write != nullptr;
 				slices.push_back(slice);
+				frame.slices.push_back(slice.id);
 			}
-			SendControl(remote.Control(), CROSSING_CONTROL_PLAN + RenderSubstraitSlices(slices));
-			string reply;
-			if (!RecvControl(remote.Control(), reply)) {
-				throw IOException("crossing: the link closed before far bound the plan");
-			}
-			ThrowIfControlError(reply);
-			remote.StatementRunning(true);
+			frame.plan = RenderSubstraitSlices(slices);
+			frame.ends_transaction = auto_commit && !writes && !remote.Used();
+			remote.StatementSent(frame.ends_transaction);
+			SendControl(remote.Control(), frame.Encode());
 		} catch (std::exception &ex) {
 			start_error = ErrorData(ex);
 			finished = true;
@@ -139,12 +168,10 @@ void CrossingRemoteStatement::Finish() {
 		return;
 	}
 	finished = true;
-	remote.StatementRunning(false);
-	string reply;
-	if (!RecvControl(remote.Control(), reply)) {
-		throw IOException("crossing: the link closed before far ended the statement");
+	auto failed = remote.DrainStatement();
+	if (failed.HasError()) {
+		failed.Throw();
 	}
-	ThrowIfControlError(reply);
 }
 
 namespace {
@@ -488,8 +515,9 @@ PhysicalOperator &PlanCrossingRemote(ClientContext &, PhysicalPlanGenerator &pla
 			positions.push_back(c);
 		}
 		seam_ordered = seam->ordered;
-		sink = make_uniq<CrossingStreamSink>(statement->Remote().Link(), slice.id, true, std::move(positions),
-		                                     std::move(seam->types), seam->ordered, seam->parallel, nullptr);
+		sink = make_uniq<CrossingStreamSink>(statement->Remote().Link(), statement->Remote().Link().Streams(), slice.id,
+		                                     true, std::move(positions), std::move(seam->types), seam->ordered,
+		                                     seam->parallel, nullptr);
 	}
 	auto slice_id = slice.id;
 	auto ordered = slice.ordered;

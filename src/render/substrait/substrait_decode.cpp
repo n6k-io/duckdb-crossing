@@ -2,6 +2,7 @@
 #include "substrait_types.hpp"
 
 #include "duckdb/common/enum_util.hpp"
+#include "duckdb/common/exception/binder_exception.hpp"
 #include "duckdb/common/enums/set_operation_type.hpp"
 #include "duckdb/common/helper.hpp"
 #include "duckdb/common/limits.hpp"
@@ -339,6 +340,15 @@ private:
 			auto policy = resolver(floor);
 			if (!policy) {
 				return addressed;
+			}
+			bool exposes_row_id = false;
+			auto relation = make_shared_ptr<ViewRelation>(conn.context, policy->Copy(), table);
+			for (auto &column : relation->Columns()) {
+				exposes_row_id |= column.Name().GetIdentifierName() == "rowid";
+			}
+			if (!exposes_row_id) {
+				throw BinderException("crossing: the row policy on '%s' hides rowid, so a write cannot reach its rows",
+				                      table);
 			}
 			auto select = make_uniq<SelectNode>();
 			select->select_list.push_back(make_uniq<ColumnRefExpression>(Identifier("rowid")));

@@ -67,6 +67,9 @@ struct CrossingTable {
 	vector<CrossingVerb> verbs;
 	//! Whether a write may return rows. Without it RETURNING is refused at bind.
 	bool returning = false;
+	//! Whether far's table has a `rowid`, as a view has not. Without it a write that crossing cannot say as target,
+	//! source and condition, such as one with a subquery in its WHERE, is refused at bind.
+	bool row_ids = true;
 	//! Constraints the source enforces. Declaring one your source does not enforce claims a
 	//! guarantee nothing keeps, so only pass what is real.
 	vector<unique_ptr<Constraint>> constraints;
@@ -174,6 +177,9 @@ public:
 	}
 	virtual void Detach(ClientContext &context) {
 	}
+	//! Fills in `table`, of which far has given the columns, when a transaction reads a schema it changed. Defaults
+	//! to every verb.
+	virtual void DescribeChanged(const string &schema, CrossingTable &table);
 	//! Told of each slice as it is planned, before it is sent. For logging and tests.
 	virtual void Planned(const LogicalOperator &plan) {
 	}

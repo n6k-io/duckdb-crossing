@@ -29,12 +29,46 @@ void CrossingFailure::CloseHeld(const ErrorData &error) {
 	held.clear();
 }
 
+void CrossingFailure::Cancel(const ErrorData &error) {
+	vector<CrossingWaker> wake;
+	{
+		lock_guard<mutex> guard(lock);
+		cancelled = error;
+		wake.swap(waiting);
+	}
+	for (auto &waker : wake) {
+		waker.Wake();
+	}
+}
+
+void CrossingFailure::WakeOnCancel(CrossingWaker waker) {
+	{
+		lock_guard<mutex> guard(lock);
+		if (!cancelled.HasError()) {
+			waiting.push_back(std::move(waker));
+			return;
+		}
+	}
+	waker.Wake();
+}
+
+void CrossingFailure::ThrowIfCancelled() {
+	lock_guard<mutex> guard(lock);
+	if (cancelled.HasError()) {
+		cancelled.Throw();
+	}
+}
+
 namespace {
 
 enum class Sent : uint8_t { TAKEN, BLOCKED, STOPPED };
 
-Sent SendFrame(CrossingStream &stream, CrossingFrame &frame, const InterruptState &resume) {
+Sent SendFrame(CrossingStream &stream, CrossingFrame &frame, const InterruptState &resume,
+               const shared_ptr<CrossingFailure> &failure) {
 	while (true) {
+		if (failure) {
+			failure->ThrowIfCancelled();
+		}
 		auto parking = CrossingParking::Of(resume);
 		switch (stream.Send(frame, parking->Waker())) {
 		case CrossingIo::TAKEN:
@@ -42,6 +76,9 @@ Sent SendFrame(CrossingStream &stream, CrossingFrame &frame, const InterruptStat
 		case CrossingIo::DONE:
 			return Sent::STOPPED;
 		default:
+			if (failure) {
+				failure->WakeOnCancel(parking->Waker());
+			}
 			if (parking->Park()) {
 				return Sent::BLOCKED;
 			}
@@ -102,18 +139,18 @@ bool ClaimStream(StreamSinkGlobal &global, StreamSinkLocal &local, const Interru
 
 } // namespace
 
-CrossingStreamSink::CrossingStreamSink(CrossingLink &link_p, idx_t slice_p, bool into_far_p, vector<idx_t> columns_p,
-                                       vector<LogicalType> types_p, bool ordered_p, bool parallel_p,
-                                       shared_ptr<CrossingFailure> failure_p)
-    : link(&link_p), slice(slice_p), into_far(into_far_p), columns(std::move(columns_p)), types(std::move(types_p)),
-      ordered(ordered_p), parallel(parallel_p), failure(std::move(failure_p)) {
+CrossingStreamSink::CrossingStreamSink(CrossingLink &link_p, idx_t streams_p, idx_t slice_p, bool into_far_p,
+                                       vector<idx_t> columns_p, vector<LogicalType> types_p, bool ordered_p,
+                                       bool parallel_p, shared_ptr<CrossingFailure> failure_p)
+    : link(&link_p), streams(streams_p), slice(slice_p), into_far(into_far_p), columns(std::move(columns_p)),
+      types(std::move(types_p)), ordered(ordered_p), parallel(parallel_p), failure(std::move(failure_p)) {
 }
 
 unique_ptr<GlobalSinkState> CrossingStreamSink::GlobalState() const {
 	auto state = make_uniq<StreamSinkGlobal>();
 	state->failure = failure;
-	auto count = parallel ? link->Streams() : idx_t(1);
-	for (idx_t k = 0; k < link->Streams(); k++) {
+	auto count = parallel ? streams : idx_t(1);
+	for (idx_t k = 0; k < streams; k++) {
 		auto stream = link->Open(CrossingSliceStreamId(slice, into_far, k));
 		if (k < count) {
 			state->streams.push_back(std::move(stream));
@@ -152,7 +189,7 @@ SinkResultType CrossingStreamSink::Sink(DataChunk &chunk, OperatorSinkInput &inp
 	frame.header = CrossingBatchHeader(batch);
 	frame.rows.InitializeEmpty(types);
 	frame.rows.Reference(local.frame_rows);
-	switch (SendFrame(*global.streams[local.stream.GetIndex()], frame, input.interrupt_state)) {
+	switch (SendFrame(*global.streams[local.stream.GetIndex()], frame, input.interrupt_state, failure)) {
 	case Sent::BLOCKED:
 		return SinkResultType::BLOCKED;
 	case Sent::STOPPED:
@@ -176,7 +213,8 @@ SinkCombineResultType CrossingStreamSink::Combine(OperatorSinkCombineInput &inpu
 	if (ordered && !local.stopped) {
 		CrossingFrame idle;
 		idle.header = CROSSING_IDLE_HEADER;
-		if (SendFrame(*global.streams[local.stream.GetIndex()], idle, input.interrupt_state) == Sent::BLOCKED) {
+		if (SendFrame(*global.streams[local.stream.GetIndex()], idle, input.interrupt_state, failure) ==
+		    Sent::BLOCKED) {
 			return SinkCombineResultType::BLOCKED;
 		}
 	}
@@ -201,7 +239,7 @@ SinkNextBatchType CrossingStreamSink::NextBatch(OperatorSinkNextBatchInput &inpu
 	}
 	CrossingFrame reached;
 	reached.header = CrossingBatchHeader(local.partition_info.batch_index.GetIndex());
-	switch (SendFrame(*global.streams[local.stream.GetIndex()], reached, input.interrupt_state)) {
+	switch (SendFrame(*global.streams[local.stream.GetIndex()], reached, input.interrupt_state, failure)) {
 	case Sent::BLOCKED:
 		return SinkNextBatchType::BLOCKED;
 	case Sent::STOPPED:

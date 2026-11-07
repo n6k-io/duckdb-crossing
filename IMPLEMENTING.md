@@ -38,9 +38,10 @@ Optional members, with what happens if you leave them:
 | `AcceptsSeam` | no join runs on far over rows near sends |
 | `Group` | the source is its own group |
 | `Detach` | nothing |
+| `DescribeChanged` | every verb; fills in a table this transaction changed, of which far has given the columns |
 | `Planned` | nothing; told of each slice as it is planned, for logging and tests |
 
-`Describe` fills in `CrossingTable`: columns in source order, the verbs allowed, whether `RETURNING` is allowed, and any constraints far enforces. A verb left out is refused before the statement runs. Answers are cached per attach until `Refresh`.
+`Describe` fills in `CrossingTable`: columns in source order, the verbs allowed, whether `RETURNING` is allowed, any constraints far enforces, and whether far's table has a `rowid` (a view has not). A verb left out is refused before the statement runs. Answers are cached per attach until `Refresh`.
 
 Sources with the same `Group` serve one store through one link, so a plan may join their tables. They must answer the `Accepts*` calls alike. A source whose group spans catalogs sets `CrossingTable::catalog`.
 
@@ -51,8 +52,6 @@ class ToyLink : public CrossingLink {
 public:
 	idx_t Streams() override;
 	unique_ptr<CrossingStream> Open(idx_t id) override;
-	vector<string> Tables(const string &schema) override;
-	CrossingTable Describe(const string &schema, const string &name) override;
 };
 
 class ToyStream : public CrossingStream {
@@ -63,14 +62,13 @@ public:
 };
 ```
 
-- **A link is one far transaction.** `Connect` is called when a transaction first needs far. The link is destroyed after far has answered its commit or rollback.
-- **`Streams`** is how many streams a slice may use in each direction. It caps DuckDB's threads on that slice.
+- **A link is one far transaction.** `Connect` is called when a transaction first needs far. The link is destroyed after far has answered its commit or rollback. A read-only autocommit statement is the exception: far commits it itself, near waits for no reply, and a later statement in that near transaction connects a new link.
+- **`Streams`** is how many streams a slice may use in each direction. It caps DuckDB's threads on that slice. Only near's end is asked; far uses the number near sends.
 - **`Open(id)`** gives one end of a stream. Both ends open the same id, in either order. Streams are independent, so they can be connections, HTTP/2 streams or anything else.
 - **`Send`** returns `TAKEN` once it no longer needs the frame, `WAIT` when it can't take it yet, or `DONE` when the other end closed without an error. On `WAIT`, call the waker when it may go on; crossing sends the same frame again.
 - **`Recv`** fills the frame's `header` and `rows`, and returns `ROWS`, `WAIT`, or `DONE` once the other end closed without an error.
 - **`Close`** ends this end. A non-null error reaches the other end: its `Send` and `Recv` throw it, keeping its type.
 - **`header`** is crossing's: carry it unread. **`rows`** may be empty, and has no columns on a frame that carries only a header. Encode rows however you like; `Recv` is given a chunk initialized with the right types when rows are expected.
-- **`Tables` and `Describe`** answer what this transaction sees after it changed a schema. A source whose schemas declare no DDL verb can leave them out.
 
 `Send`, `Recv` and `Close` are called from any thread, one thread at a time on each end of a stream. `Open`, and `Wake` on a waker, may be called from any thread at any time. A waker may fire before the call that was given it returns.
 
@@ -82,11 +80,11 @@ CrossingFar far(connection, "mycatalog");
 far.Serve(link);
 ```
 
-Crossing owns everything on far. `Serve` opens a transaction on `connection`, runs each statement near sends, and returns when near commits, rolls back or closes the link. Run one per link, on its own thread. It blocks.
+Crossing owns everything on far. `Serve` opens a transaction on `connection`, runs each statement near sends, and returns when near commits, rolls back or closes the link. Run one per link, on its own thread. It blocks. `Cancel` from any thread fails its statement, rolls back and makes it return.
 
 `CrossingFarOptions` takes:
 
-- `floors`: what stands for a table far reads, such as a subquery with a row filter. Its columns are the table's, in order, then `rowid`. An `UPDATE` or `DELETE` reaches only rows it produces. A `MERGE` into a table it replaces is refused.
+- `floors`: what stands for a table far reads, such as a subquery with a row filter. Its columns are the table's, in order, then `rowid`. An `UPDATE` or `DELETE` reaches only rows it produces, and fails with a clear error if it hides `rowid`. A `MERGE` into a table it replaces is refused.
 - `catalogs`: called with each catalog a plan names; throw to refuse the plan.
 
 ## What travels
@@ -96,9 +94,10 @@ Every plan travels as Substrait, in frame headers. A statement's slices are one 
 Whatever Substrait cannot express stays on near.
 
 - **Rows** go through streams as near's feed produces them. Far takes every row and spills if it has to, so a sender never waits on far's results. `VALUES` lists inside a slice still travel in the plan's JSON.
-- **Writes** are native statements on far: `UPDATE ... FROM`, `DELETE ... USING`, `MERGE`, `INSERT`, and `CREATE TABLE AS`. When a write's shape cannot be split into target, source and condition, such as a `WHERE` with a subquery, its rows are addressed by far's `rowid`, which holds within the transaction. A far table with no `rowid`, such as a view, cannot be written that way.
+- **Writes** are native statements on far: `UPDATE ... FROM`, `DELETE ... USING`, `MERGE`, `INSERT`, and `CREATE TABLE AS`. When a write's shape cannot be split into target, source and condition, such as a `WHERE` with a subquery, its rows are addressed by far's `rowid`, which holds within the transaction. On a table declared with `row_ids = false`, such a write is refused at bind.
 - **Order:** when row order matters, rows carry batch positions, and the receiving end releases them in order.
-- **DDL** travels as SQL text, and a view's body as Substrait.
+- **DDL** travels as SQL text, and a view's body as Substrait. Crossing asks far what a transaction sees of a schema it changed, then `DescribeChanged` fills in the rest.
+- **Errors:** near does not wait for far to bind. Far closes the statement's streams with the error, keeping its type.
 
 Writes on far run after the statement's reads have finished, and one at a time, so a transaction never scans a table while changing it.
 

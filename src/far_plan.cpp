@@ -118,8 +118,8 @@ TableFunction SeamRowsFunction(const char *name, OrderPreservationType order) {
 
 class PhysicalStreamOut : public PhysicalOperator {
 public:
-	PhysicalStreamOut(PhysicalPlan &physical_plan, vector<LogicalType> types_p, CrossingStreamSink sink_p, bool writes_p,
-	                  idx_t estimated_cardinality)
+	PhysicalStreamOut(PhysicalPlan &physical_plan, vector<LogicalType> types_p, CrossingStreamSink sink_p,
+	                  bool writes_p, idx_t estimated_cardinality)
 	    : PhysicalOperator(physical_plan, PhysicalOperatorType::EXTENSION, std::move(types_p), estimated_cardinality),
 	      sink(std::move(sink_p)), writes(writes_p) {
 	}
@@ -243,10 +243,10 @@ protected:
 
 class LogicalStreamOut : public LogicalFarOperator {
 public:
-	LogicalStreamOut(TableIndex table_index_p, CrossingLink &link_p, idx_t slice_p, bool ordered_p,
+	LogicalStreamOut(TableIndex table_index_p, CrossingLink &link_p, idx_t streams_p, idx_t slice_p, bool ordered_p,
 	                 bool writes_p, unique_ptr<LogicalOperator> plan, shared_ptr<CrossingFailure> failure_p)
-	    : LogicalFarOperator(table_index_p), link(link_p), slice(slice_p), ordered(ordered_p), writes(writes_p),
-	      failure(std::move(failure_p)) {
+	    : LogicalFarOperator(table_index_p), link(link_p), streams(streams_p), slice(slice_p), ordered(ordered_p),
+	      writes(writes_p), failure(std::move(failure_p)) {
 		plan->ResolveOperatorTypes();
 		auto bindings = plan->GetColumnBindings();
 		for (idx_t c = 0; c < bindings.size(); c++) {
@@ -256,6 +256,7 @@ public:
 	}
 
 	CrossingLink &link;
+	idx_t streams;
 	idx_t slice;
 	bool ordered;
 	bool writes = false;
@@ -272,9 +273,10 @@ public:
 			columns.push_back(expr->Cast<BoundReferenceExpression>().Index());
 			row_types.push_back(expr->GetReturnType());
 		}
-		CrossingStreamSink sink(link, slice, false, std::move(columns), row_types, ordered,
+		CrossingStreamSink sink(link, streams, slice, false, std::move(columns), row_types, ordered,
 		                        !ordered || PhysicalPlanGenerator::UseBatchIndex(context, child), failure);
-		auto &out = planner.Make<PhysicalStreamOut>(std::move(row_types), std::move(sink), writes, estimated_cardinality);
+		auto &out =
+		    planner.Make<PhysicalStreamOut>(std::move(row_types), std::move(sink), writes, estimated_cardinality);
 		out.children.push_back(child);
 		return out;
 	}
@@ -309,11 +311,13 @@ void RegisterCrossingFarFunctions(DatabaseInstance &db) {
 	}
 }
 
-unique_ptr<LogicalOperator> MakeFarRoot(Binder &binder, CrossingLink &link, vector<CrossingFarSlice> slices,
-                                        shared_ptr<CrossingFailure> failure) {
+unique_ptr<LogicalOperator> MakeFarRoot(Binder &binder, CrossingLink &link, idx_t streams,
+                                        vector<CrossingFarSlice> slices, shared_ptr<CrossingFailure> failure) {
 	auto root = make_uniq<LogicalFarRoot>(binder.GenerateTableIndex());
 	for (auto &slice : slices) {
-		root->children.push_back(make_uniq<LogicalStreamOut>(binder.GenerateTableIndex(), link, slice.id, slice.ordered, slice.writes, std::move(slice.plan), failure));
+		root->children.push_back(make_uniq<LogicalStreamOut>(binder.GenerateTableIndex(), link, streams, slice.id,
+		                                                     slice.ordered, slice.writes, std::move(slice.plan),
+		                                                     failure));
 	}
 	return std::move(root);
 }

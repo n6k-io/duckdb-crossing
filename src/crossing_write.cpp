@@ -177,6 +177,10 @@ unique_ptr<MergeIntoOperator> PlanCrossingMergeAction(ClientContext &context, Lo
 	switch (action.action_type) {
 	case MergeActionType::MERGE_UPDATE:
 	case MergeActionType::MERGE_DELETE: {
+		if (!table.described.row_ids) {
+			throw BinderException("crossing: '%s' has no row ids, so this merge cannot address its rows",
+			                      table.name.GetIdentifierName());
+		}
 		auto verb = action.action_type == MergeActionType::MERGE_UPDATE ? CrossingVerb::UPDATE : CrossingVerb::DELETE_;
 		RequireVerb(table, verb);
 		auto seam = SeamOf(table, table.described, verb, SetColumnNames(table, action.columns));

@@ -58,9 +58,10 @@ struct CrossingOpenTransaction {
 	CrossingOpenTransaction();
 	~CrossingOpenTransaction();
 
-	unique_ptr<CrossingRemote> remote;
 	unique_ptr<CrossingLink> link;
+	unique_ptr<CrossingRemote> remote;
 	vector<string> altered_schemas;
+	vector<unique_ptr<CrossingOpenTransaction>> finished;
 };
 
 class CrossingAttach {
@@ -143,6 +144,8 @@ private:
 		mutex lock;
 		unique_ptr<CrossingLink> link;
 		unique_ptr<CrossingRemote> remote;
+		//! Links far ended with a read; statements may still point at them.
+		vector<unique_ptr<CrossingOpenTransaction>> finished;
 		shared_ptr<CrossingRemoteStatement> statement;
 		idx_t statement_query = 0;
 		vector<string> altered_schemas;

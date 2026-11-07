@@ -31,20 +31,36 @@ public:
 	//! Whichever statement far is running ends first: a failure in it fails Commit, which then rolls back.
 	void Commit();
 	void Rollback();
-	void StatementRunning(bool running) {
-		statement_running = running;
+	void StatementSent(bool ends_transaction) {
+		used = true;
+		ended_by_far = ends_transaction;
+		statement_running = !ends_transaction;
+	}
+	bool Used() const {
+		return used;
+	}
+	//! What this transaction sees of a schema it changed.
+	vector<string> Tables(const string &schema);
+	//! The columns, and whether it has row ids; the source fills in the rest.
+	CrossingTable Describe(ClientContext &context, const string &schema, const string &name);
+	//! Far ended this transaction with its statement; another statement needs another link.
+	bool EndedByFar() const {
+		return ended_by_far;
 	}
 	//! Waits out a statement near has finished with. What far reports of it is returned, not thrown.
 	ErrorData DrainStatement();
 
 private:
 	void End(const char *word);
+	string Ask(const string &question);
 
 	CrossingLink &link;
 	unique_ptr<CrossingStream> control;
 	idx_t next_slice = 0;
 	bool ended = false;
 	bool statement_running = false;
+	bool used = false;
+	bool ended_by_far = false;
 };
 
 //! A slice as near plans it. `owned` keeps alive the expressions `write` refers to; `keep` what `borrowed`
@@ -71,6 +87,10 @@ public:
 	CrossingRemote &Remote() {
 		return remote;
 	}
+	//! The statement is its whole transaction.
+	void SetAutoCommit(bool auto_commit_p) {
+		auto_commit = auto_commit_p;
+	}
 	void Add(CrossingRemoteSlice slice, bool seam_ordered, optional_idx seam_estimate);
 	void PutWrite(idx_t slice, unique_ptr<SubstraitWrite> write, vector<unique_ptr<Expression>> owned);
 	//! Blocks until far has bound the plan. Throws what far reported, every time it is called.
@@ -88,6 +108,7 @@ private:
 	CrossingRemote &remote;
 	mutex lock;
 	vector<Added> added;
+	bool auto_commit = false;
 	bool started = false;
 	bool finished = false;
 	ErrorData start_error;

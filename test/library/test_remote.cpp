@@ -506,3 +506,22 @@ TEST_CASE("far works on a seam's rows while they are still arriving", "[remote]"
 	REQUIRE(pair.link.FarSentBeforeSeamEnded());
 	pair.Commit();
 }
+
+TEST_CASE("cancelling far ends a statement parked on either side and returns from Serve", "[remote][failure]") {
+	auto parked_on = GENERATE(as<string> {}, "seam", "send", "idle");
+	INFO(parked_on);
+	Pair pair(1, 1);
+	if (parked_on == "idle") {
+		pair.far_side.Cancel();
+	} else {
+		auto slice =
+		    pair.Slice(parked_on == "seam" ? unique_ptr<LogicalOperator>(MakeSeamNode(0, TWO_BIGINTS)) : pair.Floor(0));
+		pair.statement->Add(std::move(slice), false, optional_idx());
+		pair.statement->Start();
+		std::this_thread::sleep_for(std::chrono::milliseconds(50));
+		pair.far_side.Cancel("stop now");
+	}
+	REQUIRE(pair.serving.wait_for(std::chrono::seconds(REMOTE_TIMEOUT_SECONDS)) == std::future_status::ready);
+	REQUIRE(!pair.serving.get().HasError());
+	REQUIRE(pair.Far("SELECT count(*) FROM t") == 5000);
+}

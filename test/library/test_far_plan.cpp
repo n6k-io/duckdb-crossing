@@ -60,8 +60,8 @@ struct FarDb {
 					far_slice.plan = std::move(bound.plan);
 					far_slices.push_back(std::move(far_slice));
 				}
-				auto root =
-				    MakeFarRoot(*planner.binder, link, std::move(far_slices), make_shared_ptr<CrossingFailure>());
+				auto root = MakeFarRoot(*planner.binder, link, link.Streams(), std::move(far_slices),
+				                        make_shared_ptr<CrossingFailure>());
 				auto result = SubmitCrossingPlan(*con.context, std::move(root));
 				result->ThrowIfError();
 				result->Complete();

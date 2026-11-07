@@ -255,3 +255,92 @@ TEST_CASE("far's floor resolver applies a row policy to reads and writes", "[lin
 	REQUIRE_THAT(twin.Error("MERGE INTO far.p t USING (SELECT 3 AS id) s ON t.id = s.id WHEN MATCHED THEN DELETE"),
 	             Catch::Contains("row policy"));
 }
+
+TEST_CASE("far uses the stream count near sends, whatever its own end reports", "[link]") {
+	auto far_streams = GENERATE(idx_t(1), idx_t(8));
+	INFO("far's end reports " << far_streams);
+	Twin twin;
+	twin.store->streams = 3;
+	twin.store->far_streams = far_streams;
+	twin.Far("CREATE TABLE big AS SELECT i::BIGINT AS id FROM range(50000) r(i)");
+	twin.Attach();
+	twin.Query("SET threads = 4");
+	twin.Query("CREATE TABLE here AS SELECT i::BIGINT AS id FROM range(1000) r(i)");
+
+	REQUIRE(twin.Query("SELECT count(*) FROM far.big")->GetValue(0, 0) == Value::BIGINT(50000));
+	twin.Query("INSERT INTO far.big SELECT id FROM here");
+	REQUIRE(Scalar(twin, "SELECT count(*) FROM big") == Value::BIGINT(51000));
+}
+
+TEST_CASE("a read-only autocommit statement waits for no control reply", "[link]") {
+	Twin twin;
+	twin.Far("CREATE TABLE t(id INTEGER)");
+	twin.Far("INSERT INTO t VALUES (1), (2)");
+	twin.Attach();
+
+	REQUIRE(twin.Query("SELECT count(*) FROM far.t")->GetValue(0, 0) == Value::BIGINT(2));
+	REQUIRE(twin.store->near_control_replies == 0);
+	REQUIRE(twin.store->transaction_ends.back() == "commit");
+
+	twin.Query("BEGIN");
+	REQUIRE(twin.Query("SELECT count(*) FROM far.t")->GetValue(0, 0) == Value::BIGINT(2));
+	twin.Query("COMMIT");
+	REQUIRE(twin.store->near_control_replies == 2);
+	twin.Query("INSERT INTO far.t VALUES (3)");
+	REQUIRE(twin.store->near_control_replies == 4);
+}
+
+TEST_CASE("a read far cannot bind fails with its error type, with no reply to wait for", "[link]") {
+	Twin twin;
+	twin.Far("CREATE TABLE t(id INTEGER)");
+	twin.Attach();
+	twin.Query("SELECT * FROM far.t");
+	twin.Far("ALTER TABLE t ADD COLUMN extra INTEGER");
+
+	REQUIRE_THAT(twin.Error("SELECT * FROM far.t"), Catch::Contains("changed on the source"));
+	twin.Query("DETACH far");
+	twin.Attach();
+	REQUIRE(twin.Query("SELECT count(*) FROM far.t")->GetValue(0, 0) == Value::BIGINT(0));
+}
+
+TEST_CASE("a transaction reads the schema it changed through far alone", "[link]") {
+	Twin twin;
+	twin.Attach();
+
+	twin.Query("BEGIN");
+	twin.Query("CREATE TABLE far.main.n(a INTEGER, s VARCHAR, l INTEGER[], st STRUCT(x INTEGER, y VARCHAR))");
+	twin.Query("INSERT INTO far.n(a) VALUES (1)");
+	auto read = twin.Query("SELECT a, s FROM far.n");
+	REQUIRE(read->GetValue(0, 0) == Value::INTEGER(1));
+	auto listed = twin.Query("SELECT count(*) FROM duckdb_tables() WHERE database_name = 'far' AND table_name = 'n'");
+	REQUIRE(listed->GetValue(0, 0) == Value::BIGINT(1));
+	twin.Query("COMMIT");
+	REQUIRE(Scalar(twin, "SELECT count(*) FROM n") == Value::BIGINT(1));
+}
+
+TEST_CASE("a write a view's lack of row ids cannot address is refused at bind", "[link]") {
+	Twin twin;
+	twin.Far("CREATE TABLE t(id INTEGER)");
+	twin.Far("CREATE VIEW v AS SELECT id FROM t");
+	twin.store->verbs["v"] = {CrossingVerb::SELECT, CrossingVerb::DELETE_};
+	twin.Attach();
+
+	REQUIRE_THAT(twin.Error("DELETE FROM far.v WHERE id IN (SELECT id FROM far.t)"), Catch::Contains("has no row ids"));
+}
+
+TEST_CASE("a row policy hiding rowid reads, and refuses a write clearly", "[link]") {
+	Twin twin;
+	twin.Far("CREATE TABLE p(id INTEGER, tenant INTEGER)");
+	twin.Far("INSERT INTO p VALUES (1, 1), (2, 2)");
+	auto &far_context = *twin.store->con.context;
+	twin.store->floors = [&far_context](const CrossingFloor &floor) -> unique_ptr<TableRef> {
+		Parser parser(far_context);
+		parser.ParseQuery("SELECT * FROM memory.main." + floor.table + " WHERE tenant = 1");
+		auto select = unique_ptr_cast<SQLStatement, SelectStatement>(std::move(parser.statements[0]));
+		return make_uniq<SubqueryRef>(std::move(select), Identifier(floor.table));
+	};
+	twin.Attach();
+
+	REQUIRE(twin.Query("SELECT count(*) FROM far.p")->GetValue(0, 0) == Value::BIGINT(1));
+	REQUIRE_THAT(twin.Error("UPDATE far.p SET id = 0"), Catch::Contains("hides rowid"));
+}

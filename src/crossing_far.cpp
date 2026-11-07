@@ -6,6 +6,7 @@
 
 #include "duckdb/catalog/catalog.hpp"
 #include "duckdb/main/query_result.hpp"
+#include "duckdb/common/sql_identifier.hpp"
 #include "duckdb/common/string_util.hpp"
 #include "duckdb/main/query_parameters.hpp"
 #include "duckdb/parser/parsed_data/alter_info.hpp"
@@ -129,12 +130,6 @@ private:
 	shared_ptr<CrossingParking> current;
 };
 
-void RequireOk(unique_ptr<QueryResult> result) {
-	result->ThrowIfError();
-	result->Complete();
-	result->ThrowIfError();
-}
-
 } // namespace
 
 CrossingFar::CrossingFar(Connection &connection_p, string catalog_p, CrossingFarOptions options_p)
@@ -142,21 +137,65 @@ CrossingFar::CrossingFar(Connection &connection_p, string catalog_p, CrossingFar
 	RegisterCrossingFarFunctions(*connection.context->db);
 }
 
-void CrossingFar::RunStatement(CrossingLink &link, CrossingStream &control, const string &plan) {
+void CrossingFar::Cancel(const string &reason) {
+	ErrorData error(ExceptionType::INTERRUPT, reason);
+	shared_ptr<CrossingParking> waiting;
+	shared_ptr<CrossingFailure> failure;
+	vector<shared_ptr<CrossingSeamInbox>> seams;
+	{
+		lock_guard<mutex> guard(lock);
+		cancelled = error;
+		waiting = control_wait;
+		failure = running;
+		seams = inboxes;
+	}
+	if (failure) {
+		failure->Cancel(error);
+	}
+	for (auto &inbox : seams) {
+		inbox->Cancel(error);
+	}
+	if (waiting) {
+		waiting->Waker().Wake();
+	}
+	connection.Interrupt();
+}
+
+bool CrossingFar::RunStatement(CrossingLink &link, CrossingStream &control, const string &body) {
 	auto &context = *connection.context;
+	auto frame = CrossingPlanFrame::Decode(body);
 	auto failure = make_shared_ptr<CrossingFailure>();
 	auto &seams = CrossingFarSeams::Of(context).inboxes;
 	seams.clear();
+
+	auto end_transaction = [&](const ErrorData &error) {
+		if (!frame.ends_transaction) {
+			SendControl(control, error.HasError() ? ControlError(error) : string(CROSSING_CONTROL_DONE));
+			return false;
+		}
+		connection.Query(error.HasError() ? "ROLLBACK" : "COMMIT");
+		control.Close(nullptr);
+		return true;
+	};
 
 	unique_ptr<Planner> planner;
 	vector<shared_ptr<Binder>> slice_binders;
 	unique_ptr<QueryResult> result;
 	try {
-		auto decoded = DecodeSubstraitSlices(connection, catalog, plan, options.catalogs, options.floors);
+		{
+			lock_guard<mutex> guard(lock);
+			if (cancelled.HasError()) {
+				cancelled.Throw();
+			}
+			running = failure;
+		}
+		auto decoded = DecodeSubstraitSlices(connection, catalog, frame.plan, options.catalogs, options.floors);
 		for (auto &seam : decoded.seams) {
-			auto inbox = make_shared_ptr<CrossingSeamInbox>(context, seam.types, seam.ordered, link.Streams());
+			auto inbox = make_shared_ptr<CrossingSeamInbox>(context, seam.types, seam.ordered, frame.streams);
 			inbox->estimate = seam.estimate;
-			seams[seam.id] = std::move(inbox);
+			seams[seam.id] = inbox;
+			lock_guard<mutex> guard(lock);
+			inboxes.push_back(std::move(inbox));
 		}
 		planner = make_uniq<Planner>(context);
 		vector<CrossingFarSlice> slices;
@@ -179,17 +218,21 @@ void CrossingFar::RunStatement(CrossingLink &link, CrossingStream &control, cons
 			slice_binders.push_back(std::move(binder));
 			slices.push_back(std::move(far_slice));
 		}
-		auto root = MakeFarRoot(*planner->binder, link, std::move(slices), failure);
+		auto root = MakeFarRoot(*planner->binder, link, frame.streams, std::move(slices), failure);
 		result = SubmitCrossingPlan(context, std::move(root));
 		result->ThrowIfError();
 	} catch (std::exception &ex) {
 		ErrorData error(ex);
 		result.reset();
 		failure->CloseHeld(error);
-		SendControl(control, ControlError(error));
-		return;
+		for (auto slice : frame.slices) {
+			for (idx_t k = 0; k < frame.streams; k++) {
+				link.Open(CrossingSliceStreamId(slice, false, k))->Close(&error);
+				link.Open(CrossingSliceStreamId(slice, true, k))->Close(&error);
+			}
+		}
+		return end_transaction(error);
 	}
-	SendControl(control, CROSSING_CONTROL_BOUND);
 
 	SeamPump pump(link, seams);
 	ErrorData run_error;
@@ -201,6 +244,12 @@ void CrossingFar::RunStatement(CrossingLink &link, CrossingStream &control, cons
 			run_error = ErrorData(ex);
 		}
 		result.reset();
+		{
+			lock_guard<mutex> guard(lock);
+			if (cancelled.HasError()) {
+				run_error = cancelled;
+			}
+		}
 		failure->CloseHeld(run_error);
 		pump.StatementEnded();
 	});
@@ -209,7 +258,12 @@ void CrossingFar::RunStatement(CrossingLink &link, CrossingStream &control, cons
 	pump.Close(run_error);
 	seams.clear();
 	planner.reset();
-	SendControl(control, run_error.HasError() ? ControlError(run_error) : string(CROSSING_CONTROL_DONE));
+	{
+		lock_guard<mutex> guard(lock);
+		running = nullptr;
+		inboxes.clear();
+	}
+	return end_transaction(run_error);
 }
 
 void CrossingFar::RunDdl(CrossingStream &control, const string &frame) {
@@ -260,25 +314,122 @@ void CrossingFar::RunDdl(CrossingStream &control, const string &frame) {
 	SendControl(control, CROSSING_CONTROL_DONE);
 }
 
+void CrossingFar::AnswerTables(CrossingStream &control, const string &schema) {
+	try {
+		auto prepared = connection.Prepare(
+		    "SELECT table_name FROM duckdb_tables() WHERE database_name = ? AND schema_name = ? UNION ALL "
+		    "SELECT view_name FROM duckdb_views() WHERE database_name = ? AND schema_name = ? AND NOT internal "
+		    "ORDER BY 1");
+		vector<Value> args {Value(catalog), Value(schema), Value(catalog), Value(schema)};
+		auto result = prepared->Execute(args);
+		result->ThrowIfError();
+		string reply;
+		while (auto chunk = result->Fetch()) {
+			for (idx_t r = 0; r < chunk->size(); r++) {
+				reply += (reply.empty() ? "" : "\n") + chunk->GetValue(0, r).ToString();
+			}
+		}
+		SendControl(control, reply);
+	} catch (IOException &) {
+		throw;
+	} catch (std::exception &ex) {
+		SendControl(control, ControlError(ErrorData(ex)));
+	}
+}
+
+void CrossingFar::AnswerDescribe(CrossingStream &control, const string &question) {
+	try {
+		auto parts = StringUtil::Split(question, '\n');
+		auto prepared = connection.Prepare(
+		    "SELECT count(*) FROM duckdb_views() WHERE database_name = ? AND schema_name = ? AND view_name = ?");
+		vector<Value> args {Value(catalog), Value(parts[0]), Value(parts[1])};
+		auto counted = prepared->Execute(args);
+		counted->ThrowIfError();
+		bool view = counted->Fetch()->GetValue(0, 0).GetValue<int64_t>() > 0;
+		auto result =
+		    connection.Query("SELECT * FROM " + SQLIdentifier::ToString(catalog) + "." +
+		                     SQLIdentifier::ToString(parts[0]) + "." + SQLIdentifier::ToString(parts[1]) + " LIMIT 0");
+		result->ThrowIfError();
+		string reply = view ? "view" : "table";
+		for (idx_t c = 0; c < result->ColumnCount(); c++) {
+			reply += "\n" + result->GetNames()[c].GetIdentifierName() + "\n" + result->GetTypes()[c].ToString();
+		}
+		SendControl(control, reply);
+	} catch (IOException &) {
+		throw;
+	} catch (std::exception &ex) {
+		SendControl(control, ControlError(ErrorData(ex)));
+	}
+}
+
+bool CrossingFar::NextControl(CrossingStream &control, string &header) {
+	while (true) {
+		CrossingFrame frame;
+		auto signal = make_shared_ptr<InterruptDoneSignalState>();
+		auto parking = CrossingParking::Of(InterruptState(signal));
+		{
+			lock_guard<mutex> guard(lock);
+			if (cancelled.HasError()) {
+				return false;
+			}
+			control_wait = parking;
+		}
+		switch (control.Recv(frame, parking->Waker())) {
+		case CrossingIo::ROWS:
+			header = std::move(frame.header);
+			return true;
+		case CrossingIo::DONE:
+			return false;
+		default:
+			if (parking->Park()) {
+				signal->Await();
+			}
+		}
+	}
+}
+
 void CrossingFar::Serve(CrossingLink &link) {
 	auto control = link.Open(0);
 	auto begin = connection.Query("BEGIN");
-	begin->ThrowIfError();
+	if (begin->HasError()) {
+		ErrorData why;
+		{
+			lock_guard<mutex> guard(lock);
+			why = cancelled;
+		}
+		if (!why.HasError()) {
+			begin->ThrowError();
+		}
+		control->Close(&why);
+		return;
+	}
 	const string plan_prefix(CROSSING_CONTROL_PLAN);
 	const string ddl_prefix(CROSSING_CONTROL_DDL);
+	const string tables_prefix(CROSSING_CONTROL_TABLES);
+	const string describe_prefix(CROSSING_CONTROL_DESCRIBE);
 	string header;
-	while (RecvControl(*control, header)) {
-		if (header.compare(0, plan_prefix.size(), plan_prefix) == 0) {
-			try {
-				RunStatement(link, *control, header.substr(plan_prefix.size()));
-			} catch (IOException &) {
-				break;
+	while (NextControl(*control, header)) {
+		try {
+			if (header.compare(0, plan_prefix.size(), plan_prefix) == 0) {
+				if (RunStatement(link, *control, header.substr(plan_prefix.size()))) {
+					return;
+				}
+				continue;
 			}
-			continue;
-		}
-		if (header.compare(0, ddl_prefix.size(), ddl_prefix) == 0) {
-			RunDdl(*control, header.substr(ddl_prefix.size()));
-			continue;
+			if (header.compare(0, ddl_prefix.size(), ddl_prefix) == 0) {
+				RunDdl(*control, header.substr(ddl_prefix.size()));
+				continue;
+			}
+			if (header.compare(0, tables_prefix.size(), tables_prefix) == 0) {
+				AnswerTables(*control, header.substr(tables_prefix.size()));
+				continue;
+			}
+			if (header.compare(0, describe_prefix.size(), describe_prefix) == 0) {
+				AnswerDescribe(*control, header.substr(describe_prefix.size()));
+				continue;
+			}
+		} catch (IOException &) {
+			break;
 		}
 		auto end = connection.Query(header == CROSSING_CONTROL_COMMIT ? "COMMIT" : "ROLLBACK");
 		if (end->HasError()) {
@@ -290,7 +441,12 @@ void CrossingFar::Serve(CrossingLink &link) {
 		return;
 	}
 	auto rollback = connection.Query("ROLLBACK");
-	control->Close(nullptr);
+	ErrorData why;
+	{
+		lock_guard<mutex> guard(lock);
+		why = cancelled;
+	}
+	control->Close(why.HasError() ? &why : nullptr);
 }
 
 } // namespace duckdb

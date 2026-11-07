@@ -36,7 +36,7 @@ struct CrossingFarSlice {
 };
 
 //! One plan of the statement's slices, each ending in a stream. It produces no rows.
-unique_ptr<LogicalOperator> MakeFarRoot(Binder &binder, CrossingLink &link, vector<CrossingFarSlice> slices,
-                                        shared_ptr<CrossingFailure> failure);
+unique_ptr<LogicalOperator> MakeFarRoot(Binder &binder, CrossingLink &link, idx_t streams,
+                                        vector<CrossingFarSlice> slices, shared_ptr<CrossingFailure> failure);
 
 } // namespace duckdb
