@@ -1,5 +1,10 @@
 #pragma once
 
+#include <chrono>
+#include <condition_variable>
+#include <deque>
+#include <mutex>
+
 #include "duckdb/common/error_data.hpp"
 #include "duckdb/common/exception.hpp"
 #include "duckdb/common/string_util.hpp"
@@ -39,25 +44,67 @@ inline void SendControl(CrossingStream &stream, const string &header) {
 	}
 }
 
-//! False when the other end closed.
-inline bool RecvControl(CrossingStream &stream, string &header) {
-	while (true) {
-		CrossingFrame frame;
-		auto signal = make_shared_ptr<InterruptDoneSignalState>();
-		auto parking = CrossingParking::Of(InterruptState(signal));
-		switch (stream.Recv(frame, parking->Waker())) {
-		case CrossingIo::ROWS:
-			header = std::move(frame.header);
-			return true;
-		case CrossingIo::DONE:
-			return false;
-		default:
-			if (parking->Park()) {
-				signal->Await();
+//! The control frames the other end has sent, in order.
+class CrossingControlQueue : public CrossingReceiver {
+public:
+	const vector<LogicalType> &Types() const override {
+		static const vector<LogicalType> none;
+		return none;
+	}
+	void Deliver(CrossingFrame &frame) override {
+		{
+			std::lock_guard<std::mutex> guard(lock);
+			frames.push_back(std::move(frame.header));
+		}
+		changed.notify_all();
+	}
+	void Closed(optional_ptr<const ErrorData> error) override {
+		{
+			std::lock_guard<std::mutex> guard(lock);
+			closed = true;
+			if (error) {
+				closed_with = *error;
 			}
 		}
+		changed.notify_all();
 	}
-}
+	void Wake() {
+		changed.notify_all();
+	}
+
+	//! False when the other end closed, or `interrupted` says to stop waiting.
+	template <class INTERRUPTED>
+	bool Next(string &header, INTERRUPTED &&interrupted) {
+		std::unique_lock<std::mutex> guard(lock);
+		while (true) {
+			if (!frames.empty()) {
+				header = std::move(frames.front());
+				frames.pop_front();
+				return true;
+			}
+			if (closed) {
+				if (closed_with.HasError()) {
+					closed_with.Throw();
+				}
+				return false;
+			}
+			if (interrupted()) {
+				return false;
+			}
+			changed.wait_for(guard, std::chrono::milliseconds(50));
+		}
+	}
+	bool Next(string &header) {
+		return Next(header, []() { return false; });
+	}
+
+private:
+	std::mutex lock;
+	std::condition_variable changed;
+	std::deque<string> frames;
+	bool closed = false;
+	ErrorData closed_with;
+};
 
 //! What far must know of a statement before it can read its plan. A statement that ends the transaction itself is
 //! the whole of a read-only autocommit transaction: far commits it and sends no reply.

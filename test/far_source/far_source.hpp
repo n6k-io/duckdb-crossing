@@ -1,5 +1,7 @@
 #pragma once
 
+#include <atomic>
+
 #include "crossing_far.hpp"
 #include "framework/test_link.hpp"
 #include "internal/floor.hpp"
@@ -126,6 +128,15 @@ struct FarStore {
 	idx_t seam_rows = 0;
 	idx_t waits = 0;
 	idx_t near_control_replies = 0;
+	idx_t most_held_for_near = 0;
+	std::atomic<idx_t> far_rows_sent {0};
+	idx_t near_recv_streams = 0;
+	//! Near's Recv waits, as if far were slow: on control replies, and on a slice's rows.
+	std::atomic<bool> stall_replies {false};
+	std::atomic<bool> stall_results {false};
+	//! Set while a link is open: ends every stall and lifts its limits.
+	std::function<void()> release_link;
+	void Release();
 	//! Non-zero: what far's end of the link reports, which crossing must not ask.
 	idx_t far_streams = 0;
 	//! For each slice of the open transaction, whether it is a write and where its call is.

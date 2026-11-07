@@ -20,7 +20,7 @@
 
 namespace duckdb {
 
-CrossingRemote::CrossingRemote(CrossingLink &link_p) : link(link_p), control(link.Open(0)) {
+CrossingRemote::CrossingRemote(CrossingLink &link_p) : link(link_p), control(link.Open(0, &replies)) {
 }
 
 CrossingRemote::~CrossingRemote() {
@@ -29,21 +29,41 @@ CrossingRemote::~CrossingRemote() {
 	}
 }
 
-ErrorData CrossingRemote::DrainStatement() {
-	if (!statement_running) {
-		return ErrorData();
-	}
-	statement_running = false;
+ErrorData CrossingRemote::DrainReply(optional_ptr<ClientContext> context) {
 	string reply;
+	bool replied = false;
 	try {
-		if (!RecvControl(*control, reply)) {
-			throw IOException("crossing: the link closed before far ended the statement");
+		replied = replies.Next(reply, [&context]() { return context && context->IsInterrupted(); });
+	} catch (std::exception &ex) {
+		return ErrorData(ex);
+	}
+	if (!replied) {
+		if (context && context->IsInterrupted()) {
+			throw InterruptException();
 		}
+		return ErrorData(ExceptionType::IO, "crossing: the link closed before far replied");
+	}
+	try {
 		ThrowIfControlError(reply);
 	} catch (std::exception &ex) {
 		return ErrorData(ex);
 	}
 	return ErrorData();
+}
+
+ErrorData CrossingRemote::DrainStatement(optional_ptr<ClientContext> context) {
+	ErrorData failed;
+	while (unread_replies > 0) {
+		auto error = DrainReply(context);
+		unread_replies--;
+		failed = failed.HasError() ? failed : error;
+	}
+	if (!statement_running) {
+		return failed;
+	}
+	auto error = DrainReply(context);
+	statement_running = false;
+	return failed.HasError() ? failed : error;
 }
 
 void CrossingRemote::End(const char *word) {
@@ -55,7 +75,7 @@ void CrossingRemote::End(const char *word) {
 	auto failed = DrainStatement();
 	SendControl(*control, failed.HasError() ? CROSSING_CONTROL_ROLLBACK : word);
 	string reply;
-	bool replied = RecvControl(*control, reply);
+	bool replied = replies.Next(reply);
 	control->Close(nullptr);
 	if (failed.HasError() && word == CROSSING_CONTROL_COMMIT) {
 		failed.Throw();
@@ -66,17 +86,17 @@ void CrossingRemote::End(const char *word) {
 	ThrowIfControlError(reply);
 }
 
-void CrossingRemote::RunDdl(const string &frame) {
-	Ask(CROSSING_CONTROL_DDL + frame);
+void CrossingRemote::RunDdl(ClientContext &context, const string &frame) {
+	Ask(context, CROSSING_CONTROL_DDL + frame);
 }
 
-vector<string> CrossingRemote::Tables(const string &schema) {
-	auto reply = Ask(CROSSING_CONTROL_TABLES + schema);
+vector<string> CrossingRemote::Tables(ClientContext &context, const string &schema) {
+	auto reply = Ask(context, CROSSING_CONTROL_TABLES + schema);
 	return reply.empty() ? vector<string>() : StringUtil::Split(reply, '\n');
 }
 
 CrossingTable CrossingRemote::Describe(ClientContext &context, const string &schema, const string &name) {
-	auto lines = StringUtil::Split(Ask(CROSSING_CONTROL_DESCRIBE + schema + "\n" + name), '\n');
+	auto lines = StringUtil::Split(Ask(context, CROSSING_CONTROL_DESCRIBE + schema + "\n" + name), '\n');
 	CrossingTable table;
 	table.name = name;
 	table.row_ids = lines[0] == "table";
@@ -103,12 +123,16 @@ CrossingTable CrossingRemote::Describe(ClientContext &context, const string &sch
 	return table;
 }
 
-string CrossingRemote::Ask(const string &question) {
-	DrainStatement();
+string CrossingRemote::Ask(ClientContext &context, const string &question) {
+	DrainStatement(&context);
 	used = true;
 	SendControl(*control, question);
 	string reply;
-	if (!RecvControl(*control, reply)) {
+	if (!replies.Next(reply, [&context]() { return context.IsInterrupted(); })) {
+		if (context.IsInterrupted()) {
+			unread_replies++;
+			throw InterruptException();
+		}
 		throw IOException("crossing: the link closed before far answered");
 	}
 	ThrowIfControlError(reply);
@@ -198,42 +222,59 @@ void CrossingRemoteStatement::Finish() {
 
 namespace {
 
-//! After a WAIT. True with BLOCKED when parked, true with FINISHED when the operator can no longer block; false when
-//! the waker already fired and the source is to be asked again.
-bool ParkSource(CrossingParking &parking, GlobalSourceState &state, SourceResultType &result) {
-	const annotated_lock_guard<annotated_mutex> guard {state.lock};
-	if (parking.Park(state)) {
-		result = SourceResultType::BLOCKED;
-		return true;
-	}
-	if (!state.CanBlock()) {
-		result = SourceResultType::FINISHED;
-		return true;
-	}
-	return false;
-}
-
-struct RemoteSourceGlobal : public GlobalSourceState {
+//! Reading a slice's results: frames land in the inbox from wherever the transport delivers them.
+struct RemoteResults {
 	shared_ptr<CrossingSeamInbox> inbox;
+	vector<unique_ptr<CrossingInboxReceiver>> receivers;
 	vector<unique_ptr<CrossingStream>> streams;
-	atomic<idx_t> next_stream {0};
+	mutex credit_lock;
+	idx_t unsent_credit = 0;
 
-	~RemoteSourceGlobal() override {
+	RemoteResults(ClientContext &context, CrossingLink &link, idx_t slice, const vector<LogicalType> &types,
+	              bool ordered) {
+		inbox = make_shared_ptr<CrossingSeamInbox>(context, types, ordered, link.Streams());
+		for (idx_t k = 0; k < link.Streams(); k++) {
+			receivers.push_back(make_uniq<CrossingInboxReceiver>(inbox));
+			streams.push_back(link.Open(CrossingSliceStreamId(slice, false, k), receivers.back().get()));
+		}
+	}
+
+	~RemoteResults() {
 		for (auto &stream : streams) {
 			stream->Close(nullptr);
 		}
 	}
+
+	//! Tells far what has been read. False when the stream cannot take it yet; the waker goes when it can.
+	bool GiveCredit(idx_t bytes, CrossingWaker waker) {
+		lock_guard<mutex> guard(credit_lock);
+		unsent_credit += bytes;
+		if (unsent_credit == 0) {
+			return true;
+		}
+		CrossingFrame frame;
+		frame.header = to_string(unsent_credit);
+		if (streams[0]->Send(frame, std::move(waker)) == CrossingIo::WAIT) {
+			return false;
+		}
+		unsent_credit = 0;
+		return true;
+	}
+};
+
+struct RemoteSourceGlobal : public GlobalSourceState {
+	unique_ptr<RemoteResults> results;
+
 	idx_t MaxThreads() override {
-		return streams.size();
+		return results->streams.size();
 	}
 };
 
 struct RemoteSourceLocal : public LocalSourceState {
-	optional_idx stream;
 	unique_ptr<ColumnDataCollection> rows;
 	ColumnDataScanState scan;
 	idx_t rank = 0;
-	CrossingFrame frame;
+	idx_t bytes = 0;
 	DataChunk received;
 };
 
@@ -254,6 +295,7 @@ public:
 	CrossingRemoteColumns columns;
 	unique_ptr<CrossingStreamSink> sink;
 	bool awaits_result;
+	mutable unique_ptr<RemoteResults> awaited;
 
 	void BuildPipelines(Pipeline &current, MetaPipeline &meta_pipeline) override {
 		if (meta_pipeline.HasRecursiveCTE()) {
@@ -261,28 +303,6 @@ public:
 			                              "table: its far plan runs once per statement");
 		}
 		PhysicalOperator::BuildPipelines(current, meta_pipeline);
-	}
-
-	void AwaitResult() const {
-		auto &link = statement->Remote().Link();
-		for (idx_t k = 0; k < link.Streams(); k++) {
-			auto stream = link.Open(CrossingSliceStreamId(slice, false, k));
-			CrossingFrame frame;
-			frame.rows.Initialize(Allocator::DefaultAllocator(), columns.received);
-			while (true) {
-				auto signal = make_shared_ptr<InterruptDoneSignalState>();
-				auto parking = CrossingParking::Of(InterruptState(signal));
-				frame.rows.Reset();
-				auto io = stream->Recv(frame, parking->Waker());
-				if (io == CrossingIo::DONE) {
-					break;
-				}
-				if (io == CrossingIo::WAIT && parking->Park()) {
-					signal->Await();
-				}
-			}
-			stream->Close(nullptr);
-		}
 	}
 
 	bool IsSink() const override {
@@ -313,12 +333,31 @@ public:
 	SinkNextBatchType NextBatch(ExecutionContext &, OperatorSinkNextBatchInput &input) const override {
 		return sink->NextBatch(input);
 	}
-	SinkFinalizeType Finalize(Pipeline &, Event &, ClientContext &, OperatorSinkFinalizeInput &input) const override {
+	SinkNextBatchType UpdateMinBatchIndex(ExecutionContext &, OperatorSinkNextBatchInput &input) const override {
+		return sink->UpdateMinBatchIndex(input);
+	}
+	SinkFinalizeType Finalize(Pipeline &, Event &, ClientContext &context,
+	                          OperatorSinkFinalizeInput &input) const override {
 		sink->Finish(input.global_state);
-		if (awaits_result) {
-			AwaitResult();
+		if (!awaits_result) {
+			return SinkFinalizeType::READY;
 		}
-		return SinkFinalizeType::READY;
+		if (!awaited) {
+			awaited = make_uniq<RemoteResults>(context, statement->Remote().Link(), slice, columns.received, false);
+		}
+		while (true) {
+			unique_ptr<ColumnDataCollection> rows;
+			idx_t rank = 0;
+			idx_t bytes = 0;
+			switch (awaited->inbox->Take(rows, rank, bytes, input.interrupt_state)) {
+			case CrossingSeamInbox::Took::DONE:
+				return SinkFinalizeType::READY;
+			case CrossingSeamInbox::Took::PARK:
+				return SinkFinalizeType::BLOCKED;
+			default:
+				break;
+			}
+		}
 	}
 
 	bool IsSource() const override {
@@ -340,17 +379,13 @@ public:
 
 	unique_ptr<GlobalSourceState> GetGlobalSourceState(ClientContext &context) const override {
 		statement->Start();
-		auto &link = statement->Remote().Link();
 		auto state = make_uniq<RemoteSourceGlobal>();
-		state->inbox = make_shared_ptr<CrossingSeamInbox>(context, columns.received, ordered, link.Streams());
-		for (idx_t k = 0; k < link.Streams(); k++) {
-			state->streams.push_back(link.Open(CrossingSliceStreamId(slice, false, k)));
-		}
+		state->results =
+		    make_uniq<RemoteResults>(context, statement->Remote().Link(), slice, columns.received, ordered);
 		return std::move(state);
 	}
 	unique_ptr<LocalSourceState> GetLocalSourceState(ExecutionContext &, GlobalSourceState &) const override {
 		auto state = make_uniq<RemoteSourceLocal>();
-		state->frame.rows.Initialize(Allocator::DefaultAllocator(), columns.received);
 		state->received.Initialize(Allocator::DefaultAllocator(), columns.received);
 		return std::move(state);
 	}
@@ -371,7 +406,7 @@ public:
 	SourceResultType GetDataInternal(ExecutionContext &, DataChunk &chunk, OperatorSourceInput &input) const override {
 		auto &global = input.global_state.Cast<RemoteSourceGlobal>();
 		auto &local = input.local_state.Cast<RemoteSourceLocal>();
-		auto &inbox = *global.inbox;
+		auto &results = *global.results;
 		while (true) {
 			if (local.rows) {
 				local.received.Reset();
@@ -382,48 +417,26 @@ public:
 				}
 				local.rows.reset();
 			}
-			if (inbox.TryTake(local.rows, local.rank)) {
-				local.rows->InitializeScan(local.scan);
-				continue;
-			}
-			if (!local.stream.IsValid()) {
-				auto claimed = global.next_stream.fetch_add(1);
-				if (claimed < global.streams.size()) {
-					local.stream = claimed;
-				}
-			}
-			if (!local.stream.IsValid()) {
-				auto took = inbox.Take(local.rows, local.rank, input.interrupt_state);
-				if (took == CrossingSeamInbox::Took::DONE) {
-					return SourceResultType::FINISHED;
-				}
-				if (took == CrossingSeamInbox::Took::PARK) {
+			auto parking = CrossingParking::Of(input.interrupt_state);
+			auto credited = results.GiveCredit(local.bytes, parking->Waker());
+			local.bytes = 0;
+			if (!credited) {
+				annotated_lock_guard<annotated_mutex> guard(global.lock);
+				if (parking->Park(global)) {
 					return SourceResultType::BLOCKED;
 				}
-				local.rows->InitializeScan(local.scan);
+				if (!global.CanBlock()) {
+					return SourceResultType::FINISHED;
+				}
 				continue;
 			}
-			auto index = local.stream.GetIndex();
-			auto parking = CrossingParking::Of(input.interrupt_state);
-			local.frame.rows.Reset();
-			switch (global.streams[index]->Recv(local.frame, parking->Waker())) {
-			case CrossingIo::ROWS:
-				if (local.frame.header == CROSSING_IDLE_HEADER) {
-					inbox.Idle(index);
-				} else {
-					inbox.Append(index, local.frame.rows, std::stoull(local.frame.header));
-				}
-				break;
-			case CrossingIo::DONE:
-				inbox.StreamDone(index);
-				local.stream = optional_idx();
-				break;
-			default: {
-				SourceResultType parked;
-				if (ParkSource(*parking, global, parked)) {
-					return parked;
-				}
-			}
+			switch (results.inbox->Take(local.rows, local.rank, local.bytes, input.interrupt_state)) {
+			case CrossingSeamInbox::Took::DONE:
+				return SourceResultType::FINISHED;
+			case CrossingSeamInbox::Took::PARK:
+				return SourceResultType::BLOCKED;
+			default:
+				local.rows->InitializeScan(local.scan);
 			}
 		}
 	}

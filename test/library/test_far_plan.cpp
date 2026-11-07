@@ -11,7 +11,10 @@
 #include "duckdb/parser/statement/select_statement.hpp"
 #include "duckdb/planner/planner.hpp"
 
+#include <atomic>
 #include <chrono>
+#include <condition_variable>
+#include <mutex>
 #include <future>
 #include <thread>
 
@@ -80,42 +83,44 @@ struct FarDb {
 };
 
 //! Stands where near would be: drains one slice's output.
+struct DrainReceiver : public CrossingReceiver {
+	const vector<LogicalType> &Types() const override {
+		static const vector<LogicalType> types {LogicalType::BIGINT};
+		return types;
+	}
+	void Deliver(CrossingFrame &frame) override {
+		std::lock_guard<std::mutex> guard(lock);
+		for (idx_t r = 0; r < frame.rows.size(); r++) {
+			rows.push_back(frame.rows.GetValue(0, r).GetValue<int64_t>());
+		}
+	}
+	void Closed(optional_ptr<const ErrorData>) override {
+		closed++;
+		ended.notify_all();
+	}
+
+	std::mutex lock;
+	std::condition_variable ended;
+	std::atomic<idx_t> closed {0};
+	vector<int64_t> rows;
+};
+
 vector<int64_t> Drain(CrossingLink &link, idx_t slice) {
-	vector<int64_t> out;
+	DrainReceiver receiver;
 	vector<unique_ptr<CrossingStream>> streams;
 	for (idx_t k = 0; k < link.Streams(); k++) {
-		streams.push_back(link.Open(CrossingSliceStreamId(slice, false, k)));
+		streams.push_back(link.Open(CrossingSliceStreamId(slice, false, k), &receiver));
 	}
-	auto signal = make_shared_ptr<InterruptDoneSignalState>();
-	vector<bool> done(streams.size(), false);
-	idx_t open = streams.size();
-	while (open > 0) {
-		signal = make_shared_ptr<InterruptDoneSignalState>();
-		auto parking = CrossingParking::Of(InterruptState(signal));
-		bool progressed = false;
-		for (idx_t k = 0; k < streams.size(); k++) {
-			if (done[k]) {
-				continue;
-			}
-			CrossingFrame frame;
-			frame.rows.Initialize(Allocator::DefaultAllocator(), {LogicalType::BIGINT});
-			auto io = streams[k]->Recv(frame, parking->Waker());
-			if (io == CrossingIo::ROWS) {
-				progressed = true;
-				for (idx_t r = 0; r < frame.rows.size(); r++) {
-					out.push_back(frame.rows.GetValue(0, r).GetValue<int64_t>());
-				}
-			} else if (io == CrossingIo::DONE) {
-				progressed = true;
-				done[k] = true;
-				open--;
-			}
-		}
-		if (!progressed && parking->Park()) {
-			signal->Await();
+	{
+		std::unique_lock<std::mutex> guard(receiver.lock);
+		while (receiver.closed < streams.size()) {
+			receiver.ended.wait_for(guard, std::chrono::milliseconds(10));
 		}
 	}
-	return out;
+	for (auto &stream : streams) {
+		stream->Close(nullptr);
+	}
+	return receiver.rows;
 }
 
 void RequireFinishes(std::future<ErrorData> &far) {
@@ -126,7 +131,16 @@ void RequireFinishes(std::future<ErrorData> &far) {
 	}
 }
 
-void AppendRange(CrossingSeamInbox &inbox, idx_t stream, int64_t from, int64_t to, idx_t batch = 0) {
+idx_t next_sequence = 0;
+
+void AppendRange(CrossingSeamInbox &inbox, int64_t from, int64_t to, idx_t batch = 0) {
+	auto append = [&](DataChunk &rows) {
+		CrossingRowHeader header;
+		header.sequence = next_sequence++;
+		header.batch = batch;
+		header.min_batch = 0;
+		inbox.Append(rows, header);
+	};
 	DataChunk chunk;
 	chunk.Initialize(Allocator::DefaultAllocator(), {LogicalType::BIGINT});
 	idx_t r = 0;
@@ -134,14 +148,14 @@ void AppendRange(CrossingSeamInbox &inbox, idx_t stream, int64_t from, int64_t t
 		chunk.SetValue(0, r++, Value::BIGINT(v));
 		if (r == STANDARD_VECTOR_SIZE) {
 			chunk.SetChildCardinality(r);
-			inbox.Append(stream, chunk, batch);
+			append(chunk);
 			chunk.Reset();
 			r = 0;
 		}
 	}
 	if (r > 0) {
 		chunk.SetChildCardinality(r);
-		inbox.Append(stream, chunk, batch);
+		append(chunk);
 	}
 }
 
@@ -172,10 +186,10 @@ TEST_CASE("a seam parks until its rows arrive, under a filter and a join", "[far
 	std::this_thread::sleep_for(std::chrono::milliseconds(50));
 	REQUIRE(running.wait_for(std::chrono::milliseconds(0)) == std::future_status::timeout);
 
-	AppendRange(*seam, 0, 0, 5000);
+	AppendRange(*seam, 0, 5000);
 	std::this_thread::sleep_for(std::chrono::milliseconds(20));
-	AppendRange(*seam, 0, 5000, 6000);
-	seam->StreamDone(0);
+	AppendRange(*seam, 5000, 6000);
+	seam->StreamDone();
 
 	auto rows = Drain(link.Near(), 0);
 	RequireFinishes(running);
@@ -193,8 +207,8 @@ TEST_CASE("one far plan runs a slice that waits on another slice's rows", "[far]
 	    link.Far(), {{0, "SELECT a FROM t WHERE a < 3000"}, {1, "SELECT c0 + 1 FROM crossing_seam_rows(9::UBIGINT)"}});
 
 	auto first = Drain(link.Near(), 0);
-	AppendRange(*seam, 0, 0, NumericCast<int64_t>(first.size()));
-	seam->StreamDone(0);
+	AppendRange(*seam, 0, NumericCast<int64_t>(first.size()));
+	seam->StreamDone();
 	auto second = Drain(link.Near(), 1);
 
 	RequireFinishes(running);
@@ -203,6 +217,7 @@ TEST_CASE("one far plan runs a slice that waits on another slice's rows", "[far]
 }
 
 TEST_CASE("a seam releases batches in order across streams", "[far]") {
+	next_sequence = 0;
 	auto threads = GENERATE(idx_t(1), idx_t(4));
 	INFO(threads << " far threads");
 	FarDb far(threads);
@@ -212,10 +227,10 @@ TEST_CASE("a seam releases batches in order across streams", "[far]") {
 	auto running =
 	    far.Start(link.Far(), {{0, "SELECT c0 FROM crossing_seam_ordered_rows(3::UBIGINT)"}}, /* ordered */ true);
 
-	AppendRange(*seam, 1, 4000, 8000, 2);
-	AppendRange(*seam, 0, 0, 4000, 1);
-	seam->StreamDone(0);
-	seam->StreamDone(1);
+	AppendRange(*seam, 4000, 8000, 2);
+	AppendRange(*seam, 0, 4000, 1);
+	seam->StreamDone();
+	seam->StreamDone();
 
 	auto rows = Drain(link.Near(), 0);
 	RequireFinishes(running);

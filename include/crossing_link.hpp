@@ -2,9 +2,9 @@
 
 #include "duckdb/common/error_data.hpp"
 #include "duckdb/common/optional_ptr.hpp"
+#include "duckdb/common/string.hpp"
 #include "duckdb/common/types/data_chunk.hpp"
 #include "duckdb/common/unique_ptr.hpp"
-#include "duckdb/common/string.hpp"
 
 #include "crossing.hpp"
 
@@ -17,23 +17,36 @@ struct CrossingFrame {
 	DataChunk rows;
 };
 
-//! TAKEN: Send has the frame and needs nothing from it after returning. ROWS: Recv filled the frame.
-//! DONE: the other end closed with no error, so it wants no more (Send) or has sent all (Recv). WAIT: not
-//! yet; call the waker's Wake() when it may go on.
-enum class CrossingIo : uint8_t { TAKEN, ROWS, DONE, WAIT };
+//! TAKEN: Send has the frame and needs nothing from it after returning. DONE: the other end closed with no error, so
+//! it wants no more. WAIT: not yet; call the waker's Wake() when it may go on, and Send is asked again with the frame.
+enum class CrossingIo : uint8_t { TAKEN, DONE, WAIT };
 
-//! Frames in order, one thread at a time at each end. Send and Recv throw the error the other end closed with.
+//! Where the transport hands what arrives on a stream. One call at a time for each stream, from any thread, in the
+//! order sent. It never waits on the transport.
+class CrossingReceiver {
+public:
+	virtual ~CrossingReceiver() = default;
+
+	//! What a frame's rows are, to decode them into. Empty when frames carry only a header.
+	virtual const vector<LogicalType> &Types() const = 0;
+	virtual void Deliver(CrossingFrame &frame) = 0;
+	//! The other end closed. Non-null is the error it closed with. Called once, after the last Deliver.
+	virtual void Closed(optional_ptr<const ErrorData> error) = 0;
+};
+
+//! Send throws the error the other end closed with. One thread at a time at each end.
 class CrossingStream {
 public:
 	virtual ~CrossingStream() = default;
 
 	virtual CrossingIo Send(CrossingFrame &frame, CrossingWaker waker) = 0;
-	virtual CrossingIo Recv(CrossingFrame &frame, CrossingWaker waker) = 0;
-	//! No more frames from this end. Null when it ended cleanly. Called once, and never throws.
+	//! No more frames from this end, and none delivered to it once this returns. Null when it ended cleanly. Called
+	//! once, and never throws.
 	virtual void Close(optional_ptr<const ErrorData> error) = 0;
 };
 
-//! One far transaction. Both ends open a stream by the same id, in either order, from any thread.
+//! One far transaction. Both ends open a stream by the same id, in either order, from any thread. What arrives before
+//! this end opens is held for it.
 class CrossingLink {
 public:
 	virtual ~CrossingLink() = default;
@@ -42,7 +55,8 @@ public:
 	virtual idx_t Streams() {
 		return 1;
 	}
-	virtual unique_ptr<CrossingStream> Open(idx_t id) = 0;
+	//! `receiver` is null at an end that only sends. It outlives the stream.
+	virtual unique_ptr<CrossingStream> Open(idx_t id, optional_ptr<CrossingReceiver> receiver) = 0;
 };
 
 } // namespace duckdb

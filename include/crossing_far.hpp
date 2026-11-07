@@ -9,7 +9,6 @@
 
 namespace duckdb {
 
-struct CrossingParking;
 class CrossingFailure;
 class CrossingSeamInbox;
 
@@ -37,14 +36,12 @@ private:
 	void RunDdl(CrossingStream &control, const string &frame);
 	void AnswerTables(CrossingStream &control, const string &schema);
 	void AnswerDescribe(CrossingStream &control, const string &question);
-	bool NextControl(CrossingStream &control, string &header);
 
 	Connection &connection;
 	string catalog;
 	CrossingFarOptions options;
 	mutex lock;
 	ErrorData cancelled;
-	shared_ptr<CrossingParking> control_wait;
 	shared_ptr<CrossingFailure> running;
 	vector<shared_ptr<CrossingSeamInbox>> inboxes;
 };

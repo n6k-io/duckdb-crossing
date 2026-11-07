@@ -1,21 +1,22 @@
 #include "internal/stream_sink.hpp"
 
 #include "internal/parking.hpp"
+#include "internal/seam_inbox.hpp"
+
+#include "duckdb/common/atomic.hpp"
+#include "duckdb/common/map.hpp"
 
 namespace duckdb {
-
-const char *const CROSSING_IDLE_HEADER = "I";
 
 idx_t CrossingSliceStreamId(idx_t slice, bool into_far, idx_t stream) {
 	return 1 + (((slice << 1) | (into_far ? 1 : 0)) << 16 | stream);
 }
 
-string CrossingBatchHeader(idx_t batch) {
-	return to_string(batch);
-}
-
-void CrossingFailure::Hold(vector<unique_ptr<CrossingStream>> streams) {
+void CrossingFailure::Hold(vector<unique_ptr<CrossingStream>> streams, shared_ptr<CrossingReceiver> receiver) {
 	lock_guard<mutex> guard(lock);
+	if (receiver) {
+		held_receivers.push_back(std::move(receiver));
+	}
 	for (auto &stream : streams) {
 		held.push_back(std::move(stream));
 	}
@@ -27,6 +28,7 @@ void CrossingFailure::CloseHeld(const ErrorData &error) {
 		stream->Close(error.HasError() ? &error : nullptr);
 	}
 	held.clear();
+	held_receivers.clear();
 }
 
 void CrossingFailure::Cancel(const ErrorData &error) {
@@ -86,12 +88,86 @@ Sent SendFrame(CrossingStream &stream, CrossingFrame &frame, const InterruptStat
 	}
 }
 
+struct StreamSinkGlobal;
+
+//! Frames from the end reading this slice's rows: how many bytes of them it has read.
+struct CreditReceiver : public CrossingReceiver {
+	explicit CreditReceiver(StreamSinkGlobal &global_p) : global(&global_p) {
+	}
+	const vector<LogicalType> &Types() const override {
+		static const vector<LogicalType> none;
+		return none;
+	}
+	void Deliver(CrossingFrame &frame) override;
+	void Closed(optional_ptr<const ErrorData> error) override;
+
+	StreamSinkGlobal *global;
+};
+
 struct StreamSinkGlobal : public GlobalSinkState {
 	vector<unique_ptr<CrossingStream>> streams;
+	shared_ptr<CreditReceiver> credit;
 	vector<idx_t> free_streams;
+	atomic<idx_t> next_sequence {0};
 	idx_t next_sequential_batch = 0;
 	bool closed = false;
 	shared_ptr<CrossingFailure> failure;
+
+	mutex credit_lock;
+	idx_t sent_bytes = 0;
+	idx_t read_bytes = 0;
+	idx_t min_batch = 0;
+	idx_t largest_frame = 0;
+	map<idx_t, idx_t> sent_by_batch;
+	idx_t released_bytes = 0;
+	bool reader_gone = false;
+	vector<CrossingWaker> waiting;
+
+	void WakeWaiting() {
+		vector<CrossingWaker> wake;
+		{
+			lock_guard<mutex> guard(credit_lock);
+			wake.swap(waiting);
+		}
+		for (auto &waker : wake) {
+			waker.Wake();
+		}
+	}
+
+	void AdvanceMinBatch(idx_t min_batch_p) {
+		{
+			lock_guard<mutex> guard(credit_lock);
+			if (min_batch_p <= min_batch) {
+				return;
+			}
+			min_batch = min_batch_p;
+			while (!sent_by_batch.empty() && sent_by_batch.begin()->first < min_batch) {
+				released_bytes += sent_by_batch.begin()->second;
+				sent_by_batch.erase(sent_by_batch.begin());
+			}
+		}
+		WakeWaiting();
+	}
+
+	//! BatchedBufferedData::ShouldBlockBatch, or SimpleBufferedData's rule when no order is kept.
+	bool ShouldBlock(bool ordered, idx_t budget, idx_t batch, idx_t incoming) {
+		if (budget == 0 || reader_gone) {
+			return false;
+		}
+		largest_frame = MaxValue(largest_frame, incoming);
+		auto total = sent_bytes - read_bytes;
+		if (!ordered) {
+			return total > 0 && total + incoming > budget;
+		}
+		if (batch <= min_batch) {
+			return total + incoming > budget && released_bytes > read_bytes;
+		}
+		if (total == 0) {
+			return false;
+		}
+		auto reserve = MaxValue<idx_t>(MinValue<idx_t>(largest_frame, budget / 2), MaxValue<idx_t>(budget / 8, 1));
+		return total + incoming > MaxValue<idx_t>(budget - reserve, 1);
+	}
 
 	void CloseAll(optional_ptr<const ErrorData> error) {
 		if (closed) {
@@ -108,7 +184,10 @@ struct StreamSinkGlobal : public GlobalSinkState {
 			return;
 		}
 		if (failure) {
-			failure->Hold(std::move(streams));
+			if (credit) {
+				credit->global = nullptr;
+			}
+			failure->Hold(std::move(streams), credit);
 			return;
 		}
 		ErrorData ended(ExceptionType::INTERRUPT, "crossing: the statement ended before this slice finished");
@@ -120,10 +199,37 @@ struct StreamSinkGlobal : public GlobalSinkState {
 	}
 };
 
+void CreditReceiver::Deliver(CrossingFrame &frame) {
+	if (!global) {
+		return;
+	}
+	{
+		lock_guard<mutex> guard(global->credit_lock);
+		global->read_bytes += std::stoull(frame.header);
+	}
+	global->WakeWaiting();
+}
+
+void CreditReceiver::Closed(optional_ptr<const ErrorData>) {
+	if (!global) {
+		return;
+	}
+	{
+		lock_guard<mutex> guard(global->credit_lock);
+		global->reader_gone = true;
+	}
+	global->WakeWaiting();
+}
+
 struct StreamSinkLocal : public LocalSinkState {
 	optional_idx stream;
 	DataChunk frame_rows;
 	bool stopped = false;
+	//! A frame given to Send that has not been taken yet keeps its place in the slice's order.
+	bool sending = false;
+	CrossingRowHeader header;
+	bool reporting = false;
+	CrossingRowHeader report;
 };
 
 bool ClaimStream(StreamSinkGlobal &global, StreamSinkLocal &local, const InterruptState &resume) {
@@ -141,17 +247,21 @@ bool ClaimStream(StreamSinkGlobal &global, StreamSinkLocal &local, const Interru
 
 CrossingStreamSink::CrossingStreamSink(CrossingLink &link_p, idx_t streams_p, idx_t slice_p, bool into_far_p,
                                        vector<idx_t> columns_p, vector<LogicalType> types_p, bool ordered_p,
-                                       bool parallel_p, shared_ptr<CrossingFailure> failure_p)
+                                       bool parallel_p, shared_ptr<CrossingFailure> failure_p, idx_t budget_p)
     : link(&link_p), streams(streams_p), slice(slice_p), into_far(into_far_p), columns(std::move(columns_p)),
-      types(std::move(types_p)), ordered(ordered_p), parallel(parallel_p), failure(std::move(failure_p)) {
+      types(std::move(types_p)), ordered(ordered_p), parallel(parallel_p), failure(std::move(failure_p)),
+      budget(budget_p) {
 }
 
 unique_ptr<GlobalSinkState> CrossingStreamSink::GlobalState() const {
 	auto state = make_uniq<StreamSinkGlobal>();
 	state->failure = failure;
+	if (!into_far) {
+		state->credit = make_shared_ptr<CreditReceiver>(*state);
+	}
 	auto count = parallel ? streams : idx_t(1);
 	for (idx_t k = 0; k < streams; k++) {
-		auto stream = link->Open(CrossingSliceStreamId(slice, into_far, k));
+		auto stream = link->Open(CrossingSliceStreamId(slice, into_far, k), state->credit.get());
 		if (k < count) {
 			state->streams.push_back(std::move(stream));
 			state->free_streams.push_back(count - 1 - k);
@@ -178,17 +288,45 @@ SinkResultType CrossingStreamSink::Sink(DataChunk &chunk, OperatorSinkInput &inp
 		return SinkResultType::BLOCKED;
 	}
 	idx_t batch = 0;
+	idx_t min_batch = 0;
 	if (ordered) {
 		batch = parallel ? local.partition_info.batch_index.GetIndex() : global.next_sequential_batch;
+		min_batch = parallel ? local.partition_info.min_batch_index.GetIndex() : batch;
+		global.AdvanceMinBatch(min_batch);
 	}
 	for (idx_t c = 0; c < columns.size(); c++) {
 		local.frame_rows.data[c].Reference(chunk.data[columns[c]]);
 	}
 	local.frame_rows.SetChildCardinality(chunk.size());
 	CrossingFrame frame;
-	frame.header = CrossingBatchHeader(batch);
 	frame.rows.InitializeEmpty(types);
 	frame.rows.Reference(local.frame_rows);
+	if (!local.sending) {
+		auto bytes = frame.rows.GetAllocationSize();
+		while (true) {
+			auto parking = CrossingParking::Of(input.interrupt_state);
+			{
+				lock_guard<mutex> guard(global.credit_lock);
+				if (!global.ShouldBlock(ordered, budget, batch, bytes)) {
+					break;
+				}
+				global.waiting.push_back(parking->Waker());
+			}
+			if (failure) {
+				failure->WakeOnCancel(parking->Waker());
+				failure->ThrowIfCancelled();
+			}
+			if (parking->Park()) {
+				return SinkResultType::BLOCKED;
+			}
+		}
+		local.header.sequence = global.next_sequence++;
+		local.header.batch = batch;
+		local.header.min_batch = min_batch;
+		local.header.bytes = bytes;
+		local.sending = true;
+	}
+	frame.header = local.header.Encode();
 	switch (SendFrame(*global.streams[local.stream.GetIndex()], frame, input.interrupt_state, failure)) {
 	case Sent::BLOCKED:
 		return SinkResultType::BLOCKED;
@@ -198,11 +336,54 @@ SinkResultType CrossingStreamSink::Sink(DataChunk &chunk, OperatorSinkInput &inp
 	default:
 		break;
 	}
+	local.sending = false;
+	{
+		lock_guard<mutex> guard(global.credit_lock);
+		global.sent_bytes += local.header.bytes;
+		if (ordered && batch >= global.min_batch) {
+			global.sent_by_batch[batch] += local.header.bytes;
+		} else {
+			global.released_bytes += local.header.bytes;
+		}
+	}
 	if (ordered && !parallel) {
 		global.next_sequential_batch++;
 	}
 	return SinkResultType::NEED_MORE_INPUT;
 }
+
+namespace {
+
+//! Tells the reader how far the slice has got. False when the sender is to report BLOCKED and be called again.
+bool ReportProgress(StreamSinkGlobal &global, StreamSinkLocal &local, bool parallel, const InterruptState &resume,
+                    const shared_ptr<CrossingFailure> &failure) {
+	if (!parallel) {
+		return true;
+	}
+	auto min_batch = local.partition_info.min_batch_index.GetIndex();
+	global.AdvanceMinBatch(min_batch);
+	if (!local.stream.IsValid() || local.stopped) {
+		return true;
+	}
+	if (!local.reporting) {
+		local.report.sequence = global.next_sequence++;
+		local.report.batch = local.partition_info.batch_index.GetIndex();
+		local.report.min_batch = min_batch;
+		local.report.bytes = 0;
+		local.reporting = true;
+	}
+	CrossingFrame frame;
+	frame.header = local.report.Encode();
+	auto sent = SendFrame(*global.streams[local.stream.GetIndex()], frame, resume, failure);
+	if (sent == Sent::BLOCKED) {
+		return false;
+	}
+	local.reporting = false;
+	local.stopped |= sent == Sent::STOPPED;
+	return true;
+}
+
+} // namespace
 
 SinkCombineResultType CrossingStreamSink::Combine(OperatorSinkCombineInput &input) const {
 	auto &global = input.global_state.Cast<StreamSinkGlobal>();
@@ -210,13 +391,8 @@ SinkCombineResultType CrossingStreamSink::Combine(OperatorSinkCombineInput &inpu
 	if (!local.stream.IsValid()) {
 		return SinkCombineResultType::FINISHED;
 	}
-	if (ordered && !local.stopped) {
-		CrossingFrame idle;
-		idle.header = CROSSING_IDLE_HEADER;
-		if (SendFrame(*global.streams[local.stream.GetIndex()], idle, input.interrupt_state, failure) ==
-		    Sent::BLOCKED) {
-			return SinkCombineResultType::BLOCKED;
-		}
+	if (ordered && !ReportProgress(global, local, parallel, input.interrupt_state, failure)) {
+		return SinkCombineResultType::BLOCKED;
 	}
 	vector<InterruptState> blocked;
 	{
@@ -234,20 +410,20 @@ SinkCombineResultType CrossingStreamSink::Combine(OperatorSinkCombineInput &inpu
 SinkNextBatchType CrossingStreamSink::NextBatch(OperatorSinkNextBatchInput &input) const {
 	auto &global = input.global_state.Cast<StreamSinkGlobal>();
 	auto &local = input.local_state.Cast<StreamSinkLocal>();
-	if (!ordered || !parallel || !local.stream.IsValid() || local.stopped) {
+	if (!ordered) {
 		return SinkNextBatchType::READY;
 	}
-	CrossingFrame reached;
-	reached.header = CrossingBatchHeader(local.partition_info.batch_index.GetIndex());
-	switch (SendFrame(*global.streams[local.stream.GetIndex()], reached, input.interrupt_state, failure)) {
-	case Sent::BLOCKED:
-		return SinkNextBatchType::BLOCKED;
-	case Sent::STOPPED:
-		local.stopped = true;
-		return SinkNextBatchType::READY;
-	default:
-		return SinkNextBatchType::READY;
+	return ReportProgress(global, local, parallel, input.interrupt_state, failure) ? SinkNextBatchType::READY
+	                                                                                : SinkNextBatchType::BLOCKED;
+}
+
+SinkNextBatchType CrossingStreamSink::UpdateMinBatchIndex(OperatorSinkNextBatchInput &input) const {
+	auto &global = input.global_state.Cast<StreamSinkGlobal>();
+	auto &local = input.local_state.Cast<StreamSinkLocal>();
+	if (ordered && parallel) {
+		global.AdvanceMinBatch(local.partition_info.min_batch_index.GetIndex());
 	}
+	return SinkNextBatchType::READY;
 }
 
 void CrossingStreamSink::Finish(GlobalSinkState &state) const {

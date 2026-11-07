@@ -7,6 +7,7 @@
 
 #include "crossing_link.hpp"
 #include "crossing_substrait.hpp"
+#include "internal/control_frames.hpp"
 
 namespace duckdb {
 
@@ -22,8 +23,8 @@ public:
 	CrossingStream &Control() {
 		return *control;
 	}
-	//! One DDL statement on far, in this transaction. Throws what far reported.
-	void RunDdl(const string &frame);
+	//! One DDL statement on far, in this transaction. Throws what far reported. An interrupt ends the wait.
+	void RunDdl(ClientContext &context, const string &frame);
 	//! Unique within the transaction, as a slice's streams are.
 	idx_t NextSliceId() {
 		return next_slice++;
@@ -40,22 +41,26 @@ public:
 		return used;
 	}
 	//! What this transaction sees of a schema it changed.
-	vector<string> Tables(const string &schema);
+	vector<string> Tables(ClientContext &context, const string &schema);
 	//! The columns, and whether it has row ids; the source fills in the rest.
 	CrossingTable Describe(ClientContext &context, const string &schema, const string &name);
 	//! Far ended this transaction with its statement; another statement needs another link.
 	bool EndedByFar() const {
 		return ended_by_far;
 	}
-	//! Waits out a statement near has finished with. What far reports of it is returned, not thrown.
-	ErrorData DrainStatement();
+	//! Waits out a statement near has finished with. What far reports of it is returned, not thrown. With `context`,
+	//! an interrupt ends the wait by throwing.
+	ErrorData DrainStatement(optional_ptr<ClientContext> context = nullptr);
 
 private:
 	void End(const char *word);
-	string Ask(const string &question);
+	string Ask(ClientContext &context, const string &question);
+	ErrorData DrainReply(optional_ptr<ClientContext> context);
 
 	CrossingLink &link;
+	CrossingControlQueue replies;
 	unique_ptr<CrossingStream> control;
+	idx_t unread_replies = 0;
 	idx_t next_slice = 0;
 	bool ended = false;
 	bool statement_running = false;

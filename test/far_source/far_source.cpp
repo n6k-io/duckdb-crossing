@@ -136,6 +136,9 @@ public:
 	    : store(std::move(store_p)), catalog(std::move(catalog_p)), floor_catalog(std::move(floor_catalog_p)),
 	      pair(store->streams, store->capacity, store->far_streams), far(store->db) {
 		pair.on_rows = [this](idx_t id, int side, DataChunk &rows) {
+			if (side == 1) {
+				store->far_rows_sent += rows.size();
+			}
 			Observe(id, side, rows);
 		};
 		pair.on_control = [this](const string &header) {
@@ -149,6 +152,15 @@ public:
 				store->ddls.push_back(std::move(ddl));
 			}
 		};
+		pair.stall = [this](idx_t id) {
+			return id == 0 ? store->stall_replies.load() : store->stall_results.load();
+		};
+		{
+			lock_guard<mutex> guard(store->lock);
+			store->release_link = [this]() {
+				pair.Release();
+			};
+		}
 		CrossingFarOptions options;
 		options.catalogs = store->catalog_check;
 		options.floors = store->floors;
@@ -168,13 +180,16 @@ public:
 		store->seam_rows += pair.SeamRows();
 		store->waits += pair.Waits();
 		store->near_control_replies += pair.NearControlReplies();
+		store->near_recv_streams = pair.NearRecvStreams().size();
+		store->most_held_for_near = MaxValue(store->most_held_for_near, pair.MostHeldForNear());
+		store->release_link = nullptr;
 	}
 
 	idx_t Streams() override {
 		return pair.Near().Streams();
 	}
-	unique_ptr<CrossingStream> Open(idx_t id) override {
-		return pair.Near().Open(id);
+	unique_ptr<CrossingStream> Open(idx_t id, optional_ptr<CrossingReceiver> receiver) override {
+		return pair.Near().Open(id, receiver);
 	}
 
 private:
@@ -224,6 +239,19 @@ bool FarCall::Mentions(const string &text) const {
 
 FarStore::FarStore() : db(nullptr), con(db) {
 	RegisterCrossingFarFunctions(*db.instance);
+}
+
+void FarStore::Release() {
+	stall_replies = false;
+	stall_results = false;
+	std::function<void()> release;
+	{
+		lock_guard<mutex> guard(lock);
+		release = release_link;
+	}
+	if (release) {
+		release();
+	}
 }
 
 const FarCall &FarStore::LastRead() {

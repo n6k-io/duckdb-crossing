@@ -2,6 +2,8 @@
 
 #include "internal/control_frames.hpp"
 #include "internal/execute.hpp"
+#include "internal/seam_inbox.hpp"
+#include "internal/stream_sink.hpp"
 #include "internal/far_plan.hpp"
 
 #include "duckdb/catalog/catalog.hpp"
@@ -20,117 +22,8 @@
 #include "duckdb/planner/planner.hpp"
 #include "duckdb/transaction/meta_transaction.hpp"
 
-#include <atomic>
-#include <thread>
 
 namespace duckdb {
-
-namespace {
-
-struct SeamStream {
-	shared_ptr<CrossingSeamInbox> inbox;
-	idx_t stream = 0;
-	unique_ptr<CrossingStream> wire;
-	bool done = false;
-};
-
-//! Moves seam frames into their inboxes until the rows end or the statement does: the inboxes take every
-//! row, so no frame waits on the plan.
-class SeamPump {
-public:
-	SeamPump(CrossingLink &link, const map<idx_t, shared_ptr<CrossingSeamInbox>> &inboxes) {
-		for (auto &entry : inboxes) {
-			for (idx_t k = 0; k < entry.second->Streams(); k++) {
-				SeamStream stream;
-				stream.inbox = entry.second;
-				stream.stream = k;
-				stream.wire = link.Open(CrossingSliceStreamId(entry.first, true, k));
-				streams.push_back(std::move(stream));
-			}
-		}
-	}
-
-	void Run() {
-		while (!statement_ended.load()) {
-			auto signal = make_shared_ptr<InterruptDoneSignalState>();
-			auto parking = CrossingParking::Of(InterruptState(signal));
-			{
-				lock_guard<mutex> guard(lock);
-				current = parking;
-			}
-			if (statement_ended.load()) {
-				return;
-			}
-			bool progressed = false;
-			bool open = false;
-			for (auto &stream : streams) {
-				if (stream.done) {
-					continue;
-				}
-				progressed |= PullOne(stream, *parking);
-				open |= !stream.done;
-			}
-			if (!open) {
-				return;
-			}
-			if (!progressed && parking->Park()) {
-				signal->Await();
-			}
-		}
-	}
-
-	void StatementEnded() {
-		statement_ended = true;
-		shared_ptr<CrossingParking> parking;
-		{
-			lock_guard<mutex> guard(lock);
-			parking = current;
-		}
-		if (parking) {
-			parking->Waker().Wake();
-		}
-	}
-
-	void Close(const ErrorData &error) {
-		for (auto &stream : streams) {
-			stream.wire->Close(error.HasError() ? &error : nullptr);
-		}
-	}
-
-private:
-	static bool PullOne(SeamStream &stream, CrossingParking &parking) {
-		CrossingFrame frame;
-		frame.rows.Initialize(Allocator::DefaultAllocator(), stream.inbox->Types());
-		try {
-			switch (stream.wire->Recv(frame, parking.Waker())) {
-			case CrossingIo::ROWS:
-				if (frame.header == CROSSING_IDLE_HEADER) {
-					stream.inbox->Idle(stream.stream);
-				} else {
-					stream.inbox->Append(stream.stream, frame.rows, std::stoull(frame.header));
-				}
-				return true;
-			case CrossingIo::DONE:
-				stream.done = true;
-				stream.inbox->StreamDone(stream.stream);
-				return true;
-			default:
-				return false;
-			}
-		} catch (std::exception &ex) {
-			stream.done = true;
-			stream.inbox->Cancel(ErrorData(ex));
-			return true;
-		}
-	}
-
-	vector<SeamStream> streams;
-	std::atomic<bool> statement_ended {false};
-	mutex lock;
-	shared_ptr<CrossingParking> current;
-};
-
-} // namespace
 
 CrossingFar::CrossingFar(Connection &connection_p, string catalog_p, CrossingFarOptions options_p)
     : connection(connection_p), catalog(std::move(catalog_p)), options(std::move(options_p)) {
@@ -139,13 +32,11 @@ CrossingFar::CrossingFar(Connection &connection_p, string catalog_p, CrossingFar
 
 void CrossingFar::Cancel(const string &reason) {
 	ErrorData error(ExceptionType::INTERRUPT, reason);
-	shared_ptr<CrossingParking> waiting;
 	shared_ptr<CrossingFailure> failure;
 	vector<shared_ptr<CrossingSeamInbox>> seams;
 	{
 		lock_guard<mutex> guard(lock);
 		cancelled = error;
-		waiting = control_wait;
 		failure = running;
 		seams = inboxes;
 	}
@@ -154,9 +45,6 @@ void CrossingFar::Cancel(const string &reason) {
 	}
 	for (auto &inbox : seams) {
 		inbox->Cancel(error);
-	}
-	if (waiting) {
-		waiting->Waker().Wake();
 	}
 	connection.Interrupt();
 }
@@ -227,42 +115,43 @@ bool CrossingFar::RunStatement(CrossingLink &link, CrossingStream &control, cons
 		failure->CloseHeld(error);
 		for (auto slice : frame.slices) {
 			for (idx_t k = 0; k < frame.streams; k++) {
-				link.Open(CrossingSliceStreamId(slice, false, k))->Close(&error);
-				link.Open(CrossingSliceStreamId(slice, true, k))->Close(&error);
+				link.Open(CrossingSliceStreamId(slice, false, k), nullptr)->Close(&error);
+				link.Open(CrossingSliceStreamId(slice, true, k), nullptr)->Close(&error);
 			}
 		}
 		return end_transaction(error);
 	}
 
-	SeamPump pump(link, seams);
+	vector<unique_ptr<CrossingInboxReceiver>> seam_receivers;
+	vector<unique_ptr<CrossingStream>> seam_streams;
+	for (auto &entry : seams) {
+		for (idx_t k = 0; k < frame.streams; k++) {
+			seam_receivers.push_back(make_uniq<CrossingInboxReceiver>(entry.second));
+			seam_streams.push_back(link.Open(CrossingSliceStreamId(entry.first, true, k), seam_receivers.back().get()));
+		}
+	}
 	ErrorData run_error;
-	std::thread runner([&]() {
-		try {
-			result->Complete();
-			result->ThrowIfError();
-		} catch (std::exception &ex) {
-			run_error = ErrorData(ex);
-		}
-		result.reset();
-		{
-			lock_guard<mutex> guard(lock);
-			if (cancelled.HasError()) {
-				run_error = cancelled;
-			}
-		}
-		failure->CloseHeld(run_error);
-		pump.StatementEnded();
-	});
-	pump.Run();
-	runner.join();
-	pump.Close(run_error);
-	seams.clear();
-	planner.reset();
+	try {
+		result->Complete();
+		result->ThrowIfError();
+	} catch (std::exception &ex) {
+		run_error = ErrorData(ex);
+	}
+	result.reset();
 	{
 		lock_guard<mutex> guard(lock);
+		if (cancelled.HasError()) {
+			run_error = cancelled;
+		}
 		running = nullptr;
 		inboxes.clear();
 	}
+	failure->CloseHeld(run_error);
+	for (auto &stream : seam_streams) {
+		stream->Close(run_error.HasError() ? &run_error : nullptr);
+	}
+	seams.clear();
+	planner.reset();
 	return end_transaction(run_error);
 }
 
@@ -377,34 +266,9 @@ void CrossingFar::AnswerDescribe(CrossingStream &control, const string &question
 	}
 }
 
-bool CrossingFar::NextControl(CrossingStream &control, string &header) {
-	while (true) {
-		CrossingFrame frame;
-		auto signal = make_shared_ptr<InterruptDoneSignalState>();
-		auto parking = CrossingParking::Of(InterruptState(signal));
-		{
-			lock_guard<mutex> guard(lock);
-			if (cancelled.HasError()) {
-				return false;
-			}
-			control_wait = parking;
-		}
-		switch (control.Recv(frame, parking->Waker())) {
-		case CrossingIo::ROWS:
-			header = std::move(frame.header);
-			return true;
-		case CrossingIo::DONE:
-			return false;
-		default:
-			if (parking->Park()) {
-				signal->Await();
-			}
-		}
-	}
-}
-
 void CrossingFar::Serve(CrossingLink &link) {
-	auto control = link.Open(0);
+	CrossingControlQueue incoming;
+	auto control = link.Open(0, &incoming);
 	auto begin = connection.Query("BEGIN");
 	if (begin->HasError()) {
 		ErrorData why;
@@ -423,7 +287,11 @@ void CrossingFar::Serve(CrossingLink &link) {
 	const string tables_prefix(CROSSING_CONTROL_TABLES);
 	const string describe_prefix(CROSSING_CONTROL_DESCRIBE);
 	string header;
-	while (NextControl(*control, header)) {
+	auto cancelling = [this]() {
+		lock_guard<mutex> guard(lock);
+		return cancelled.HasError();
+	};
+	while (incoming.Next(header, cancelling)) {
 		try {
 			if (header.compare(0, plan_prefix.size(), plan_prefix) == 0) {
 				if (RunStatement(link, *control, header.substr(plan_prefix.size()))) {

@@ -7,6 +7,7 @@
 #include "duckdb/execution/physical_operator.hpp"
 #include "duckdb/execution/physical_plan_generator.hpp"
 #include "duckdb/function/table_function.hpp"
+#include "duckdb/main/client_config.hpp"
 #include "duckdb/parallel/meta_pipeline.hpp"
 #include "duckdb/parallel/pipeline.hpp"
 #include "duckdb/parser/parsed_data/create_table_function_info.hpp"
@@ -42,6 +43,7 @@ struct SeamRowsLocalState : public LocalTableFunctionState {
 	unique_ptr<ColumnDataCollection> rows;
 	ColumnDataScanState scan;
 	idx_t rank = 0;
+	idx_t bytes = 0;
 };
 
 unique_ptr<FunctionData> SeamRowsBind(ClientContext &context, TableFunctionBindInput &input,
@@ -82,7 +84,7 @@ void SeamRowsScan(ClientContext &, TableFunctionInput &data, DataChunk &output) 
 		if (!data.interrupt_state) {
 			throw InternalException("crossing: a seam scan has nothing to resume it");
 		}
-		switch (inbox.Take(local.rows, local.rank, *data.interrupt_state)) {
+		switch (inbox.Take(local.rows, local.rank, local.bytes, *data.interrupt_state)) {
 		case CrossingSeamInbox::Took::ROWS:
 			local.rows->InitializeScan(local.scan);
 			break;
@@ -153,6 +155,9 @@ public:
 	}
 	SinkNextBatchType NextBatch(ExecutionContext &, OperatorSinkNextBatchInput &input) const override {
 		return sink.NextBatch(input);
+	}
+	SinkNextBatchType UpdateMinBatchIndex(ExecutionContext &, OperatorSinkNextBatchInput &input) const override {
+		return sink.UpdateMinBatchIndex(input);
 	}
 	SinkFinalizeType Finalize(Pipeline &, Event &, ClientContext &, OperatorSinkFinalizeInput &input) const override {
 		sink.Finish(input.global_state);
@@ -274,7 +279,8 @@ public:
 			row_types.push_back(expr->GetReturnType());
 		}
 		CrossingStreamSink sink(link, streams, slice, false, std::move(columns), row_types, ordered,
-		                        !ordered || PhysicalPlanGenerator::UseBatchIndex(context, child), failure);
+		                        !ordered || PhysicalPlanGenerator::UseBatchIndex(context, child), failure,
+		                        ClientConfig::GetConfig(context).max_streaming_buffer_size);
 		auto &out =
 		    planner.Make<PhysicalStreamOut>(std::move(row_types), std::move(sink), writes, estimated_cardinality);
 		out.children.push_back(child);

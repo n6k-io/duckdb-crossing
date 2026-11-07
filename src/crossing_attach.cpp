@@ -144,7 +144,7 @@ auto CrossingAttach::WithTables(const string &schema, optional_ptr<Transaction> 
 		if (it != slot->overlays.end()) {
 			auto &overlay = it->second;
 			if (!overlay.listed) {
-				for (auto &table : slot->remote->Tables(schema)) {
+				for (auto &table : slot->remote->Tables(*transaction->context.lock(), schema)) {
 					overlay.tables.insert(table);
 				}
 				overlay.listed = true;
@@ -419,7 +419,7 @@ void CrossingAttach::Ddl(ClientContext &context, Transaction &transaction, Schem
                          const CrossingDdl &ddl) {
 	Authorize(owner, ddl, &transaction);
 	Pin(ddl.schema, owner, ddl.table);
-	RemoteOf(context, transaction).RunDdl(DdlFrame(ddl));
+	RemoteOf(context, transaction).RunDdl(context, DdlFrame(ddl));
 	NoteAltered(transaction, ddl.schema);
 }
 
@@ -519,7 +519,7 @@ shared_ptr<CrossingRemoteStatement> CrossingAttach::RemoteStatement(ClientContex
 	lock_guard<mutex> guard(slot.lock);
 	auto query = context.transaction.GetActiveQuery();
 	if (!slot.statement || slot.statement_query != query) {
-		remote.DrainStatement();
+		remote.DrainStatement(&context);
 		slot.statement = make_shared_ptr<CrossingRemoteStatement>(remote);
 		slot.statement->SetAutoCommit(context.transaction.IsAutoCommit());
 		slot.statement_query = query;

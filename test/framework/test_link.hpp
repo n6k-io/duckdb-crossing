@@ -3,22 +3,37 @@
 #include "crossing_link.hpp"
 
 #include "duckdb/common/deque.hpp"
+#include "duckdb/common/limits.hpp"
 #include "duckdb/common/mutex.hpp"
 #include "duckdb/common/optional_idx.hpp"
 
+#include <chrono>
+#include <condition_variable>
+#include <deque>
 #include <functional>
+#include <mutex>
 #include <map>
 #include <set>
 #include <thread>
 
 namespace duckdb {
 
-//! Two ends of one link in one process. A pipe holds `capacity` frames, then Send returns WAIT.
+//! Two ends of one link in one process, with one thread delivering everything. A pipe holds `capacity` frames, then
+//! Send returns WAIT.
 class TestLinkPair {
 public:
 	explicit TestLinkPair(idx_t streams_p = 1, idx_t capacity_p = 4, idx_t far_streams_p = 0)
 	    : near_end(make_uniq<End>(*this, 0)), far_end(make_uniq<End>(*this, 1)), streams(streams_p),
-	      far_streams(far_streams_p ? far_streams_p : streams_p), capacity(capacity_p) {
+	      far_streams(far_streams_p ? far_streams_p : streams_p), capacity(capacity_p), delivery([this]() { Run(); }) {
+	}
+
+	~TestLinkPair() {
+		{
+			std::lock_guard<std::mutex> guard(lock);
+			stopping = true;
+		}
+		changed.notify_all();
+		delivery.join();
 	}
 
 	CrossingLink &Near() {
@@ -31,46 +46,139 @@ public:
 	//! Called with each frame of rows sent, and each control frame near sends.
 	std::function<void(idx_t id, int side, DataChunk &rows)> on_rows;
 	std::function<void(const string &header)> on_control;
+	//! Whether delivery to near on stream `id` waits, as if far were slow. Release ends the wait.
+	std::function<bool(idx_t id)> stall;
 
-	std::set<idx_t> UsedStreams() {
-		lock_guard<mutex> guard(lock);
-		return used_streams;
+	//! Lifts every limit and wakes everything waiting, so whatever a test left stuck can end.
+	void Release() {
+		vector<CrossingWaker> wake;
+		{
+			std::lock_guard<std::mutex> guard(lock);
+			released = true;
+			capacity = NumericLimits<idx_t>::Maximum();
+			for (auto &entry : pipes) {
+				wake.insert(wake.end(), entry.second.senders.begin(), entry.second.senders.end());
+				entry.second.senders.clear();
+			}
+		}
+		changed.notify_all();
+		for (auto &sleeper : wake) {
+			sleeper.Wake();
+		}
 	}
-	std::set<std::thread::id> SendingThreads() {
-		lock_guard<mutex> guard(lock);
-		return sending_threads;
+	std::set<idx_t> NearRecvStreams() {
+		std::lock_guard<std::mutex> guard(lock);
+		return recv_streams;
 	}
 	idx_t NearControlReplies() {
-		lock_guard<mutex> guard(lock);
+		std::lock_guard<std::mutex> guard(lock);
 		return near_control_replies;
 	}
 	idx_t SeamRows() {
-		lock_guard<mutex> guard(lock);
+		std::lock_guard<std::mutex> guard(lock);
 		return seam_rows;
 	}
+	idx_t MostHeldForNear() {
+		std::lock_guard<std::mutex> guard(lock);
+		return most_held_for_near;
+	}
 	bool FarSentBeforeSeamEnded() {
-		lock_guard<mutex> guard(lock);
+		std::lock_guard<std::mutex> guard(lock);
 		return far_sent_before_seam_ended;
 	}
+	std::set<idx_t> UsedStreams() {
+		std::lock_guard<std::mutex> guard(lock);
+		return used_streams;
+	}
+	std::set<std::thread::id> SendingThreads() {
+		std::lock_guard<std::mutex> guard(lock);
+		return sending_threads;
+	}
 	idx_t Waits() {
-		lock_guard<mutex> guard(lock);
+		std::lock_guard<std::mutex> guard(lock);
 		return waits;
 	}
 
 private:
 	struct Stored {
 		string header;
-		bool has_rows = false;
 		unique_ptr<DataChunk> rows;
 	};
 
+	//! Frames travelling one way on one stream, keyed by the side that sends them.
 	struct Pipe {
-		deque<Stored> frames;
+		std::deque<Stored> frames;
 		bool closed = false;
+		bool close_delivered = false;
 		ErrorData error;
 		vector<CrossingWaker> senders;
-		vector<CrossingWaker> receivers;
+		optional_ptr<CrossingReceiver> receiver;
 	};
+
+	static bool IntoFar(idx_t id) {
+		return id > 0 && (((id - 1) >> 16) & 1);
+	}
+
+	void Run() {
+		std::unique_lock<std::mutex> guard(lock);
+		while (!stopping) {
+			bool delivered = false;
+			for (auto &entry : pipes) {
+				auto id = entry.first.first;
+				auto side = entry.first.second;
+				auto &pipe = entry.second;
+				if (!pipe.receiver || (side == 1 && !released && stall && stall(id))) {
+					continue;
+				}
+				if (!pipe.frames.empty()) {
+					auto stored = std::move(pipe.frames.front());
+					pipe.frames.pop_front();
+					if (side == 1 && id == 0) {
+						near_control_replies++;
+					}
+					if (side == 1 && id != 0 && stored.rows) {
+						recv_streams.insert(id);
+					}
+					vector<CrossingWaker> wake;
+					wake.swap(pipe.senders);
+					auto receiver = pipe.receiver;
+					delivering = true;
+					guard.unlock();
+					for (auto &sleeper : wake) {
+						sleeper.Wake();
+					}
+					CrossingFrame frame;
+					frame.header = std::move(stored.header);
+					if (stored.rows) {
+						frame.rows.Initialize(Allocator::DefaultAllocator(), receiver->Types());
+						stored.rows->Copy(frame.rows);
+					}
+					receiver->Deliver(frame);
+					guard.lock();
+					delivering = false;
+					changed.notify_all();
+					delivered = true;
+					break;
+				}
+				if (pipe.closed && !pipe.close_delivered) {
+					pipe.close_delivered = true;
+					auto receiver = pipe.receiver;
+					auto error = pipe.error;
+					delivering = true;
+					guard.unlock();
+					receiver->Closed(error.HasError() ? &error : nullptr);
+					guard.lock();
+					delivering = false;
+					changed.notify_all();
+					delivered = true;
+					break;
+				}
+			}
+			if (!delivered) {
+				changed.wait_for(guard, std::chrono::milliseconds(5));
+			}
+		}
+	}
 
 	class Stream : public CrossingStream {
 	public:
@@ -78,9 +186,14 @@ private:
 		}
 
 		CrossingIo Send(CrossingFrame &frame, CrossingWaker waker) override {
-			vector<CrossingWaker> wake;
+			if (pair.on_control && id == 0 && side == 0) {
+				pair.on_control(frame.header);
+			}
+			if (pair.on_rows && frame.rows.ColumnCount() > 0) {
+				pair.on_rows(id, side, frame.rows);
+			}
 			{
-				lock_guard<mutex> guard(pair.lock);
+				std::lock_guard<std::mutex> guard(pair.lock);
 				auto &reverse = pair.pipes[{id, 1 - side}];
 				if (reverse.closed) {
 					if (reverse.error.HasError()) {
@@ -94,89 +207,56 @@ private:
 					pair.waits++;
 					return CrossingIo::WAIT;
 				}
-				if (pair.on_control && id == 0 && side == 0) {
-					pair.on_control(frame.header);
-				}
-				if (pair.on_rows && frame.rows.ColumnCount() > 0) {
-					pair.on_rows(id, side, frame.rows);
-				}
 				Stored stored;
 				stored.header = frame.header;
 				if (frame.rows.ColumnCount() > 0) {
-					stored.has_rows = true;
 					stored.rows = make_uniq<DataChunk>();
 					stored.rows->Initialize(Allocator::DefaultAllocator(), frame.rows.GetTypes());
 					frame.rows.Copy(*stored.rows);
 					pair.used_streams.insert(id);
+					pair.sending_threads.insert(std::this_thread::get_id());
 					if (side == 0) {
 						pair.seam_rows += frame.rows.size();
 					}
 					if (side == 1 && !pair.seam_ended) {
 						pair.far_sent_before_seam_ended = true;
 					}
-					pair.sending_threads.insert(std::this_thread::get_id());
 				}
 				pipe.frames.push_back(std::move(stored));
-				wake.swap(pipe.receivers);
-			}
-			for (auto &sleeper : wake) {
-				sleeper.Wake();
-			}
-			return CrossingIo::TAKEN;
-		}
-
-		CrossingIo Recv(CrossingFrame &frame, CrossingWaker waker) override {
-			vector<CrossingWaker> wake;
-			CrossingIo result;
-			{
-				lock_guard<mutex> guard(pair.lock);
-				auto &pipe = pair.pipes[{id, 1 - side}];
-				if (!pipe.frames.empty()) {
-					auto stored = std::move(pipe.frames.front());
-					pipe.frames.pop_front();
-					if (id == 0 && side == 0) {
-						pair.near_control_replies++;
+				if (side == 1) {
+					idx_t held = 0;
+					for (auto &entry : pair.pipes) {
+						if (entry.first.second == 1) {
+							held += entry.second.frames.size();
+						}
 					}
-					frame.header = stored.header;
-					if (stored.has_rows) {
-						frame.rows.Reset();
-						stored.rows->Copy(frame.rows);
-					}
-					wake.swap(pipe.senders);
-					result = CrossingIo::ROWS;
-				} else if (pipe.closed) {
-					if (pipe.error.HasError()) {
-						pipe.error.Throw();
-					}
-					return CrossingIo::DONE;
-				} else {
-					pipe.receivers.push_back(std::move(waker));
-					return CrossingIo::WAIT;
+					pair.most_held_for_near = MaxValue(pair.most_held_for_near, held);
 				}
 			}
-			for (auto &sleeper : wake) {
-				sleeper.Wake();
-			}
-			return result;
+			pair.changed.notify_all();
+			return CrossingIo::TAKEN;
 		}
 
 		void Close(optional_ptr<const ErrorData> error) override {
 			vector<CrossingWaker> wake;
 			{
-				lock_guard<mutex> guard(pair.lock);
+				std::unique_lock<std::mutex> guard(pair.lock);
 				auto &pipe = pair.pipes[{id, side}];
 				pipe.closed = true;
-				if (side == 0 && id > 0 && ((id - 1) >> 16) & 1) {
-					pair.seam_ended = true;
-				}
 				if (error) {
 					pipe.error = *error;
 				}
-				wake.swap(pipe.receivers);
+				if (side == 0 && IntoFar(id)) {
+					pair.seam_ended = true;
+				}
 				auto &reverse = pair.pipes[{id, 1 - side}];
-				wake.insert(wake.end(), reverse.senders.begin(), reverse.senders.end());
-				reverse.senders.clear();
+				wake.swap(reverse.senders);
+				reverse.receiver = nullptr;
+				while (pair.delivering) {
+					pair.changed.wait(guard);
+				}
 			}
+			pair.changed.notify_all();
 			for (auto &sleeper : wake) {
 				sleeper.Wake();
 			}
@@ -195,7 +275,12 @@ private:
 		idx_t Streams() override {
 			return side == 0 ? pair.streams : pair.far_streams;
 		}
-		unique_ptr<CrossingStream> Open(idx_t id) override {
+		unique_ptr<CrossingStream> Open(idx_t id, optional_ptr<CrossingReceiver> receiver) override {
+			{
+				std::lock_guard<std::mutex> guard(pair.lock);
+				pair.pipes[{id, 1 - side}].receiver = receiver;
+			}
+			pair.changed.notify_all();
 			return make_uniq<Stream>(pair, id, side);
 		}
 
@@ -209,15 +294,22 @@ private:
 	idx_t streams;
 	idx_t far_streams;
 	idx_t capacity;
-	idx_t near_control_replies = 0;
-	mutex lock;
+	std::mutex lock;
+	std::condition_variable changed;
 	std::map<std::pair<idx_t, int>, Pipe> pipes;
+	bool stopping = false;
+	bool delivering = false;
+	bool released = false;
+	idx_t near_control_replies = 0;
+	std::set<idx_t> recv_streams;
 	std::set<idx_t> used_streams;
 	std::set<std::thread::id> sending_threads;
 	idx_t waits = 0;
 	idx_t seam_rows = 0;
+	idx_t most_held_for_near = 0;
 	bool seam_ended = false;
 	bool far_sent_before_seam_ended = false;
+	std::thread delivery;
 };
 
 } // namespace duckdb
