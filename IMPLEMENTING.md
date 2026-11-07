@@ -83,7 +83,7 @@ Crossing owns everything on far. `Serve` opens a transaction on `connection`, ru
 
 `CrossingFarOptions` takes:
 
-- `floors`: what stands for a table far reads, such as a subquery with a row filter. Its columns are the table's, in order, then `rowid`. An `UPDATE` or `DELETE` reaches only rows it produces, and fails with a clear error if it hides `rowid`. A `MERGE` into a table it replaces is refused.
+- `floors`: what stands for a table far reads, such as a subquery with a row filter. Its columns are the table's, in order, then `rowid`. An `UPDATE` or `DELETE` reaches only rows it produces, and fails with a clear error if it hides `rowid`. A `MERGE` into a table it replaces is refused. It is asked for a write's target too, with `verb` saying which write; `reads_rows` is false when the write reads nothing of the target's rows (no target column in `WHERE` or `SET`, no subquery, no `RETURNING`), which as in Postgres needs no `SELECT` on the target.
 - `catalogs`: called with each catalog a plan names; throw to refuse the plan.
 
 ## What travels

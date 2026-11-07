@@ -102,16 +102,22 @@ struct CrossingSchema {
 	}
 };
 
-//! A table a far plan reads, for CrossingFarOptions::floors.
+//! A table a far plan reads or writes, for CrossingFarOptions::floors.
 struct CrossingFloor {
 	//! Empty: the catalog far binds in.
 	string catalog;
 	string schema;
 	string table;
+	//! SELECT for a table read; UPDATE or DELETE_ for a write's target.
+	CrossingVerb verb = CrossingVerb::SELECT;
+	//! False on a write target whose rows the write reads nothing of: no target column in its WHERE or SET, no
+	//! subquery, no RETURNING. As Postgres, such a write needs no SELECT on its target.
+	bool reads_rows = true;
 };
 
-//! What stands for a table far reads: a TableRef producing its columns, in order, then its `rowid`. An UPDATE or
-//! DELETE reaches only rows it produces, and a MERGE into a table it replaces is refused. Null means the table itself.
+//! What stands for a table far reads or writes: a TableRef producing its columns, in order, then its `rowid`. An
+//! UPDATE or DELETE reaches only rows it produces, and a MERGE into a table it replaces is refused. Null means the
+//! table itself.
 using CrossingFloorResolver = std::function<unique_ptr<TableRef>(const CrossingFloor &)>;
 
 struct CrossingParking;

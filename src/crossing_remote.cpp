@@ -6,6 +6,7 @@
 #include "internal/seam_inbox.hpp"
 #include "internal/stream_sink.hpp"
 
+#include "duckdb/common/enum_util.hpp"
 #include "duckdb/common/numeric_utils.hpp"
 #include "duckdb/common/string_util.hpp"
 #include "duckdb/execution/physical_operator.hpp"
@@ -173,6 +174,74 @@ void CrossingRemoteStatement::PutWrite(idx_t slice, unique_ptr<SubstraitWrite> w
 	throw InternalException("crossing: no slice %llu to write through", slice);
 }
 
+namespace {
+
+string WriteText(const SubstraitWrite &write) {
+	auto target = write.schema + "." + write.table;
+	if (write.merge) {
+		auto text = "MERGE INTO " + target;
+		if (write.condition) {
+			text += " ON " + write.condition->ToString();
+		}
+		for (auto &action : write.actions) {
+			text += "\n" + StringUtil::Replace(EnumUtil::ToString(action.when), "_", " ") + " THEN " +
+			        StringUtil::Replace(EnumUtil::ToString(action.type), "MERGE_", "");
+		}
+		return text;
+	}
+	auto text = StringUtil::Upper(CrossingVerbName(write.verb)) + " " + target;
+	if (!write.set_columns.empty()) {
+		auto columns = StringUtil::Join(write.set_columns, ", ");
+		text += write.verb == CrossingVerb::UPDATE ? " SET " + columns : " (" + columns + ")";
+	}
+	if (write.condition) {
+		text += " WHERE " + write.condition->ToString();
+	}
+	return text;
+}
+
+string TypeNames(const vector<LogicalType> &types) {
+	vector<string> names;
+	for (auto &type : types) {
+		names.push_back(type.ToString());
+	}
+	return StringUtil::Join(names, ", ");
+}
+
+} // namespace
+
+InsertionOrderPreservingMap<string> CrossingRemoteStatement::Explain(idx_t slice,
+                                                                     optional_ptr<const vector<LogicalType>> seam) {
+	lock_guard<mutex> guard(lock);
+	InsertionOrderPreservingMap<string> result;
+	for (auto &entry : added) {
+		if (entry.slice.id != slice) {
+			continue;
+		}
+		vector<string> runs;
+		if (entry.slice.write) {
+			runs.push_back(WriteText(*entry.slice.write));
+		}
+		if (auto source = entry.slice.Source()) {
+			runs.push_back(source->ToString());
+		}
+		result["Runs on source"] = StringUtil::Join(runs, "\n");
+		if (seam) {
+			auto rows = entry.seam_estimate.IsValid() ? "~" + to_string(entry.seam_estimate.GetIndex()) + " rows"
+			                                          : string("rows");
+			result["Sends"] = rows + " (" + TypeNames(*seam) + ")";
+		}
+		if (!entry.slice.write) {
+			result["Returns"] = "rows";
+		} else if (entry.slice.write->returning.empty()) {
+			result["Returns"] = "count";
+		} else {
+			result["Returns"] = "rows (" + StringUtil::Join(entry.slice.write->returning, ", ") + ")";
+		}
+	}
+	return result;
+}
+
 void CrossingRemoteStatement::Start() {
 	lock_guard<mutex> guard(lock);
 	if (!started) {
@@ -302,6 +371,14 @@ public:
 			                              "table: its far plan runs once per statement");
 		}
 		PhysicalOperator::BuildPipelines(current, meta_pipeline);
+	}
+
+	InsertionOrderPreservingMap<string> ParamsToString() const override {
+		vector<LogicalType> seam;
+		if (sink && !children.empty()) {
+			seam = children[0].get().GetTypes();
+		}
+		return statement->Explain(slice, sink ? &seam : nullptr);
 	}
 
 	bool IsSink() const override {

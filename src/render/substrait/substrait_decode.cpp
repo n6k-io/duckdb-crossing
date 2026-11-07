@@ -287,6 +287,25 @@ private:
 		return info;
 	}
 
+	//! True unless every column `expr` names is qualified by `source`, and it holds no subquery or star.
+	static bool ReadsTarget(const ParsedExpression &expr, const string &source) {
+		switch (expr.GetExpressionClass()) {
+		case ExpressionClass::SUBQUERY:
+		case ExpressionClass::STAR:
+			return true;
+		case ExpressionClass::COLUMN_REF: {
+			auto &names = expr.Cast<ColumnRefExpression>().ColumnNames();
+			return names.size() != 2 || names[0].GetIdentifierName() != source;
+		}
+		default:
+			break;
+		}
+		bool reads = false;
+		ParsedExpressionIterator::EnumerateChildren(
+		    expr, [&](const ParsedExpression &child) { reads = reads || ReadsTarget(child, source); });
+		return reads;
+	}
+
 	static vector<unique_ptr<ParsedExpression>> Returning(const vector<string> &columns, const string &alias) {
 		vector<unique_ptr<ParsedExpression>> out;
 		for (auto &column : columns) {
@@ -330,13 +349,15 @@ private:
 			source = AsRef(std::move(built), SOURCE);
 		}
 		auto *condition = yyjson_obj_get(detail, "condition");
-		auto policed = [&](unique_ptr<ParsedExpression> addressed) -> unique_ptr<ParsedExpression> {
+		auto policed = [&](unique_ptr<ParsedExpression> addressed, bool reads_rows) -> unique_ptr<ParsedExpression> {
 			if (!resolver) {
 				return addressed;
 			}
 			CrossingFloor floor;
 			floor.schema = schema;
 			floor.table = table;
+			floor.verb = verb;
+			floor.reads_rows = reads_rows;
 			auto policy = resolver(floor);
 			if (!policy) {
 				return addressed;
@@ -459,7 +480,12 @@ private:
 			update->table = target_ref();
 			update->from_table = std::move(source);
 			update->set_info = SetInfo(set_columns, values, scope);
-			update->set_info->condition = policed(condition ? Expr(condition, scope) : nullptr);
+			auto addressed = condition ? Expr(condition, scope) : nullptr;
+			bool reads_rows = !returning.empty() || (addressed && ReadsTarget(*addressed, SOURCE));
+			for (auto &value : update->set_info->expressions) {
+				reads_rows |= ReadsTarget(*value, SOURCE);
+			}
+			update->set_info->condition = policed(std::move(addressed), reads_rows);
 			update->returning_list = Returning(returning, TARGET);
 			auto statement = make_uniq<UpdateStatement>();
 			statement->node = std::move(update);
@@ -471,7 +497,9 @@ private:
 			if (source) {
 				del->using_clauses.push_back(std::move(source));
 			}
-			del->condition = policed(condition ? Expr(condition, scope) : nullptr);
+			auto addressed = condition ? Expr(condition, scope) : nullptr;
+			bool reads_rows = !returning.empty() || (addressed && ReadsTarget(*addressed, SOURCE));
+			del->condition = policed(std::move(addressed), reads_rows);
 			del->returning_list = Returning(returning, TARGET);
 			auto statement = make_uniq<DeleteStatement>();
 			statement->node = std::move(del);

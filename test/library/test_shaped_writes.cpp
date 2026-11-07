@@ -260,6 +260,63 @@ TEST_CASE("far's floor resolver applies a row policy to reads and writes", "[lin
 	             Catch::Contains("row policy"));
 }
 
+TEST_CASE("far's floor resolver is told which writes read their target's rows", "[link]") {
+	Twin twin;
+	twin.store->returning = true;
+	twin.Far("CREATE TABLE p(id INTEGER, tenant INTEGER)");
+	twin.Far("INSERT INTO p VALUES (1, 1), (2, 1), (3, 2)");
+	twin.Far("CREATE TABLE q(v INTEGER)");
+	twin.Far("INSERT INTO q VALUES (9)");
+	auto &far_context = *twin.store->con.context;
+	vector<CrossingFloor> asked;
+	twin.store->floors = [&far_context, &asked](const CrossingFloor &floor) -> unique_ptr<TableRef> {
+		if (floor.table != "p") {
+			return nullptr;
+		}
+		asked.push_back(floor);
+		if (!floor.reads_rows) {
+			return nullptr;
+		}
+		Parser parser(far_context);
+		parser.ParseQuery("SELECT *, rowid FROM memory.main.p WHERE tenant = 1");
+		auto select = unique_ptr_cast<SQLStatement, SelectStatement>(std::move(parser.statements[0]));
+		return make_uniq<SubqueryRef>(std::move(select), Identifier(floor.table));
+	};
+	twin.Attach();
+	auto last_target = [&asked]() {
+		for (auto it = asked.rbegin(); it != asked.rend(); ++it) {
+			if (it->verb != CrossingVerb::SELECT) {
+				return *it;
+			}
+		}
+		FAIL("no write target was resolved");
+		return CrossingFloor();
+	};
+
+	REQUIRE(twin.Query("UPDATE far.p SET id = id * 10")->GetValue(0, 0) == Value::BIGINT(2));
+	REQUIRE(last_target().verb == CrossingVerb::UPDATE);
+	REQUIRE(last_target().reads_rows);
+
+	REQUIRE(twin.Query("DELETE FROM far.p WHERE id = 3")->GetValue(0, 0) == Value::BIGINT(0));
+	REQUIRE(last_target().verb == CrossingVerb::DELETE_);
+	REQUIRE(last_target().reads_rows);
+
+	REQUIRE(twin.Query("UPDATE far.p SET id = 5 RETURNING 1")->RowCount() == 2);
+	REQUIRE(last_target().reads_rows);
+
+	REQUIRE(twin.Query("UPDATE far.p SET id = 7")->GetValue(0, 0) == Value::BIGINT(3));
+	REQUIRE(last_target().verb == CrossingVerb::UPDATE);
+	REQUIRE_FALSE(last_target().reads_rows);
+
+	REQUIRE(twin.Query("UPDATE far.p SET id = s.v FROM far.q s")->GetValue(0, 0) == Value::BIGINT(3));
+	REQUIRE_FALSE(last_target().reads_rows);
+	REQUIRE(Scalar(twin, "SELECT count(*) FROM p WHERE id = 9") == Value::BIGINT(3));
+
+	REQUIRE(twin.Query("DELETE FROM far.p")->GetValue(0, 0) == Value::BIGINT(3));
+	REQUIRE(last_target().verb == CrossingVerb::DELETE_);
+	REQUIRE_FALSE(last_target().reads_rows);
+}
+
 TEST_CASE("far uses the stream count near sends, whatever its own end reports", "[link]") {
 	auto far_streams = GENERATE(idx_t(1), idx_t(8));
 	INFO("far's end reports " << far_streams);

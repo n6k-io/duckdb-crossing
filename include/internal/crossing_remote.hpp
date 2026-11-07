@@ -99,6 +99,8 @@ public:
 	}
 	void Add(CrossingRemoteSlice slice, bool seam_ordered, optional_idx seam_estimate);
 	void PutWrite(idx_t slice, unique_ptr<SubstraitWrite> write, vector<unique_ptr<Expression>> owned);
+	//! What EXPLAIN shows of a slice: what the source runs and returns; with `seam`, the rows sent to it too.
+	InsertionOrderPreservingMap<string> Explain(idx_t slice, optional_ptr<const vector<LogicalType>> seam);
 	//! Sends the statement's slices on the first call; every call rethrows that send's failure. Far's errors come back
 	//! through Finish.
 	void Start();
