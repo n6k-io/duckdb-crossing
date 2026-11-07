@@ -120,8 +120,7 @@ void CutOneJoin(unique_ptr<LogicalOperator> &node, const FreshTableIndex &fresh,
 	if (IsMaterialisedRows(near_slot->type) || !StandsAlone(*near_slot) || !NodeCanCross(join, source)) {
 		return;
 	}
-	if (under_filter &&
-	    (!NodeCanCross(*node, source) || !LinksBothSides(node->Cast<LogicalFilter>(), join, source))) {
+	if (under_filter && (!NodeCanCross(*node, source) || !LinksBothSides(node->Cast<LogicalFilter>(), join, source))) {
 		return;
 	}
 	near_slot->ResolveOperatorTypes();
