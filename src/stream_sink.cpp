@@ -141,12 +141,16 @@ struct StreamSinkGlobal : public GlobalSinkState {
 				return;
 			}
 			min_batch = min_batch_p;
-			while (!sent_by_batch.empty() && sent_by_batch.begin()->first < min_batch) {
-				released_bytes += sent_by_batch.begin()->second;
-				sent_by_batch.erase(sent_by_batch.begin());
-			}
 		}
 		WakeWaiting();
+	}
+
+	//! A frame reporting `reported` was taken: the reader can release what is below it. Caller holds credit_lock.
+	void Reported(idx_t reported) {
+		while (!sent_by_batch.empty() && sent_by_batch.begin()->first < reported) {
+			released_bytes += sent_by_batch.begin()->second;
+			sent_by_batch.erase(sent_by_batch.begin());
+		}
 	}
 
 	//! BatchedBufferedData::ShouldBlockBatch, or SimpleBufferedData's rule when no order is kept.
@@ -302,7 +306,7 @@ SinkResultType CrossingStreamSink::Sink(DataChunk &chunk, OperatorSinkInput &inp
 	frame.rows.InitializeEmpty(types);
 	frame.rows.Reference(local.frame_rows);
 	if (!local.sending) {
-		auto bytes = frame.rows.GetAllocationSize();
+		auto bytes = frame.rows.GetDataSize();
 		while (true) {
 			auto parking = CrossingParking::Of(input.interrupt_state);
 			{
@@ -340,11 +344,8 @@ SinkResultType CrossingStreamSink::Sink(DataChunk &chunk, OperatorSinkInput &inp
 	{
 		lock_guard<mutex> guard(global.credit_lock);
 		global.sent_bytes += local.header.bytes;
-		if (ordered && batch >= global.min_batch) {
-			global.sent_by_batch[batch] += local.header.bytes;
-		} else {
-			global.released_bytes += local.header.bytes;
-		}
+		global.sent_by_batch[local.header.batch] += local.header.bytes;
+		global.Reported(local.header.min_batch);
 	}
 	if (ordered && !parallel) {
 		global.next_sequential_batch++;
@@ -380,6 +381,11 @@ bool ReportProgress(StreamSinkGlobal &global, StreamSinkLocal &local, bool paral
 	}
 	local.reporting = false;
 	local.stopped |= sent == Sent::STOPPED;
+	{
+		lock_guard<mutex> guard(global.credit_lock);
+		global.Reported(local.report.min_batch);
+	}
+	global.WakeWaiting();
 	return true;
 }
 
@@ -414,7 +420,7 @@ SinkNextBatchType CrossingStreamSink::NextBatch(OperatorSinkNextBatchInput &inpu
 		return SinkNextBatchType::READY;
 	}
 	return ReportProgress(global, local, parallel, input.interrupt_state, failure) ? SinkNextBatchType::READY
-	                                                                                : SinkNextBatchType::BLOCKED;
+	                                                                               : SinkNextBatchType::BLOCKED;
 }
 
 SinkNextBatchType CrossingStreamSink::UpdateMinBatchIndex(OperatorSinkNextBatchInput &input) const {

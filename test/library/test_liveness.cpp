@@ -22,6 +22,9 @@ struct Running {
 
 	bool EndsWithin(int seconds) {
 		auto ended = result.wait_for(std::chrono::seconds(seconds)) == std::future_status::ready;
+		if (!ended) {
+			twin.con.Interrupt();
+		}
 		twin.store->Release();
 		outcome = result.get();
 		return ended;

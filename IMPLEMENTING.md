@@ -51,26 +51,25 @@ Sources with the same `Group` serve one store through one link, so a plan may jo
 class ToyLink : public CrossingLink {
 public:
 	idx_t Streams() override;
-	unique_ptr<CrossingStream> Open(idx_t id) override;
+	unique_ptr<CrossingStream> Open(idx_t id, optional_ptr<CrossingReceiver> receiver) override;
 };
 
 class ToyStream : public CrossingStream {
 public:
 	CrossingIo Send(CrossingFrame &frame, CrossingWaker waker) override;
-	CrossingIo Recv(CrossingFrame &frame, CrossingWaker waker) override;
 	void Close(optional_ptr<const ErrorData> error) override;
 };
 ```
 
 - **A link is one far transaction.** `Connect` is called when a transaction first needs far. The link is destroyed after far has answered its commit or rollback. A read-only autocommit statement is the exception: far commits it itself, near waits for no reply, and a later statement in that near transaction connects a new link.
 - **`Streams`** is how many streams a slice may use in each direction. It caps DuckDB's threads on that slice. Only near's end is asked; far uses the number near sends.
-- **`Open(id)`** gives one end of a stream. Both ends open the same id, in either order. Streams are independent, so they can be connections, HTTP/2 streams or anything else.
+- **`Open(id, receiver)`** gives one end of a stream, and says where to hand what arrives. Both ends open the same id, in either order; hold what arrives before this end opens. `receiver` is null at an end that only sends. Streams are independent, so they can be connections, HTTP/2 streams or anything else.
 - **`Send`** returns `TAKEN` once it no longer needs the frame, `WAIT` when it can't take it yet, or `DONE` when the other end closed without an error. On `WAIT`, call the waker when it may go on; crossing sends the same frame again.
-- **`Recv`** fills the frame's `header` and `rows`, and returns `ROWS`, `WAIT`, or `DONE` once the other end closed without an error.
-- **`Close`** ends this end. A non-null error reaches the other end: its `Send` and `Recv` throw it, keeping its type.
-- **`header`** is crossing's: carry it unread. **`rows`** may be empty, and has no columns on a frame that carries only a header. Encode rows however you like; `Recv` is given a chunk initialized with the right types when rows are expected.
+- **`CrossingReceiver::Deliver`** takes each frame that arrives. Initialize `rows` from the receiver's `Types()` when the frame carries rows. It never waits on the transport, so one thread can deliver everything. `Closed` follows the last frame, with the error the other end closed with.
+- **`Close`** ends this end, and nothing is delivered to it once `Close` returns. A non-null error reaches the other end: `Closed` gets it, and `Send` throws it.
+- **`header`** is crossing's: carry it unread. **`rows`** may be empty, and has no columns on a frame that carries only a header. Encode rows however you like.
 
-`Send`, `Recv` and `Close` are called from any thread, one thread at a time on each end of a stream. `Open`, and `Wake` on a waker, may be called from any thread at any time. A waker may fire before the call that was given it returns.
+`Send` and `Close` are called from any thread, one thread at a time on each end of a stream. `Deliver` is called one at a time for each stream. `Open`, and `Wake` on a waker, may be called from any thread at any time. A waker may fire before the call that was given it returns.
 
 ## Far: serving the link
 
@@ -93,7 +92,7 @@ Every plan travels as Substrait, in frame headers. A statement's slices are one 
 
 Whatever Substrait cannot express stays on near.
 
-- **Rows** go through streams as near's feed produces them. Far takes every row and spills if it has to, so a sender never waits on far's results. `VALUES` lists inside a slice still travel in the plan's JSON.
+- **Rows** go through streams as they are produced, and land in an inbox DuckDB's scan reads, on either side. A seam takes every row and spills if it has to, so a sender never waits on far's results. Far's results are held back by what near has not yet read, by DuckDB's own rule for streaming results and its `streaming_buffer_size`. `VALUES` lists inside a slice still travel in the plan's JSON.
 - **Writes** are native statements on far: `UPDATE ... FROM`, `DELETE ... USING`, `MERGE`, `INSERT`, and `CREATE TABLE AS`. When a write's shape cannot be split into target, source and condition, such as a `WHERE` with a subquery, its rows are addressed by far's `rowid`, which holds within the transaction. On a table declared with `row_ids = false`, such a write is refused at bind.
 - **Order:** when row order matters, rows carry batch positions, and the receiving end releases them in order.
 - **DDL** travels as SQL text, and a view's body as Substrait. Crossing asks far what a transaction sees of a schema it changed, then `DescribeChanged` fills in the rest.
