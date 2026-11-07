@@ -95,6 +95,9 @@ struct DecodedSlice {
 	string write_catalog;
 	//! What the write's RETURNING must produce, or empty.
 	vector<LogicalType> returning_types;
+	//! A write's verb and whether it reads its target's rows, for its target's row policy.
+	CrossingVerb verb = CrossingVerb::SELECT;
+	bool reads_rows = true;
 };
 
 struct DecodedStatement {

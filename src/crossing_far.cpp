@@ -5,6 +5,7 @@
 #include "internal/seam_inbox.hpp"
 #include "internal/stream_sink.hpp"
 #include "internal/far_plan.hpp"
+#include "internal/row_policy.hpp"
 
 #include "duckdb/catalog/catalog.hpp"
 #include "duckdb/main/query_result.hpp"
@@ -101,6 +102,7 @@ bool CrossingFar::RunStatement(CrossingLink &link, CrossingStream &control, cons
 			far_slice.writes = !slice.write_catalog.empty();
 			auto binder = Binder::CreateBinder(context, planner->binder.get());
 			auto bound = binder->Bind(*slice.statement);
+			ApplyRowPolicies(*binder, bound.plan, catalog, options.floors, slice.verb, slice.reads_rows);
 			if (!slice.returning_types.empty() && bound.types != slice.returning_types) {
 				throw CatalogException("crossing: the write's table changed on the source: it returns other columns "
 				                       "than the description taken at attach says; refresh the attach");

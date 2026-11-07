@@ -176,7 +176,10 @@ public:
 			auto *write_detail = WriteDetailOf(input);
 			if (write_detail) {
 				auto *single = yyjson_obj_get(input, "extensionSingle");
+				write_reads_rows = true;
 				slice.statement = WriteStatement(write_detail, single ? Require(single, "input") : nullptr);
+				slice.verb = static_cast<CrossingVerb>(yyjson_get_uint(Require(write_detail, "verb")));
+				slice.reads_rows = write_reads_rows;
 				slice.write_catalog = WriteCatalog(write_detail);
 				size_t type_idx, type_max;
 				yyjson_val *type;
@@ -349,54 +352,19 @@ private:
 			source = AsRef(std::move(built), SOURCE);
 		}
 		auto *condition = yyjson_obj_get(detail, "condition");
-		auto policed = [&](unique_ptr<ParsedExpression> addressed, bool reads_rows) -> unique_ptr<ParsedExpression> {
-			if (!resolver) {
-				return addressed;
-			}
-			CrossingFloor floor;
-			floor.schema = schema;
-			floor.table = table;
-			floor.verb = verb;
-			floor.reads_rows = reads_rows;
-			auto policy = resolver(floor);
-			if (!policy) {
-				return addressed;
-			}
-			bool exposes_row_id = false;
-			auto relation = make_shared_ptr<ViewRelation>(conn.context, policy->Copy(), table);
-			for (auto &column : relation->Columns()) {
-				exposes_row_id |= column.Name().GetIdentifierName() == "rowid";
-			}
-			if (!exposes_row_id) {
-				throw BinderException("crossing: the row policy on '%s' hides rowid, so a write cannot reach its rows",
-				                      table);
-			}
-			auto select = make_uniq<SelectNode>();
-			select->select_list.push_back(make_uniq<ColumnRefExpression>(Identifier("rowid")));
-			select->from_table = std::move(policy);
-			auto query = make_uniq<SelectStatement>();
-			query->node = std::move(select);
-			auto allowed = make_uniq<SubqueryExpression>();
-			allowed->GetSubqueryTypeMutable() = SubqueryType::ANY;
-			allowed->SubqueryMutable() = std::move(query);
-			allowed->GetChildMutable() = make_uniq<ColumnRefExpression>(Identifier("rowid"), Identifier(TARGET));
-			allowed->GetComparisonTypeMutable() = ExpressionType::COMPARE_EQUAL;
-			if (!addressed) {
-				return std::move(allowed);
-			}
-			return make_uniq<ConjunctionExpression>(ExpressionType::CONJUNCTION_AND, std::move(addressed),
-			                                        std::move(allowed));
-		};
 		auto set_columns = StrArrayOf(detail, "setColumns");
 		auto *values = Require(detail, "values");
 
 		if (yyjson_get_bool(Require(detail, "merge"))) {
 			if (resolver) {
-				CrossingFloor floor;
-				floor.schema = schema;
-				floor.table = table;
-				if (resolver(floor)) {
-					throw NotImplementedException("crossing: a MERGE into '%s' cannot apply its row policy", table);
+				for (auto merge_verb : {CrossingVerb::SELECT, CrossingVerb::UPDATE, CrossingVerb::DELETE_}) {
+					CrossingFloor floor;
+					floor.schema = schema;
+					floor.table = table;
+					floor.verb = merge_verb;
+					if (resolver(floor)) {
+						throw NotImplementedException("crossing: a MERGE into '%s' cannot apply its row policy", table);
+					}
 				}
 			}
 			auto merge = make_uniq<MergeQueryNode>();
@@ -485,7 +453,8 @@ private:
 			for (auto &value : update->set_info->expressions) {
 				reads_rows |= ReadsTarget(*value, SOURCE);
 			}
-			update->set_info->condition = policed(std::move(addressed), reads_rows);
+			update->set_info->condition = std::move(addressed);
+			write_reads_rows = reads_rows;
 			update->returning_list = Returning(returning, TARGET);
 			auto statement = make_uniq<UpdateStatement>();
 			statement->node = std::move(update);
@@ -499,7 +468,8 @@ private:
 			}
 			auto addressed = condition ? Expr(condition, scope) : nullptr;
 			bool reads_rows = !returning.empty() || (addressed && ReadsTarget(*addressed, SOURCE));
-			del->condition = policed(std::move(addressed), reads_rows);
+			del->condition = std::move(addressed);
+			write_reads_rows = reads_rows;
 			del->returning_list = Returning(returning, TARGET);
 			auto statement = make_uniq<DeleteStatement>();
 			statement->node = std::move(del);
@@ -907,20 +877,9 @@ private:
 		if (names.size() == 3 && check) {
 			check(names[0]);
 		}
-		unique_ptr<TableRef> ref;
-		if (resolver) {
-			CrossingFloor floor;
-			floor.catalog = names.size() == 3 ? names[0] : string();
-			floor.schema = names[names.size() - 2];
-			floor.table = names.back();
-			ref = resolver(floor);
-		}
-		if (!ref) {
-			auto base = make_uniq<BaseTableRef>();
-			base->SetQualifiedName(Identifier(names.size() == 3 ? names[0] : catalog),
-			                       Identifier(names[names.size() - 2]), Identifier(names.back()));
-			ref = std::move(base);
-		}
+		auto ref = make_uniq<BaseTableRef>();
+		ref->SetQualifiedName(Identifier(names.size() == 3 ? names[0] : catalog), Identifier(names[names.size() - 2]),
+		                      Identifier(names.back()));
 		shared_ptr<Relation> rel = make_shared_ptr<ViewRelation>(conn.context, std::move(ref), names.back());
 		RequireSchemaUnchanged(read, names[names.size() - 2], names.back(), rel->Columns());
 		auto &columns = rel->Columns();
@@ -1346,6 +1305,7 @@ private:
 	const string &catalog;
 	const SubstraitCatalogCheck &check;
 	CrossingFloorResolver resolver;
+	bool write_reads_rows = true;
 	vector<DecodedSeam> seams;
 	std::unordered_map<uint64_t, string> functions;
 	std::unordered_map<uint64_t, idx_t> cte_widths;

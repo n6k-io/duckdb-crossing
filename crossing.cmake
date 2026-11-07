@@ -33,6 +33,7 @@ set(CROSSING_LIBRARY_SOURCE_NAMES
     crossing_transactions.cpp
     crossing_register.cpp
     crossing_far.cpp
+    row_policy.cpp
     crossing_remote.cpp
     crossing_in_process.cpp
     shaped_write.cpp

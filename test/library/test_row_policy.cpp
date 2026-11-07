@@ -1,5 +1,7 @@
 #include "framework/twin.hpp"
 
+#include <map>
+
 #include "duckdb/parser/parser.hpp"
 #include "duckdb/parser/statement/select_statement.hpp"
 #include "duckdb/parser/tableref/subqueryref.hpp"
@@ -29,7 +31,13 @@ struct Policed {
 				return nullptr;
 			}
 			Parser parser(far_context);
-			parser.ParseQuery("SELECT *, rowid FROM memory.main.p WHERE " + policy);
+			if (!body.empty()) {
+				parser.ParseQuery(body);
+			} else {
+				auto entry = verb_policies.find(floor.verb);
+				parser.ParseQuery("SELECT *, rowid FROM memory.main.p WHERE " +
+				                  (entry == verb_policies.end() ? policy : entry->second));
+			}
 			auto select = unique_ptr_cast<SQLStatement, SelectStatement>(std::move(parser.statements[0]));
 			return make_uniq<SubqueryRef>(std::move(select), Identifier(floor.table));
 		};
@@ -77,6 +85,10 @@ struct Policed {
 	vector<CrossingFloor> asked;
 	//! What the policy keeps, over memory.main.p.
 	string policy = "tenant = 1";
+	//! Replaces `policy` for a floor of this verb.
+	std::map<CrossingVerb, string> verb_policies;
+	//! Replaces the whole policy query when set.
+	string body;
 	std::function<bool(const CrossingFloor &)> polices = [](const CrossingFloor &) {
 		return true;
 	};
@@ -165,23 +177,6 @@ TEST_CASE("a write with a subquery reaches only rows its policy allows", "[polic
 	REQUIRE(p.HiddenUntouched());
 }
 
-TEST_CASE("a merge's matched actions change only rows its policy allows", "[policy]") {
-	Policed p;
-	SECTION("under a read and write policy") {
-	}
-	SECTION("under a write policy alone") {
-		p.polices = [](const CrossingFloor &floor) {
-			return floor.verb != CrossingVerb::SELECT;
-		};
-	}
-	p.Attach();
-
-	p.Runs("MERGE INTO far.p t USING far.q s ON t.id = s.id WHEN MATCHED THEN UPDATE SET x = 99");
-	REQUIRE(p.Rows() == "1:99:1:1 2:99:2:1 3:3:oops:2");
-	p.Runs("MERGE INTO far.p t USING far.q s ON t.id = s.id WHEN MATCHED THEN DELETE");
-	REQUIRE(p.Rows() == "3:3:oops:2");
-}
-
 TEST_CASE("a merge matching a hidden row neither changes it nor inserts it again", "[policy]") {
 	Policed p;
 	SECTION("under a read and write policy") {
@@ -217,7 +212,7 @@ TEST_CASE("a merge's not-matched-by-source actions change only rows its policy a
 	REQUIRE(p.Rows() == "1:1:1:1 3:3:oops:2");
 }
 
-TEST_CASE("a merge's conditions never run on a hidden row", "[policy]") {
+TEST_CASE("a merge or ON CONFLICT into a policed table is refused and changes nothing", "[policy]") {
 	Policed p;
 	SECTION("under a read and write policy") {
 	}
@@ -226,44 +221,42 @@ TEST_CASE("a merge's conditions never run on a hidden row", "[policy]") {
 			return floor.verb != CrossingVerb::SELECT;
 		};
 	}
+	SECTION("under an update policy alone") {
+		p.polices = [](const CrossingFloor &floor) {
+			return floor.verb == CrossingVerb::UPDATE;
+		};
+	}
+	SECTION("under a delete policy alone") {
+		p.polices = [](const CrossingFloor &floor) {
+			return floor.verb == CrossingVerb::DELETE_;
+		};
+	}
 	p.Attach();
 
-	p.Runs("MERGE INTO far.p t USING far.q s ON t.id = s.id WHEN MATCHED AND t.v::INTEGER > 0 THEN UPDATE SET x = 99");
+	auto before = p.Rows();
+	for (auto &sql : {"MERGE INTO far.p t USING far.q s ON t.id = s.id WHEN MATCHED THEN UPDATE SET x = 99",
+	                  "MERGE INTO far.p t USING far.q s ON t.id = s.id WHEN MATCHED THEN DELETE",
+	                  "MERGE INTO far.p t USING far.q s ON t.id = s.id WHEN MATCHED AND t.v::INTEGER > 0 THEN UPDATE "
+	                  "SET x = 99",
+	                  "INSERT INTO far.p VALUES (1, 0, '0', 1) ON CONFLICT (id) DO UPDATE SET x = 99",
+	                  "INSERT INTO far.p VALUES (3, 0, '0', 1), (4, 4, '4', 1) ON CONFLICT DO NOTHING"}) {
+		INFO(sql);
+		REQUIRE_THAT(p.twin.Error(sql), Catch::Contains("cannot apply its row policy"));
+		REQUIRE(p.Rows() == before);
+	}
+}
+
+TEST_CASE("a merge or ON CONFLICT runs when no verb on its table has a policy", "[policy]") {
+	Policed p;
+	p.polices = [](const CrossingFloor &) {
+		return false;
+	};
+	p.Attach();
+
+	p.Runs("MERGE INTO far.p t USING far.q s ON t.id = s.id WHEN MATCHED AND t.id < 3 THEN UPDATE SET x = 99");
 	REQUIRE(p.Rows() == "1:99:1:1 2:99:2:1 3:3:oops:2");
-}
-
-TEST_CASE("an insert's ON CONFLICT changes only rows its policy allows", "[policy]") {
-	Policed p;
-	SECTION("under a read and write policy") {
-	}
-	SECTION("under a write policy alone") {
-		p.polices = [](const CrossingFloor &floor) {
-			return floor.verb != CrossingVerb::SELECT;
-		};
-	}
-	p.Attach();
-
-	p.Runs("INSERT INTO far.p VALUES (1, 0, '0', 1) ON CONFLICT (id) DO UPDATE SET x = 99");
-	p.Runs("INSERT INTO far.p VALUES (4, 4, '4', 1) ON CONFLICT (id) DO UPDATE SET x = 99");
-	REQUIRE(p.Rows() == "1:99:1:1 2:2:2:1 3:3:oops:2 4:4:4:1");
-
-	p.twin.con.Query("INSERT INTO far.p VALUES (3, 0, '0', 1) ON CONFLICT (id) DO UPDATE SET x = 99");
-	REQUIRE(p.Rows() == "1:99:1:1 2:2:2:1 3:3:oops:2 4:4:4:1");
-}
-
-TEST_CASE("an insert's ON CONFLICT DO NOTHING leaves a hidden row and inserts the rest", "[policy]") {
-	Policed p;
-	SECTION("under a read and write policy") {
-	}
-	SECTION("under a write policy alone") {
-		p.polices = [](const CrossingFloor &floor) {
-			return floor.verb != CrossingVerb::SELECT;
-		};
-	}
-	p.Attach();
-
-	p.Runs("INSERT INTO far.p VALUES (3, 0, '0', 1), (4, 4, '4', 1) ON CONFLICT DO NOTHING");
-	REQUIRE(p.Rows() == "1:1:1:1 2:2:2:1 3:3:oops:2 4:4:4:1");
+	p.Runs("INSERT INTO far.p VALUES (4, 4, '4', 1) ON CONFLICT (id) DO UPDATE SET x = 0");
+	REQUIRE(p.Rows() == "1:99:1:1 2:99:2:1 3:3:oops:2 4:4:4:1");
 }
 
 namespace {
@@ -330,6 +323,89 @@ TEST_CASE("a read's expressions never run on a row its policy hides", "[policy]"
 	SECTION("a correlated EXISTS") {
 		p.policy = "EXISTS (SELECT 1 FROM memory.main.allowed a WHERE a.tenant = p.tenant)";
 	}
+	SECTION("an inner join") {
+		p.body = "SELECT p.id, p.x, p.v, p.tenant, p.rowid FROM memory.main.p JOIN memory.main.allowed a "
+		         "ON a.tenant = p.tenant";
+	}
+	SECTION("far's optimizer is off") {
+		p.twin.Far("SET GLOBAL enable_optimizer = false");
+	}
+	SECTION("far's pushdown and join order are off") {
+		p.twin.Far("SET GLOBAL disabled_optimizers = 'filter_pushdown,join_order'");
+	}
 	p.Attach();
 	ReadsOnlyVisibleRows(p);
+}
+
+TEST_CASE("a write's WHERE never runs on a hidden row, whichever conjunct comes first", "[policy]") {
+	Policed p;
+	SECTION("a cast") {
+	}
+	SECTION("a membership table") {
+		p.policy = "tenant IN (SELECT tenant FROM memory.main.allowed)";
+	}
+	SECTION("far's optimizer is off") {
+		p.twin.Far("SET GLOBAL enable_optimizer = false");
+	}
+	p.Attach();
+
+	for (auto &where : {"id = 3 AND v::INTEGER > 0", "v::INTEGER > 0 AND id = 3",
+	                    "id = 3 AND error('saw ' || v) IS NULL", "id = 3 AND v::INTEGER > 0 RETURNING id"}) {
+		INFO(where);
+		CHECK(p.twin.Query(string("UPDATE far.p SET x = 0 WHERE ") + where)->RowCount() <= 1);
+		CHECK(p.twin.Query(string("DELETE FROM far.p WHERE ") + where)->RowCount() <= 1);
+		REQUIRE(p.HiddenUntouched());
+	}
+}
+
+TEST_CASE("a read's error() never runs on a row its policy hides", "[policy]") {
+	Policed p;
+	p.Attach();
+
+	REQUIRE(p.twin.Query("SELECT count(*) FROM far.p WHERE id = 3 AND error('saw ' || v) IS NULL")->GetValue(0, 0) ==
+	        Value::BIGINT(0));
+	REQUIRE(
+	    p.twin.Query("SELECT count(*) FROM far.p WHERE tenant = 2 AND error('saw ' || v) IS NULL")->GetValue(0, 0) ==
+	    Value::BIGINT(0));
+}
+
+TEST_CASE("a CTE reading a policed table twice sees only allowed rows", "[policy]") {
+	Policed p;
+	p.Attach();
+
+	REQUIRE(p.twin
+	            .Query("WITH c AS (SELECT * FROM far.p) SELECT (SELECT count(*) FROM c WHERE v::INTEGER > 0) + "
+	                   "(SELECT count(*) FROM c WHERE id = 3 AND v::INTEGER > 0)")
+	            ->GetValue(0, 0) == Value::BIGINT(2));
+	REQUIRE(p.twin
+	            .Query("WITH c AS MATERIALIZED (SELECT * FROM far.p) SELECT count(*) FROM c a JOIN c b ON a.id = b.id "
+	                   "WHERE b.v::INTEGER > 0")
+	            ->GetValue(0, 0) == Value::BIGINT(2));
+}
+
+TEST_CASE("a write's target takes its write policy, and the rows it reads elsewhere take SELECT", "[policy]") {
+	Policed p;
+	p.verb_policies[CrossingVerb::UPDATE] = "id <> 2";
+	p.Attach();
+
+	REQUIRE(p.twin.Query("UPDATE far.p SET x = 0 WHERE id IN (SELECT id FROM far.p)")->GetValue(0, 0) ==
+	        Value::BIGINT(1));
+	REQUIRE(p.Rows() == "1:0:1:1 2:2:2:1 3:3:oops:2");
+}
+
+TEST_CASE("a row policy holds over many tenants and rows", "[policy]") {
+	Policed p;
+	p.Far("INSERT INTO p SELECT i, i, CASE WHEN i % 7 = 1 THEN i::VARCHAR ELSE 'x' || i END, i % 7 FROM range(10, "
+	      "20000) t(i)");
+	p.Attach();
+
+	REQUIRE(p.twin.Query("SELECT count(*) FROM far.p WHERE v::INTEGER > 0")->GetValue(0, 0) ==
+	        p.Far("SELECT count(*) FROM p WHERE tenant = 1"));
+	REQUIRE(p.twin.Query("SELECT count(*) FROM far.p WHERE id = 12 AND v::INTEGER > 0")->GetValue(0, 0) ==
+	        Value::BIGINT(0));
+	REQUIRE(p.twin.Query("SELECT count(*) FROM far.p WHERE id = 15 AND v::INTEGER > 0")->GetValue(0, 0) ==
+	        Value::BIGINT(1));
+	REQUIRE(p.twin.Query("UPDATE far.p SET x = -1 WHERE id BETWEEN 10 AND 100 AND v::INTEGER > 0")->GetValue(0, 0) ==
+	        p.Far("SELECT count(*) FROM p WHERE id BETWEEN 10 AND 100 AND tenant = 1"));
+	REQUIRE(p.Far("SELECT count(*) FROM p WHERE x = -1 AND tenant <> 1") == Value::BIGINT(0));
 }
