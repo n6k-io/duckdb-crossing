@@ -29,7 +29,7 @@ struct CrossingFarSlice {
 	idx_t id = 0;
 	//! Near keeps the rows in the order the stream's batches give.
 	bool ordered = false;
-	//! Runs after every slice that only reads and every earlier write: one transaction cannot have a table
+	//! Runs after every earlier slice in `slices` order: one transaction cannot have a table
 	//! scanned while it changes it.
 	bool writes = false;
 	unique_ptr<LogicalOperator> plan;

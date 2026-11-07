@@ -107,7 +107,8 @@ private:
 };
 
 //! What far must know of a statement before it can read its plan. A statement that ends the transaction itself is
-//! the whole of a read-only autocommit transaction: far commits it and sends no reply.
+//! the whole of a read-only autocommit transaction: far commits it, or rolls back on error, and closes control instead
+//! of replying. Near sets it per CrossingRemoteStatement::Start.
 struct CrossingPlanFrame {
 	bool ends_transaction = false;
 	idx_t streams = 1;

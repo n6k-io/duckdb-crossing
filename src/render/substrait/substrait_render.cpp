@@ -342,7 +342,7 @@ private:
 		return array;
 	}
 
-	//! `bindings` are the source's; an expression's fields count the target's columns first.
+	//! `bindings` are the source's.
 	yyjson_mut_val *Write(const SubstraitWrite &write, yyjson_mut_val *input, const vector<ColumnBinding> &bindings) {
 		vector<ColumnBinding> scope;
 		for (idx_t c = 0; c < write.target_columns.size(); c++) {

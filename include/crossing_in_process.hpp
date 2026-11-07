@@ -87,7 +87,6 @@ class CrossingInProcessLink : public CrossingLink {
 public:
 	CrossingInProcessLink(DatabaseInstance &db, string catalog, CrossingFarOptions options = CrossingFarOptions(),
 	                      unique_ptr<CrossingLinkPair> pair = nullptr);
-	//! Waits for Serve to return.
 	~CrossingInProcessLink() override;
 
 	idx_t Streams() override;

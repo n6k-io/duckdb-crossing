@@ -29,7 +29,8 @@ public:
 	idx_t NextSliceId() {
 		return next_slice++;
 	}
-	//! Whichever statement far is running ends first: a failure in it fails Commit, which then rolls back.
+	//! Whichever statement far is running ends first: a failure in it fails Commit, which then rolls back. When far
+	//! already ended the transaction, only closes the link.
 	void Commit();
 	void Rollback();
 	void StatementSent(bool ends_transaction) {
@@ -42,7 +43,7 @@ public:
 	}
 	//! What this transaction sees of a schema it changed.
 	vector<string> Tables(ClientContext &context, const string &schema);
-	//! The columns, and whether it has row ids; the source fills in the rest.
+	//! Far's view of the table in this transaction: columns, row ids and constraints.
 	CrossingTable Describe(ClientContext &context, const string &schema, const string &name);
 	//! Far ended this transaction with its statement; another statement needs another link.
 	bool EndedByFar() const {
@@ -98,7 +99,8 @@ public:
 	}
 	void Add(CrossingRemoteSlice slice, bool seam_ordered, optional_idx seam_estimate);
 	void PutWrite(idx_t slice, unique_ptr<SubstraitWrite> write, vector<unique_ptr<Expression>> owned);
-	//! Blocks until far has bound the plan. Throws what far reported, every time it is called.
+	//! Sends the statement's slices on the first call; every call rethrows that send's failure. Far's errors come back
+	//! through Finish.
 	void Start();
 	//! Blocks until far has ended the statement. Throws what far reported.
 	void Finish();
@@ -119,7 +121,6 @@ private:
 	ErrorData start_error;
 };
 
-//! How near's operator turns far's rows into its own.
 struct CrossingRemoteColumns {
 	static constexpr idx_t NULL_COLUMN = DConstants::INVALID_INDEX;
 
@@ -138,7 +139,6 @@ struct CrossingRemoteSeamSink {
 	bool awaits_result = false;
 };
 
-//! Adds the slice to the statement and plans its operator; a seam's feed becomes its child when given.
 PhysicalOperator &PlanCrossingRemote(ClientContext &context, PhysicalPlanGenerator &planner, vector<LogicalType> types,
                                      shared_ptr<CrossingRemoteStatement> statement, CrossingRemoteSlice slice,
                                      CrossingRemoteColumns columns, unique_ptr<CrossingRemoteSeamSink> seam,

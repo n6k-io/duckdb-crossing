@@ -6,7 +6,6 @@
 
 namespace duckdb {
 
-//! Runs a bound plan on `context` as a query.
 unique_ptr<QueryResult> SubmitCrossingPlan(ClientContext &context, unique_ptr<LogicalOperator> plan);
 
 } // namespace duckdb

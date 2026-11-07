@@ -127,7 +127,6 @@ CrossingRemoteSlice RemoteWriteSlice(CrossingRemoteStatement &statement, Crossin
 	return slice;
 }
 
-//! `emit` says, for each output column, which of the columns far returns it is.
 CrossingRemoteColumns RemoteWriteColumns(const CrossingBindData &bind_data, const vector<optional_idx> &emit) {
 	CrossingRemoteColumns columns;
 	columns.received = bind_data.seam.returning_columns.empty() ? vector<LogicalType> {LogicalType::BIGINT}

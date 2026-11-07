@@ -156,7 +156,7 @@ public:
 		result.name = schema;
 		return result;
 	}
-	//! Whether far may run these. Crossing asks only about what Substrait can carry.
+	//! Whether far may run these. Not asked about casts, comparisons or BETWEEN; a lambda is refused without asking.
 	virtual CrossingVerdict AcceptsCall(const Expression &expr) {
 		return CrossingVerdict::No("this source computes nothing");
 	}
@@ -178,7 +178,8 @@ public:
 	virtual void Detach(ClientContext &context) {
 	}
 	//! Fills in `table` when a transaction reads a schema it changed. Far has given its columns and its primary key,
-	//! unique and not-null constraints; remove any you do not declare in Describe. Defaults to every verb.
+	//! unique and not-null constraints; remove any you do not declare in Describe. Defaults to SELECT and DROP,
+	//! plus INSERT, UPDATE, DELETE and ALTER when far's table has row ids, with RETURNING allowed.
 	virtual void DescribeChanged(const string &schema, CrossingTable &table);
 	//! Told of each slice as it is planned, before it is sent. For logging and tests.
 	virtual void Planned(const LogicalOperator &plan) {

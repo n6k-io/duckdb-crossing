@@ -222,7 +222,6 @@ void CrossingRemoteStatement::Finish() {
 
 namespace {
 
-//! Reading a slice's results: frames land in the inbox from wherever the transport delivers them.
 struct RemoteResults {
 	shared_ptr<CrossingSeamInbox> inbox;
 	vector<unique_ptr<CrossingInboxReceiver>> receivers;

@@ -88,7 +88,6 @@ private:
 	ErrorData error DUCKDB_GUARDED_BY(lock);
 };
 
-//! Takes a stream's frames into an inbox.
 class CrossingInboxReceiver : public CrossingReceiver {
 public:
 	explicit CrossingInboxReceiver(shared_ptr<CrossingSeamInbox> inbox_p) : inbox(std::move(inbox_p)) {

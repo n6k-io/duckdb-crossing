@@ -131,7 +131,8 @@ struct FarStore {
 	idx_t most_held_for_near = 0;
 	std::atomic<idx_t> far_rows_sent {0};
 	idx_t near_recv_streams = 0;
-	//! Near's Recv waits, as if far were slow: on control replies, and on a slice's rows.
+	//! Holds far's frames to near, as if far were slow: `stall_replies` on control, `stall_results` on every other
+	//! stream.
 	std::atomic<bool> stall_replies {false};
 	std::atomic<bool> stall_results {false};
 	//! Set while a link is open: ends every stall and lifts its limits.

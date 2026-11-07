@@ -172,7 +172,6 @@ unique_ptr<Expression> Equal(unique_ptr<Expression> left, unique_ptr<Expression>
 	return BoundComparisonExpression::Create(ExpressionType::COMPARE_EQUAL, std::move(left), std::move(right));
 }
 
-//! far t, target index 100, source a seam at index 200 with (id, value).
 SubstraitWrite TargetOfT(CrossingVerb verb) {
 	SubstraitWrite write;
 	write.verb = verb;

@@ -37,7 +37,6 @@ shared_ptr<ShapedWrite> ShapedWrites::Take(const LogicalOperator &op) {
 
 namespace {
 
-//! The target's scan and the bindings a write's expressions may read.
 struct WriteScope {
 	optional_ptr<LogicalGet> target;
 	vector<ColumnBinding> source_bindings;

@@ -100,7 +100,7 @@ public:
 	TableIndex table_index;
 	vector<ColumnBinding> bindings;
 	vector<LogicalType> output_types;
-	//! For each output column, the returned column it is; invalid when nothing reads it.
+	//! For each output column, the returned column it is; invalid for a virtual column, which near fills with NULL.
 	vector<optional_idx> emit;
 	unique_ptr<CrossingBindData> bind_data;
 

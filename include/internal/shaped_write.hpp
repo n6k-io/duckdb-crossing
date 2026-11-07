@@ -45,9 +45,9 @@ struct ShapedWrites : public ClientContextState {
 	shared_ptr<ShapedWrite> Take(const LogicalOperator &op);
 };
 
-//! Turns each UPDATE, DELETE and MERGE of a source's table whose form is target, joined source,
-//! condition into a ShapedWrite, leaving only its source below it to fold. What does not have that form is left
-//! as it is.
+//! Turns each UPDATE, DELETE and MERGE of a source's table whose form is target, optionally crossed
+//! with a source, under filters into a ShapedWrite, leaving only its source below it to fold. What does not have that
+//! form is left as it is.
 void ShapeWrites(ClientContext &context, unique_ptr<LogicalOperator> &plan, const FreshTableIndex &fresh,
                  const CrossingIdentity &identity);
 

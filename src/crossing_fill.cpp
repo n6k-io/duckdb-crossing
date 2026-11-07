@@ -290,7 +290,8 @@ void RequireConflictClauseNamesEveryColumn(LogicalMergeInto &merge, const Crossi
 	}
 }
 
-//! Builds the write CrossingWriteTarget::reads_rows describes. An update's values are worked out once, here.
+//! A write that reads no row of far's table: an INSERT of only source defaults, a DELETE of the whole table, or an
+//! UPDATE whose values read no row. An update's values are worked out once, here.
 void FillBareWrite(ClientContext &context, unique_ptr<LogicalOperator> &node, const FreshTableIndex &fresh,
                    const CrossingIdentity &identity) {
 	if (node->type == LogicalOperatorType::LOGICAL_INSERT) {

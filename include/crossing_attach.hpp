@@ -37,7 +37,6 @@ public:
 	virtual CrossingAttach &Attach() = 0;
 };
 
-//! A DDL statement, as the attach authorizes it and far runs it.
 struct CrossingDdl {
 	CrossingVerb verb;
 	string schema;
@@ -110,7 +109,6 @@ public:
 	PhysicalOperator &PlanCreateTableAs(ClientContext &context, PhysicalPlanGenerator &planner, LogicalCreateTable &op,
 	                                    PhysicalOperator &plan);
 
-	//! The statement `context` is planning.
 	shared_ptr<CrossingRemoteStatement> RemoteStatement(ClientContext &context, Transaction &transaction);
 	//! Hands the transaction's far side back; null when it never touched far. Call this before a base transaction
 	//! manager frees `transaction`, and hand the result to Commit or Rollback.

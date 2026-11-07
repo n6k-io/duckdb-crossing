@@ -13,8 +13,7 @@ namespace {
 constexpr int STUCK_SECONDS = 15;
 constexpr int INTERRUPT_SECONDS = 5;
 
-//! Runs `sql`; stuck says it did not end in time. Releases the link either way, so the statement can end and the test
-//! fail instead of hanging.
+//! Runs `sql` async. EndsWithin interrupts it when late, then releases the link, so the test fails instead of hanging.
 struct Running {
 	Running(Twin &twin_p, const string &sql)
 	    : twin(twin_p), result(std::async(std::launch::async, [this, sql]() { return twin.con.Query(sql); })) {
