@@ -6,12 +6,17 @@
 #include "internal/seam_inbox.hpp"
 #include "internal/stream_sink.hpp"
 
+#include "duckdb/common/numeric_utils.hpp"
 #include "duckdb/common/string_util.hpp"
 #include "duckdb/execution/physical_operator.hpp"
 #include "duckdb/execution/physical_plan_generator.hpp"
 #include "duckdb/parallel/meta_pipeline.hpp"
 #include "duckdb/parallel/pipeline.hpp"
+#include "duckdb/parser/constraints/not_null_constraint.hpp"
+#include "duckdb/parser/constraints/unique_constraint.hpp"
 #include "duckdb/planner/operator/logical_extension_operator.hpp"
+
+#include <algorithm>
 
 namespace duckdb {
 
@@ -75,8 +80,25 @@ CrossingTable CrossingRemote::Describe(ClientContext &context, const string &sch
 	CrossingTable table;
 	table.name = name;
 	table.row_ids = lines[0] == "table";
-	for (idx_t l = 1; l + 1 < lines.size(); l += 2) {
-		table.Column(lines[l], TransformStringToLogicalType(lines[l + 1], context));
+	idx_t at = 1;
+	auto column_count = std::stoull(lines[at++]);
+	for (idx_t c = 0; c < column_count; c++, at += 2) {
+		table.Column(lines[at], TransformStringToLogicalType(lines[at + 1], context));
+	}
+	while (at < lines.size()) {
+		auto kind = lines[at++];
+		auto named = std::stoull(lines[at++]);
+		vector<Identifier> columns;
+		for (idx_t c = 0; c < named; c++) {
+			columns.emplace_back(lines[at++]);
+		}
+		if (kind != "NOT NULL") {
+			table.constraints.push_back(make_uniq<UniqueConstraint>(std::move(columns), kind == "PRIMARY KEY"));
+			continue;
+		}
+		auto column = std::find(table.column_names.begin(), table.column_names.end(), columns[0].GetIdentifierName());
+		table.constraints.push_back(
+		    make_uniq<NotNullConstraint>(LogicalIndex(NumericCast<idx_t>(column - table.column_names.begin()))));
 	}
 	return table;
 }

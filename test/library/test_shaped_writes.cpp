@@ -344,3 +344,79 @@ TEST_CASE("a row policy hiding rowid reads, and refuses a write clearly", "[link
 	REQUIRE(twin.Query("SELECT count(*) FROM far.p")->GetValue(0, 0) == Value::BIGINT(1));
 	REQUIRE_THAT(twin.Error("UPDATE far.p SET id = 0"), Catch::Contains("hides rowid"));
 }
+
+TEST_CASE("a table keeps its constraints after DDL in its schema", "[link]") {
+	Twin twin;
+	twin.store->declare_key_constraints = true;
+	twin.Far("CREATE TABLE t(id INTEGER PRIMARY KEY, v INTEGER)");
+	twin.Far("INSERT INTO t VALUES (1, 10)");
+	twin.Attach();
+
+	auto described = [&twin]() {
+		auto result = twin.Query("DESCRIBE far.t");
+		string text;
+		for (idx_t r = 0; r < result->RowCount(); r++) {
+			for (idx_t c = 0; c < result->ColumnCount(); c++) {
+				text += result->GetValue(c, r).ToString() + "|";
+			}
+			text += "\n";
+		}
+		return text;
+	};
+	auto before = described();
+	REQUIRE_THAT(before, Catch::Contains("PRI"));
+
+	twin.Query("BEGIN");
+	twin.Query("CREATE TABLE far.main.other(a INTEGER)");
+
+	REQUIRE(described() == before);
+	twin.Query("INSERT INTO far.t VALUES (1, 20) ON CONFLICT (id) DO UPDATE SET v = excluded.v");
+	twin.Query("COMMIT");
+	REQUIRE(Scalar(twin, "SELECT v FROM t WHERE id = 1") == Value::INTEGER(20));
+}
+
+TEST_CASE("far reports a changed table's primary key, unique and not-null constraints", "[link]") {
+	Twin twin;
+	twin.store->keep_far_constraints = true;
+	twin.Far("CREATE TABLE t(id INTEGER PRIMARY KEY, u INTEGER UNIQUE, n INTEGER NOT NULL, plain INTEGER)");
+	twin.Attach();
+
+	twin.Query("BEGIN");
+	twin.Query("CREATE TABLE far.main.other(a INTEGER)");
+	auto result = twin.Query("DESCRIBE far.t");
+	twin.Query("COMMIT");
+
+	REQUIRE(result->GetValue(0, 0).ToString() == "id");
+	REQUIRE(result->GetValue(3, 0).ToString() == "PRI");
+	REQUIRE(result->GetValue(2, 0).ToString() == "NO");
+	REQUIRE(result->GetValue(3, 1).ToString() == "UNI");
+	REQUIRE(result->GetValue(2, 2).ToString() == "NO");
+	REQUIRE(result->GetValue(2, 3).ToString() == "YES");
+}
+
+TEST_CASE("a source removes a constraint it does not declare from a changed table", "[link]") {
+	Twin twin;
+	twin.Far("CREATE TABLE t(id INTEGER PRIMARY KEY)");
+	twin.Attach();
+
+	twin.Query("BEGIN");
+	twin.Query("CREATE TABLE far.main.other(a INTEGER)");
+	auto result = twin.Query("DESCRIBE far.t");
+	twin.Query("COMMIT");
+
+	REQUIRE(result->GetValue(3, 0).IsNull());
+}
+
+TEST_CASE("a table created in the transaction keeps the constraints it was created with", "[link]") {
+	Twin twin;
+	twin.store->keep_far_constraints = true;
+	twin.Attach();
+
+	twin.Query("BEGIN");
+	twin.Query("CREATE TABLE far.main.n(id INTEGER PRIMARY KEY, v INTEGER)");
+	twin.Query("INSERT INTO far.n VALUES (1, 1)");
+	twin.Query("INSERT INTO far.n VALUES (1, 2) ON CONFLICT (id) DO UPDATE SET v = excluded.v");
+	twin.Query("COMMIT");
+
+	REQUIRE(Scalar(twin, "SELECT v FROM n WHERE id = 1") == Value::INTEGER(2));
+}

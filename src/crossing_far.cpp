@@ -351,8 +351,23 @@ void CrossingFar::AnswerDescribe(CrossingStream &control, const string &question
 		                     SQLIdentifier::ToString(parts[0]) + "." + SQLIdentifier::ToString(parts[1]) + " LIMIT 0");
 		result->ThrowIfError();
 		string reply = view ? "view" : "table";
+		reply += "\n" + to_string(result->ColumnCount());
 		for (idx_t c = 0; c < result->ColumnCount(); c++) {
 			reply += "\n" + result->GetNames()[c].GetIdentifierName() + "\n" + result->GetTypes()[c].ToString();
+		}
+		auto constraints = connection.Prepare(
+		    "SELECT constraint_type, constraint_column_names FROM duckdb_constraints() WHERE database_name = ? AND "
+		    "schema_name = ? AND table_name = ? AND constraint_type IN ('PRIMARY KEY', 'UNIQUE', 'NOT NULL')");
+		auto declared = constraints->Execute(args);
+		declared->ThrowIfError();
+		while (auto chunk = declared->Fetch()) {
+			for (idx_t r = 0; r < chunk->size(); r++) {
+				auto columns = ListValue::GetChildren(chunk->GetValue(1, r));
+				reply += "\n" + chunk->GetValue(0, r).ToString() + "\n" + to_string(columns.size());
+				for (auto &column : columns) {
+					reply += "\n" + column.ToString();
+				}
+			}
 		}
 		SendControl(control, reply);
 	} catch (IOException &) {

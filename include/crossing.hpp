@@ -177,8 +177,8 @@ public:
 	}
 	virtual void Detach(ClientContext &context) {
 	}
-	//! Fills in `table`, of which far has given the columns, when a transaction reads a schema it changed. Defaults
-	//! to every verb.
+	//! Fills in `table` when a transaction reads a schema it changed. Far has given its columns and its primary key,
+	//! unique and not-null constraints; remove any you do not declare in Describe. Defaults to every verb.
 	virtual void DescribeChanged(const string &schema, CrossingTable &table);
 	//! Told of each slice as it is planned, before it is sent. For logging and tests.
 	virtual void Planned(const LogicalOperator &plan) {

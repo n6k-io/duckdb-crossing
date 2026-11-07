@@ -38,7 +38,7 @@ Optional members, with what happens if you leave them:
 | `AcceptsSeam` | no join runs on far over rows near sends |
 | `Group` | the source is its own group |
 | `Detach` | nothing |
-| `DescribeChanged` | every verb; fills in a table this transaction changed, of which far has given the columns |
+| `DescribeChanged` | every verb; fills in a table this transaction changed, of which far has given the columns and its primary key, unique and not-null constraints. Remove any you do not declare in `Describe`, so a table describes the same before and after DDL |
 | `Planned` | nothing; told of each slice as it is planned, for logging and tests |
 
 `Describe` fills in `CrossingTable`: columns in source order, the verbs allowed, whether `RETURNING` is allowed, any constraints far enforces, and whether far's table has a `rowid` (a view has not). A verb left out is refused before the statement runs. Answers are cached per attach until `Refresh`.

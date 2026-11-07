@@ -463,13 +463,27 @@ void FarSource::DescribeChanged(const string &schema, CrossingTable &table) {
 	if (verbs != store->verbs.end()) {
 		table.verbs = verbs->second;
 	}
+	if (store->keep_far_constraints) {
+		return;
+	}
+	vector<unique_ptr<Constraint>> far_constraints;
+	far_constraints.swap(table.constraints);
+	if (!store->declare_key_constraints) {
+		return;
+	}
 	auto key = store->keys.find(table.name);
-	if (store->declare_key_constraints && key != store->keys.end()) {
+	if (key != store->keys.end()) {
 		vector<Identifier> key_columns;
 		for (auto &column : key->second) {
 			key_columns.emplace_back(column);
 		}
 		table.constraints.push_back(make_uniq<UniqueConstraint>(std::move(key_columns), true));
+		return;
+	}
+	for (auto &constraint : far_constraints) {
+		if (constraint->type == ConstraintType::UNIQUE && constraint->Cast<UniqueConstraint>().IsPrimaryKey()) {
+			table.constraints.push_back(std::move(constraint));
+		}
 	}
 }
 

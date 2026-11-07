@@ -103,6 +103,8 @@ struct FarStore {
 	vector<LogicalOperatorType> refused_operators;
 	case_insensitive_map_t<vector<string>> keys;
 	bool declare_key_constraints = false;
+	//! A transaction that changed a schema keeps every constraint far reports.
+	bool keep_far_constraints = false;
 	bool returning = true;
 	bool takes_seams = false;
 	case_insensitive_map_t<vector<CrossingVerb>> verbs;
