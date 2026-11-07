@@ -8,6 +8,8 @@
 
 namespace duckdb {
 
+class CrossingAttach;
+
 class CrossingTableCatalogEntry : public TableCatalogEntry {
 public:
 	CrossingTableCatalogEntry(Catalog &catalog, SchemaCatalogEntry &schema, CreateTableInfo &info,
@@ -31,6 +33,9 @@ private:
 };
 
 optional_ptr<CrossingTableCatalogEntry> CrossingTableOf(TableCatalogEntry &table, const CrossingIdentity &identity);
+
+//! The attach whose write catalog this is, if this copy of crossing made it.
+optional_ptr<CrossingAttach> CrossingAttachOfWriteCatalog(const Catalog &catalog);
 
 TableStorageInfo UniqueConstraintStorageInfo(TableCatalogEntry &table);
 

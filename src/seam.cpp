@@ -1,3 +1,4 @@
+#include "internal/function_tag.hpp"
 #include "internal/seam.hpp"
 
 #include "duckdb/function/table_function.hpp"
@@ -36,7 +37,7 @@ TableFunction CrossingSeamFunction() {
 
 TableFunction CrossingWriteNodeFunction() {
 	TableFunction function(CROSSING_WRITE_NODE_FUNCTION, {}, nullptr);
-	return function;
+	return TagCrossingFunction(function);
 }
 
 unique_ptr<LogicalOperator> MakeWriteNode(idx_t table_index, CrossingWriteNode node, unique_ptr<LogicalOperator> feed) {
@@ -57,7 +58,7 @@ optional_ptr<const CrossingWriteNode> WriteOf(const LogicalOperator &op) {
 		return nullptr;
 	}
 	auto &get = op.Cast<LogicalGet>();
-	if (get.function.GetName() != CROSSING_WRITE_NODE_FUNCTION || !get.bind_data) {
+	if (get.function.GetName() != CROSSING_WRITE_NODE_FUNCTION || !get.bind_data || !IsOwnCrossingFunction(get)) {
 		return nullptr;
 	}
 	return &get.bind_data->Cast<CrossingWriteNodeBindData>().node;

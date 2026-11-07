@@ -3,6 +3,7 @@ set(CROSSING_ROOT ${CMAKE_CURRENT_LIST_DIR})
 set(CROSSING_ENGINE_SOURCE_NAMES
     crossing.cpp
     carrier.cpp
+    function_tag.cpp
     fragment.cpp
     seam.cpp
     floor.cpp

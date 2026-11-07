@@ -1,4 +1,5 @@
 #include "internal/crossing_table_entry.hpp"
+#include "crossing_attach.hpp"
 #include "internal/seam.hpp"
 
 #include "internal/crossing_read.hpp"
@@ -49,11 +50,11 @@ TableStorageInfo CrossingTableCatalogEntry::GetStorageInfo(ClientContext &) {
 }
 
 optional_ptr<CrossingTableCatalogEntry> CrossingTableOf(TableCatalogEntry &table, const CrossingIdentity &identity) {
-	auto entry = dynamic_cast<CrossingTableCatalogEntry *>(&table);
-	if (!entry || &entry->source.Identity() != &identity) {
+	auto attach = CrossingAttachOfWriteCatalog(table.ParentCatalog());
+	if (!attach || &attach->Identity() != &identity) {
 		return nullptr;
 	}
-	return entry;
+	return &table.Cast<CrossingTableCatalogEntry>();
 }
 
 TableStorageInfo UniqueConstraintStorageInfo(TableCatalogEntry &table) {

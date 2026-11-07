@@ -4,6 +4,7 @@
 
 #include "catch.hpp"
 #include "internal/carrier.hpp"
+#include "internal/function_tag.hpp"
 
 #include "duckdb/function/table_function.hpp"
 #include "duckdb/planner/expression/bound_aggregate_expression.hpp"
@@ -162,6 +163,7 @@ inline unique_ptr<LogicalOperator> MemorySourceScan(case_insensitive_set_t known
 	auto types = fragment->column_types;
 	auto names = fragment->column_names;
 	TableFunction function("memory_source_scan", {}, nullptr);
+	TagCrossingFunction(function);
 	auto get = make_uniq<LogicalGet>(MEMORY_GET_INDEX, BoundTableFunction(function), std::move(bind_data),
 	                                 std::move(types), IdentifiersOf(names));
 	get->SetColumnIds({ColumnIndex(0), ColumnIndex(1)});

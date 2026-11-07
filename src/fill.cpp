@@ -30,7 +30,7 @@ namespace duckdb {
 
 namespace {
 
-constexpr const char *SOURCE_DEFAULT_FUNCTION = "crossing_source_default";
+constexpr const char *SOURCE_DEFAULT_FUNCTION = "set_by_source";
 
 void ThrowSourceDefault(DataChunk &, ExpressionState &, Vector &) {
 	throw InvalidInputException("crossing: only the source knows this column's default, so it cannot be computed "

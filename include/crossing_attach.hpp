@@ -120,8 +120,7 @@ public:
 
 	void Detach(ClientContext &context);
 
-	//! The attach behind a CrossingAttachOwner catalog. Of throws for any other catalog; TryOf returns
-	//! null.
+	//! The attach built on the catalog's database. Of throws for any other catalog; TryOf returns null.
 	static CrossingAttach &Of(Catalog &catalog);
 	static optional_ptr<CrossingAttach> TryOf(Catalog &catalog);
 

@@ -93,4 +93,48 @@ target_include_directories(
 target_link_libraries(crossing_library_unittest
                       ${DUCKDB_BUILD_DIR}/third_party/yyjson/libduckdb_yyjson.a)
 
+function(crossing_copy_plugin target type source)
+  add_library(${target} MODULE ${CROSSING_LIBRARY_SOURCES}
+                               test/far_source/far_source.cpp test/copies/plugin.cpp)
+  target_compile_definitions(${target} PRIVATE CROSSING_COPY_TYPE="${type}"
+                                               CROSSING_COPY_SOURCE=${source})
+  target_include_directories(
+    ${target}
+    PRIVATE ${DUCKDB_SOURCE_DIR}/src/include
+            ${DUCKDB_SOURCE_DIR}/third_party/catch
+            ${DUCKDB_SOURCE_DIR}/third_party/fmt/include
+            ${DUCKDB_SOURCE_DIR}/third_party/yyjson/include
+            ${CMAKE_CURRENT_SOURCE_DIR}
+            ${CROSSING_INCLUDES} ${CMAKE_CURRENT_SOURCE_DIR}/test
+            ${CROSSING_SUBSTRAIT_INCLUDES})
+  target_link_libraries(${target}
+                        ${DUCKDB_BUILD_DIR}/third_party/yyjson/libduckdb_yyjson.a)
+  if(APPLE)
+    target_link_options(${target} PRIVATE -undefined dynamic_lookup)
+  endif()
+endfunction()
+
+crossing_copy_plugin(crossing_copy_far fardb duckdb::FarSource)
+crossing_copy_plugin(crossing_copy_other otherdb other::OtherSource)
+
+add_executable(crossing_copies_unittest test/unittest_main.cpp
+                                        test/copies/test_copies.cpp)
+target_include_directories(
+  crossing_copies_unittest PRIVATE ${DUCKDB_SOURCE_DIR}/src/include
+                                   ${DUCKDB_SOURCE_DIR}/third_party/catch)
+target_compile_definitions(
+  crossing_copies_unittest
+  PRIVATE CROSSING_COPY_FAR="$<TARGET_FILE:crossing_copy_far>"
+          CROSSING_COPY_OTHER="$<TARGET_FILE:crossing_copy_other>")
+add_dependencies(crossing_copies_unittest crossing_copy_far crossing_copy_other)
+set_target_properties(crossing_copies_unittest PROPERTIES ENABLE_EXPORTS ON)
+if(APPLE)
+  target_link_libraries(crossing_copies_unittest -Wl,-force_load,${DUCKDB_STATIC_LIB}
+                        Threads::Threads)
+else()
+  target_link_libraries(
+    crossing_copies_unittest -Wl,--whole-archive ${DUCKDB_STATIC_LIB}
+    -Wl,--no-whole-archive Threads::Threads ${CMAKE_DL_LIBS})
+endif()
+
 enable_testing()

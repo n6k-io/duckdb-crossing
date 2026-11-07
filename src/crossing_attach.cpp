@@ -14,6 +14,7 @@
 
 #include "duckdb/catalog/catalog_entry/schema_catalog_entry.hpp"
 #include "duckdb/common/atomic.hpp"
+#include "duckdb/main/attached_database.hpp"
 #include "duckdb/common/exception/catalog_exception.hpp"
 #include "duckdb/common/string_util.hpp"
 #include "duckdb/parser/parsed_data/alter_info.hpp"
@@ -27,6 +28,21 @@
 #include <algorithm>
 
 namespace duckdb {
+
+namespace {
+
+struct Attaches {
+	mutex lock;
+	unordered_map<const AttachedDatabase *, CrossingAttach *> by_database;
+	unordered_map<const Catalog *, CrossingAttach *> by_write_catalog;
+};
+
+Attaches &OwnAttaches() {
+	static Attaches attaches;
+	return attaches;
+}
+
+} // namespace
 
 CrossingOpenTransaction::CrossingOpenTransaction() = default;
 CrossingOpenTransaction::~CrossingOpenTransaction() = default;
@@ -47,12 +63,25 @@ CrossingAttach::CrossingAttach(AttachedDatabase &db_p, unique_ptr<CrossingSource
 	if (!source) {
 		throw InternalException("crossing: an attach needs a source");
 	}
+	auto &attaches = OwnAttaches();
+	lock_guard<mutex> guard(attaches.lock);
+	if (!attaches.by_database.emplace(&db, this).second) {
+		throw InternalException("crossing: '%s' already has an attach", db.GetName());
+	}
+	attaches.by_write_catalog.emplace(write_catalog.get(), this);
 }
 
 CrossingAttach::~CrossingAttach() {
 	for (auto &entry : begun) {
 		Rollback(TakeOpen(*entry.second));
 	}
+	auto &attaches = OwnAttaches();
+	lock_guard<mutex> guard(attaches.lock);
+	auto it = attaches.by_database.find(&db);
+	if (it != attaches.by_database.end() && it->second == this) {
+		attaches.by_database.erase(it);
+	}
+	attaches.by_write_catalog.erase(write_catalog.get());
 }
 
 CrossingSource &CrossingAttach::Source() {
@@ -631,11 +660,23 @@ CrossingAttach &CrossingAttach::Of(Catalog &catalog) {
 }
 
 optional_ptr<CrossingAttach> CrossingAttach::TryOf(Catalog &catalog) {
-	auto owner = dynamic_cast<CrossingAttachOwner *>(&catalog);
-	if (!owner) {
+	auto &attaches = OwnAttaches();
+	lock_guard<mutex> guard(attaches.lock);
+	auto it = attaches.by_database.find(&catalog.GetAttached());
+	if (it == attaches.by_database.end()) {
 		return nullptr;
 	}
-	return owner->Attach();
+	return it->second;
+}
+
+optional_ptr<CrossingAttach> CrossingAttachOfWriteCatalog(const Catalog &catalog) {
+	auto &attaches = OwnAttaches();
+	lock_guard<mutex> guard(attaches.lock);
+	auto it = attaches.by_write_catalog.find(&catalog);
+	if (it == attaches.by_write_catalog.end()) {
+		return nullptr;
+	}
+	return it->second;
 }
 
 } // namespace duckdb

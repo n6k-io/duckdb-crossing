@@ -1,5 +1,6 @@
 #include "crossing.hpp"
 #include "internal/floor.hpp"
+#include "internal/function_tag.hpp"
 #include "internal/names.hpp"
 
 #include "duckdb/function/table_function.hpp"
@@ -30,7 +31,7 @@ struct CrossingFloorBindData : public FunctionData {
 
 TableFunction CrossingFloorFunction() {
 	TableFunction function(CROSSING_FLOOR_FUNCTION, {}, nullptr);
-	return function;
+	return TagCrossingFunction(function);
 }
 
 unique_ptr<LogicalOperator> MakeFloorNode(idx_t table_index, string schema, string table, vector<string> column_names,
@@ -65,14 +66,10 @@ optional_ptr<const CrossingFloorNode> FloorOf(const LogicalOperator &op) {
 		return nullptr;
 	}
 	auto &get = op.Cast<LogicalGet>();
-	if (get.function.GetName() != CROSSING_FLOOR_FUNCTION || !get.bind_data) {
+	if (get.function.GetName() != CROSSING_FLOOR_FUNCTION || !get.bind_data || !IsOwnCrossingFunction(get)) {
 		return nullptr;
 	}
-	auto bind_data = dynamic_cast<const CrossingFloorBindData *>(get.bind_data.get());
-	if (!bind_data) {
-		return nullptr;
-	}
-	return &bind_data->floor;
+	return &get.bind_data->Cast<CrossingFloorBindData>().floor;
 }
 
 namespace {

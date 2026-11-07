@@ -3,6 +3,7 @@
 #include "crossing_attach.hpp"
 #include "internal/crossing_remote.hpp"
 #include "internal/floor.hpp"
+#include "internal/function_tag.hpp"
 #include "internal/seam.hpp"
 #include "internal/table_indices.hpp"
 
@@ -111,11 +112,14 @@ InsertionOrderPreservingMap<string> CrossingBindData::Params() const {
 }
 
 optional_ptr<CrossingBindData> CrossingBindDataOf(LogicalGet &get, const CrossingIdentity &identity) {
-	auto data = dynamic_cast<CrossingBindData *>(get.bind_data.get());
-	if (!data || &data->Identity() != &identity) {
+	if (!get.bind_data || !IsOwnCrossingFunction(get)) {
 		return nullptr;
 	}
-	return data;
+	auto &data = get.bind_data->Cast<CrossingBindData>();
+	if (&data.Identity() != &identity) {
+		return nullptr;
+	}
+	return &data;
 }
 
 TableFunction CrossingReadFunction() {
@@ -125,7 +129,7 @@ TableFunction CrossingReadFunction() {
 	// Without this, column_ids is not the output-slot-to-source-column map the scan reads it as.
 	// Filters stay off: crossing wants them as operators to fold, not as a TableFilterSet.
 	function.projection_pushdown = true;
-	return function;
+	return TagCrossingFunction(function);
 }
 
 shared_ptr<CrossingFragment> BuildScanFragment(unique_ptr<LogicalOperator> floor, const string &source_table,

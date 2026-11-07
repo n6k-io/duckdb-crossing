@@ -638,7 +638,7 @@ TEST_CASE("DESCRIBE shows that a column's default belongs to the source", "[writ
 
 	auto result = twin.Query("DESCRIBE far.d");
 
-	REQUIRE(result->GetValue(4, 0) == Value("crossing_source_default()"));
+	REQUIRE(result->GetValue(4, 0) == Value("set_by_source()"));
 }
 
 TEST_CASE("a local copy of a source's table takes inserts that leave a column out", "[writes]") {

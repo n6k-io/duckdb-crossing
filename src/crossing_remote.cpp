@@ -160,6 +160,16 @@ void CrossingRemoteStatement::Add(CrossingRemoteSlice slice, bool seam_ordered, 
 	added.push_back(std::move(entry));
 }
 
+void CrossingRemoteStatement::Planned(PhysicalOperator &op) {
+	lock_guard<mutex> guard(lock);
+	planned.push_back(&op);
+}
+
+bool CrossingRemoteStatement::WasPlanned(const PhysicalOperator &op) {
+	lock_guard<mutex> guard(lock);
+	return std::find(planned.begin(), planned.end(), &op) != planned.end();
+}
+
 void CrossingRemoteStatement::PutWrite(idx_t slice, unique_ptr<SubstraitWrite> write,
                                        vector<unique_ptr<Expression>> owned) {
 	lock_guard<mutex> guard(lock);
@@ -592,10 +602,10 @@ CrossingRemoteColumns CrossingRemoteColumns::Identity(const vector<LogicalType> 
 bool TryPutWriteOnRemote(PhysicalOperator &plan, CrossingRemoteStatement &statement, unique_ptr<SubstraitWrite> &write,
                          vector<unique_ptr<Expression>> &owned, const CrossingRemoteColumns &columns,
                          const vector<LogicalType> &types) {
-	auto remote = dynamic_cast<PhysicalCrossingRemote *>(&plan);
-	if (!remote || remote->statement.get() != &statement) {
+	if (!statement.WasPlanned(plan)) {
 		return false;
 	}
+	auto remote = &plan.Cast<PhysicalCrossingRemote>();
 	statement.PutWrite(remote->slice, std::move(write), std::move(owned));
 	remote->columns = columns;
 	remote->types = types;
@@ -636,6 +646,7 @@ PhysicalOperator &PlanCrossingRemote(ClientContext &, PhysicalPlanGenerator &pla
 	auto &remote =
 	    planner.Make<PhysicalCrossingRemote>(std::move(types), statement, slice_id, ordered, std::move(columns),
 	                                         std::move(sink), awaits_result, estimated_cardinality);
+	statement->Planned(remote);
 	if (feed) {
 		remote.children.push_back(*feed);
 	}

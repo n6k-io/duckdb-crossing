@@ -12,6 +12,8 @@
 #include "duckdb/parser/parsed_data/attach_info.hpp"
 #include "duckdb/storage/storage_extension.hpp"
 
+#include <algorithm>
+
 namespace duckdb {
 
 namespace {
@@ -44,20 +46,49 @@ unique_ptr<TransactionManager> CreateCrossingTransactionManager(optional_ptr<Sto
 	return make_uniq<CrossingTransactionManager>(db, CrossingAttach::Of(catalog));
 }
 
+//! Weak, not raw: a live weak_ptr keeps the info's make_shared block allocated, so a freed info's
+//! address cannot come back as another copy's.
+struct OwnPasses {
+	mutex lock;
+	vector<weak_ptr<CrossingPassInfo>> infos;
+
+	optional_ptr<CrossingPassInfo> Find(const OptimizerExtensionInfo *info) {
+		for (auto &weak : infos) {
+			auto own = weak.lock();
+			if (own && own.get() == info) {
+				return own.get();
+			}
+		}
+		return nullptr;
+	}
+};
+
+OwnPasses &Passes() {
+	static OwnPasses passes;
+	return passes;
+}
+
 } // namespace
 
 void RegisterCrossingPass(DatabaseInstance &db, const CrossingIdentity &identity) {
 	auto &config = DBConfig::GetConfig(db);
+	auto &passes = Passes();
+	lock_guard<mutex> guard(passes.lock);
 	for (auto &existing : config.GetCallbackManager().OptimizerExtensions()) {
-		auto info = dynamic_cast<CrossingPassInfo *>(existing.optimizer_info.get());
-		if (info && &info->identity == &identity) {
+		auto own = passes.Find(existing.optimizer_info.get());
+		if (own && &own->identity == &identity) {
 			return;
 		}
 	}
+	passes.infos.erase(std::remove_if(passes.infos.begin(), passes.infos.end(),
+	                                  [](const weak_ptr<CrossingPassInfo> &weak) { return weak.expired(); }),
+	                   passes.infos.end());
 	OptimizerExtension pass;
 	pass.pre_optimize_function = CrossingFoldPass;
 	pass.optimize_function = CrossingNarrowPass;
-	pass.optimizer_info = make_shared_ptr<CrossingPassInfo>(identity);
+	auto info = make_shared_ptr<CrossingPassInfo>(identity);
+	passes.infos.push_back(info);
+	pass.optimizer_info = std::move(info);
 	OptimizerExtension::Register(config, pass);
 	RegisterSourceDefaultFunction(db);
 }

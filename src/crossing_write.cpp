@@ -2,6 +2,7 @@
 
 #include "internal/crossing_remote.hpp"
 #include "internal/fill.hpp"
+#include "internal/function_tag.hpp"
 #include "internal/seam.hpp"
 #include "internal/shaped_write.hpp"
 
@@ -324,7 +325,7 @@ TableFunction CrossingWriteFunction() {
 	TableFunction function(CROSSING_WRITE_FUNCTION, {}, CrossingWriteFunc);
 	function.to_string = CrossingWriteToString;
 	function.projection_pushdown = false;
-	return function;
+	return TagCrossingFunction(function);
 }
 
 LogicalCrossingNear::LogicalCrossingNear(TableIndex table_index_p, vector<ColumnBinding> bindings_p,

@@ -98,6 +98,8 @@ public:
 		auto_commit = auto_commit_p;
 	}
 	void Add(CrossingRemoteSlice slice, bool seam_ordered, optional_idx seam_estimate);
+	void Planned(PhysicalOperator &op);
+	bool WasPlanned(const PhysicalOperator &op);
 	void PutWrite(idx_t slice, unique_ptr<SubstraitWrite> write, vector<unique_ptr<Expression>> owned);
 	//! What EXPLAIN shows of a slice: what the source runs and returns; with `seam`, the rows sent to it too.
 	InsertionOrderPreservingMap<string> Explain(idx_t slice, optional_ptr<const vector<LogicalType>> seam);
@@ -117,6 +119,7 @@ private:
 	CrossingRemote &remote;
 	mutex lock;
 	vector<Added> added;
+	vector<const PhysicalOperator *> planned;
 	bool auto_commit = false;
 	bool started = false;
 	bool finished = false;
