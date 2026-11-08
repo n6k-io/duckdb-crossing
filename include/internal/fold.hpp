@@ -23,6 +23,8 @@ void AdoptSeamIndex(LogicalOperator &feed, TableIndex seam_index);
 
 bool SubtreeHoldsFrozenScan(LogicalOperator &node, const CrossingIdentity &identity);
 
-void UnfoldScansIntoPlace(unique_ptr<LogicalOperator> &subtree, const CrossingIdentity &identity);
+//! Hands back what stands for the seam of a scan inside, whose rows the unfolded plan now needs.
+unique_ptr<LogicalOperator> UnfoldScansIntoPlace(unique_ptr<LogicalOperator> &subtree,
+                                                 const CrossingIdentity &identity);
 
 } // namespace duckdb

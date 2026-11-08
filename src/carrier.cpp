@@ -1,4 +1,5 @@
 #include "internal/carrier.hpp"
+#include "internal/function_tag.hpp"
 
 #include "duckdb/planner/operator/logical_get.hpp"
 
@@ -9,7 +10,7 @@ optional_ptr<CrossingCarrier> CarrierOf(LogicalOperator &op, const CrossingIdent
 		return nullptr;
 	}
 	auto &get = op.Cast<LogicalGet>();
-	if (!get.bind_data) {
+	if (!get.bind_data || !IsOwnCrossingFunction(get)) {
 		return nullptr;
 	}
 	auto carrier = dynamic_cast<CrossingCarrier *>(get.bind_data.get());

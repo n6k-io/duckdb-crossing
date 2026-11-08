@@ -75,13 +75,22 @@ bool SubtreeHoldsFrozenScan(LogicalOperator &node, const CrossingIdentity &ident
 	return false;
 }
 
-void UnfoldScansIntoPlace(unique_ptr<LogicalOperator> &subtree, const CrossingIdentity &identity) {
+unique_ptr<LogicalOperator> UnfoldScansIntoPlace(unique_ptr<LogicalOperator> &subtree,
+                                                 const CrossingIdentity &identity) {
 	vector<unique_ptr<LogicalOperator> *> slots;
 	CollectScanSlots(subtree, slots, identity);
+	unique_ptr<LogicalOperator> near_child;
 	for (auto slot : slots) {
 		auto scan = std::move(*slot);
+		if (!scan->children.empty()) {
+			if (near_child) {
+				throw InternalException("crossing: a plan unfolded with two seams");
+			}
+			near_child = std::move(scan->children[0]);
+		}
 		*slot = std::move(CrossingReadFragmentOf(*scan, identity)->plan);
 	}
+	return near_child;
 }
 
 namespace {
@@ -121,9 +130,18 @@ unique_ptr<LogicalOperator> Fold(unique_ptr<LogicalOperator> subtree, const Cros
 		}
 		folded_sources.emplace_back(source);
 	};
+	unique_ptr<LogicalOperator> near_child;
+	vector<LogicalType> seam_types;
 	for (auto slot : slots) {
 		auto scan = std::move(*slot);
 		auto fragment = CrossingReadFragmentOf(*scan, identity);
+		if (!scan->children.empty()) {
+			if (near_child) {
+				throw InternalException("crossing: a subtree folded with two seams");
+			}
+			near_child = std::move(scan->children[0]);
+			seam_types = fragment->seam_types;
+		}
 		if (!host_source) {
 			host_source = CrossingSourceOf(*scan, identity);
 		}
@@ -138,6 +156,11 @@ unique_ptr<LogicalOperator> Fold(unique_ptr<LogicalOperator> subtree, const Cros
 		}
 	}
 	host_fragment->folded_sources = std::move(folded_sources);
+	host->children.clear();
+	if (near_child) {
+		host->children.push_back(std::move(near_child));
+		host_fragment->seam_types = std::move(seam_types);
+	}
 
 	auto &get = host->Cast<LogicalGet>();
 	auto root_index = bindings.empty() ? get.table_index : bindings[0].table_index;

@@ -14,8 +14,6 @@ void SplitFiltersAtEvaluableHalf(unique_ptr<LogicalOperator> &plan, const Crossi
 
 void PushFiltersIntoJoinBranches(unique_ptr<LogicalOperator> &plan, const CrossingIdentity &identity);
 
-void SplitFiltersAgainst(unique_ptr<LogicalOperator> &plan, CrossingSource &source);
-
 //! The inverse of the split, for halves that ended up on the same side.
 void RejoinAdjacentFiltersEverywhere(unique_ptr<LogicalOperator> &plan, const CrossingIdentity &identity);
 

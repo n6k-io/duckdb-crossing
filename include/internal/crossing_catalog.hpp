@@ -1,7 +1,7 @@
 #pragma once
 
-// The catalog Crossing<S>::Register attaches: the source's tables and nothing else. No native
-// storage; for the DDL it passes on, see Registering in IMPLEMENTING.md. A catalog that needs more
+// The catalog RegisterCrossing attaches: the source's tables and nothing else. No native
+// storage; for the DDL it passes on, see "Your own catalog" in IMPLEMENTING.md. A catalog that needs more
 // owns a CrossingAttach from its own base instead.
 
 #include "duckdb.hpp"

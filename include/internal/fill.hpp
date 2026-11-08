@@ -9,14 +9,13 @@ namespace duckdb {
 
 struct CrossingFeed {
 	unique_ptr<LogicalOperator> plan;
-	optional_ptr<LogicalOperator> image;
 };
 
 CrossingFeed FeedOf(LogicalOperator &write, const vector<column_t> &key_columns, unique_ptr<LogicalOperator> feed,
                     const FreshTableIndex &fresh);
 
 struct SeamObstacle {
-	optional_ptr<LogicalOperator> node;
+	bool stays = false;
 	string obstacle;
 };
 
@@ -29,6 +28,12 @@ struct SeamFill {
 SeamFill FillSeamFromFeed(unique_ptr<LogicalOperator> feed, CrossingFragment &fragment, CrossingSource &source,
                           const SeamObstacle &stop, const FreshTableIndex &fresh, bool single_joins_cross = true);
 
-void MaterialiseConstantRows(ClientContext &context, unique_ptr<LogicalOperator> &node);
+void MaterialiseConstantRows(ClientContext &context, unique_ptr<LogicalOperator> &node, bool only_consistent = false);
+
+//! The default every column of a crossing table declares. Only the source knows the real one, so this
+//! throws if it is ever executed, and an insert drops the columns holding it.
+unique_ptr<ParsedExpression> SourceDefaultExpression();
+void RegisterSourceDefaultFunction(DatabaseInstance &db);
+bool IsSourceDefault(const Expression &expr);
 
 } // namespace duckdb

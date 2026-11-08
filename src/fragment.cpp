@@ -15,6 +15,24 @@ unique_ptr<LogicalOperator> *CrossingFragment::SeamSlot() {
 	return FindSeamSlot(plan);
 }
 
+idx_t CrossingFragment::IncludeRowId() {
+	if (row_id_column.IsValid()) {
+		return row_id_column.GetIndex();
+	}
+	if (!floor_get) {
+		throw NotImplementedException("crossing: this scan has no row id to read");
+	}
+	floor_get->virtual_columns.insert(
+	    make_pair(COLUMN_IDENTIFIER_ROW_ID, TableColumn(CROSSING_ROW_ID_COLUMN, LogicalType::ROW_TYPE)));
+	floor_get->AddColumnId(COLUMN_IDENTIFIER_ROW_ID);
+	plan->ResolveOperatorTypes();
+	floor_bindings = floor_get->GetColumnBindings();
+	row_id_column = column_names.size();
+	column_names.push_back(CROSSING_ROW_ID_COLUMN);
+	column_types.push_back(LogicalType::ROW_TYPE);
+	return row_id_column.GetIndex();
+}
+
 void CrossingFragment::SealFloor(const LogicalOperator &node) {
 	if (sealed_floor) {
 		throw InternalException("crossing: the floor is already sealed");

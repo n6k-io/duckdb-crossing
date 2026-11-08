@@ -52,6 +52,7 @@ struct Bound {
 	explicit Bound(case_insensitive_set_t known = case_insensitive_set_t()) : db(nullptr), con(db) {
 		BoundMemorySourceKnown() = std::move(known);
 		TableFunction function("memory_source", vector<LogicalType> {}, BoundMemorySourceScan, BoundMemorySourceBind);
+		TagCrossingFunction(function);
 		con.BeginTransaction();
 		auto &catalog = Catalog::GetSystemCatalog(*con.context);
 		CreateTableFunctionInfo info(function);

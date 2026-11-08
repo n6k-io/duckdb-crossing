@@ -2,6 +2,7 @@
 #include "substrait_types.hpp"
 
 #include "duckdb/common/enum_util.hpp"
+#include "duckdb/common/exception/binder_exception.hpp"
 #include "duckdb/common/enums/set_operation_type.hpp"
 #include "duckdb/common/helper.hpp"
 #include "duckdb/common/limits.hpp"
@@ -18,6 +19,7 @@
 #include "duckdb/parser/expression/function_expression.hpp"
 #include "duckdb/parser/expression/operator_expression.hpp"
 #include "duckdb/parser/expression/star_expression.hpp"
+#include "duckdb/parser/expression/subquery_expression.hpp"
 #include "duckdb/parser/expression/window_expression.hpp"
 #include "duckdb/parser/parsed_data/sample_options.hpp"
 #include "duckdb/parser/parsed_expression_iterator.hpp"
@@ -27,9 +29,21 @@
 #include "duckdb/parser/query_node/set_operation_node.hpp"
 #include "duckdb/parser/tableref/joinref.hpp"
 #include "duckdb/parser/result_modifier.hpp"
+#include "duckdb/parser/query_node/delete_query_node.hpp"
+#include "duckdb/parser/query_node/insert_query_node.hpp"
+#include "duckdb/parser/query_node/merge_query_node.hpp"
+#include "duckdb/parser/query_node/update_query_node.hpp"
+#include "duckdb/parser/parsed_data/create_table_info.hpp"
+#include "duckdb/parser/statement/create_statement.hpp"
+#include "duckdb/parser/statement/delete_statement.hpp"
+#include "duckdb/parser/statement/insert_statement.hpp"
+#include "duckdb/parser/statement/merge_into_statement.hpp"
 #include "duckdb/parser/statement/select_statement.hpp"
+#include "duckdb/parser/statement/update_statement.hpp"
+#include "duckdb/parser/tableref/table_function_ref.hpp"
 #include "duckdb/parser/tableref/basetableref.hpp"
 #include "duckdb/parser/tableref/emptytableref.hpp"
+#include "duckdb/parser/tableref/expressionlistref.hpp"
 #include "duckdb/parser/tableref/subqueryref.hpp"
 #include "duckdb/planner/logical_operator.hpp"
 
@@ -45,6 +59,7 @@ using duckdb_yyjson::yyjson_doc;
 using duckdb_yyjson::yyjson_doc_free;
 using duckdb_yyjson::yyjson_doc_get_root;
 using duckdb_yyjson::yyjson_get_bool;
+using duckdb_yyjson::yyjson_get_len;
 using duckdb_yyjson::yyjson_get_num;
 using duckdb_yyjson::yyjson_get_sint;
 using duckdb_yyjson::yyjson_get_str;
@@ -124,12 +139,12 @@ int64_t Int64Of(yyjson_val *val, int64_t fallback) {
 
 class Decoder {
 public:
-	Decoder(Connection &conn_p, const string &catalog_p, const SubstraitSeamViews &seam_views_p,
-	        const SubstraitCatalogCheck &check_p)
-	    : conn(conn_p), catalog(catalog_p), seam_views(seam_views_p), check(check_p) {
+	Decoder(Connection &conn_p, const string &catalog_p, const SubstraitCatalogCheck &check_p,
+	        const CrossingFloorResolver &resolver_p = nullptr)
+	    : conn(conn_p), catalog(catalog_p), check(check_p), resolver(resolver_p) {
 	}
 
-	shared_ptr<Relation> Decode(yyjson_val *plan) {
+	void ReadFunctions(yyjson_val *plan) {
 		auto *extensions = yyjson_obj_get(plan, "extensions");
 		if (extensions) {
 			size_t idx, max;
@@ -143,6 +158,48 @@ public:
 				functions[NumericCast<uint64_t>(anchor)] = StrOf(fn, "name");
 			}
 		}
+	}
+
+	DecodedStatement DecodeSlices(yyjson_val *plan) {
+		ReadFunctions(plan);
+		DecodedStatement out;
+		size_t idx, max;
+		yyjson_val *relation;
+		yyjson_arr_foreach(Require(plan, "relations"), idx, max, relation) {
+			auto *root = Require(relation, "root");
+			auto *wrapped = Require(Require(root, "input"), "extensionSingle");
+			auto *detail = Require(wrapped, "detail");
+			DecodedSlice slice;
+			slice.id = yyjson_get_uint(Require(detail, "id"));
+			slice.ordered = yyjson_get_bool(Require(detail, "ordered"));
+			auto *input = Require(wrapped, "input");
+			auto *write_detail = WriteDetailOf(input);
+			if (write_detail) {
+				auto *single = yyjson_obj_get(input, "extensionSingle");
+				write_reads_rows = true;
+				slice.statement = WriteStatement(write_detail, single ? Require(single, "input") : nullptr);
+				slice.verb = static_cast<CrossingVerb>(yyjson_get_uint(Require(write_detail, "verb")));
+				slice.reads_rows = write_reads_rows;
+				slice.write_catalog = WriteCatalog(write_detail);
+				size_t type_idx, type_max;
+				yyjson_val *type;
+				yyjson_arr_foreach(Require(write_detail, "returningTypes"), type_idx, type_max, type) {
+					slice.returning_types.push_back(SubstraitTypeFromJson(*conn.context, type));
+				}
+			} else {
+				auto built = Rel(input);
+				auto statement = make_uniq<SelectStatement>();
+				statement->node = std::move(built.node);
+				slice.statement = std::move(statement);
+			}
+			out.slices.push_back(std::move(slice));
+		}
+		out.seams = std::move(seams);
+		return out;
+	}
+
+	shared_ptr<Relation> Decode(yyjson_val *plan) {
+		ReadFunctions(plan);
 		auto *relations = Require(plan, "relations");
 		auto *first = yyjson_arr_get_first(relations);
 		auto *root = first ? yyjson_obj_get(first, "root") : nullptr;
@@ -164,6 +221,265 @@ public:
 	}
 
 private:
+	struct Built {
+		unique_ptr<QueryNode> node;
+		idx_t width = 0;
+	};
+
+	static bool DetailIs(yyjson_val *detail, const string &kind) {
+		return StrOf(detail, "@type") == string(SUBSTRAIT_TYPE_URL_PREFIX) + kind;
+	}
+
+	static yyjson_val *WriteDetailOf(yyjson_val *input) {
+		auto *single = yyjson_obj_get(input, "extensionSingle");
+		auto *leaf = yyjson_obj_get(input, "extensionLeaf");
+		auto *rel = single ? single : leaf;
+		if (!rel) {
+			return nullptr;
+		}
+		auto *detail = Require(rel, "detail");
+		return DetailIs(detail, "Write") ? detail : nullptr;
+	}
+
+	string WriteCatalog(yyjson_val *detail) {
+		auto named = StrOf(detail, "catalog");
+		return named.empty() ? catalog : named;
+	}
+
+	Built SeamRead(yyjson_val *detail) {
+		DecodedSeam seam;
+		seam.id = yyjson_get_uint(Require(detail, "id"));
+		seam.ordered = yyjson_get_bool(Require(detail, "ordered"));
+		if (auto *estimate = yyjson_obj_get(detail, "estimate")) {
+			seam.estimate = yyjson_get_uint(estimate);
+		}
+		size_t idx, max;
+		yyjson_val *type;
+		yyjson_arr_foreach(Require(detail, "types"), idx, max, type) {
+			seam.types.push_back(SubstraitTypeFromJson(*conn.context, type));
+		}
+		vector<unique_ptr<ParsedExpression>> arguments;
+		arguments.push_back(ConstantExpression::FromValue(Value::UBIGINT(seam.id)));
+		auto ref = make_uniq<TableFunctionRef>();
+		ref->function = make_uniq<FunctionExpression>(
+		    Identifier(seam.ordered ? "crossing_seam_ordered_rows" : "crossing_seam_rows"), std::move(arguments));
+		vector<unique_ptr<ParsedExpression>> exprs;
+		for (idx_t c = 0; c < seam.types.size(); c++) {
+			exprs.push_back(make_uniq<ColumnRefExpression>(Identifier(ColumnName(c))));
+		}
+		seams.push_back(std::move(seam));
+		return Numbered(std::move(ref), std::move(exprs));
+	}
+
+	vector<unique_ptr<ParsedExpression>> WriteExprs(yyjson_val *values, const Scope &scope) {
+		vector<unique_ptr<ParsedExpression>> out;
+		size_t idx, max;
+		yyjson_val *value;
+		yyjson_arr_foreach(values, idx, max, value) {
+			out.push_back(Expr(value, scope));
+		}
+		return out;
+	}
+
+	unique_ptr<UpdateSetInfo> SetInfo(const vector<string> &columns, yyjson_val *values, const Scope &scope) {
+		auto info = make_uniq<UpdateSetInfo>();
+		for (auto &column : columns) {
+			info->columns.emplace_back(column);
+		}
+		info->expressions = WriteExprs(values, scope);
+		return info;
+	}
+
+	//! True unless every column `expr` names is qualified by `source`, and it holds no subquery or star.
+	static bool ReadsTarget(const ParsedExpression &expr, const string &source) {
+		switch (expr.GetExpressionClass()) {
+		case ExpressionClass::SUBQUERY:
+		case ExpressionClass::STAR:
+			return true;
+		case ExpressionClass::COLUMN_REF: {
+			auto &names = expr.Cast<ColumnRefExpression>().ColumnNames();
+			return names.size() != 2 || names[0].GetIdentifierName() != source;
+		}
+		default:
+			break;
+		}
+		bool reads = false;
+		ParsedExpressionIterator::EnumerateChildren(
+		    expr, [&](const ParsedExpression &child) { reads = reads || ReadsTarget(child, source); });
+		return reads;
+	}
+
+	static vector<unique_ptr<ParsedExpression>> Returning(const vector<string> &columns, const string &alias) {
+		vector<unique_ptr<ParsedExpression>> out;
+		for (auto &column : columns) {
+			out.push_back(alias.empty() || column == "merge_action"
+			                  ? make_uniq<ColumnRefExpression>(Identifier(column))
+			                  : make_uniq<ColumnRefExpression>(Identifier(column), Identifier(alias)));
+		}
+		return out;
+	}
+
+	unique_ptr<SQLStatement> WriteStatement(yyjson_val *detail, yyjson_val *input) {
+		static constexpr const char *TARGET = "crossing_target";
+		static constexpr const char *SOURCE = "crossing_source";
+		auto target_columns = StrArrayOf(detail, "targetColumns");
+		auto returning = StrArrayOf(detail, "returning");
+		auto verb = static_cast<CrossingVerb>(yyjson_get_uint(Require(detail, "verb")));
+		auto target_catalog = WriteCatalog(detail);
+		if (check && !StrOf(detail, "catalog").empty()) {
+			check(target_catalog);
+		}
+		auto schema = StrOf(detail, "schema");
+		auto table = StrOf(detail, "table");
+		auto width = target_columns.size();
+		Scope scope = [width, target_columns](idx_t field) -> unique_ptr<ParsedExpression> {
+			if (field < width) {
+				return make_uniq<ColumnRefExpression>(Identifier(target_columns[field]), Identifier(TARGET));
+			}
+			return make_uniq<ColumnRefExpression>(Identifier(ColumnName(field - width)), Identifier(SOURCE));
+		};
+		auto target_ref = [&]() {
+			auto ref = make_uniq<BaseTableRef>();
+			ref->SetQualifiedName(Identifier(target_catalog), Identifier(schema), Identifier(table));
+			ref->alias = TARGET;
+			return ref;
+		};
+		unique_ptr<TableRef> source;
+		idx_t source_width = 0;
+		if (input) {
+			auto built = Rel(input);
+			source_width = built.width;
+			source = AsRef(std::move(built), SOURCE);
+		}
+		auto *condition = yyjson_obj_get(detail, "condition");
+		auto set_columns = StrArrayOf(detail, "setColumns");
+		auto *values = Require(detail, "values");
+
+		if (yyjson_get_bool(Require(detail, "merge"))) {
+			if (resolver) {
+				for (auto merge_verb : {CrossingVerb::SELECT, CrossingVerb::UPDATE, CrossingVerb::DELETE_}) {
+					CrossingFloor floor;
+					floor.schema = schema;
+					floor.table = table;
+					floor.verb = merge_verb;
+					if (resolver(floor)) {
+						throw NotImplementedException("crossing: a MERGE into '%s' cannot apply its row policy", table);
+					}
+				}
+			}
+			auto merge = make_uniq<MergeQueryNode>();
+			merge->target = target_ref();
+			merge->source = std::move(source);
+			merge->join_condition = Expr(condition, scope);
+			size_t idx, max;
+			yyjson_val *entry;
+			yyjson_arr_foreach(Require(detail, "actions"), idx, max, entry) {
+				auto action = make_uniq<MergeIntoAction>();
+				action->action_type = EnumUtil::FromString<MergeActionType>(StrOf(entry, "type").c_str());
+				if (auto *action_condition = yyjson_obj_get(entry, "condition")) {
+					action->condition = Expr(action_condition, scope);
+				}
+				auto columns = StrArrayOf(entry, "columns");
+				if (action->action_type == MergeActionType::MERGE_UPDATE) {
+					action->update_info = SetInfo(columns, Require(entry, "values"), scope);
+				} else if (action->action_type == MergeActionType::MERGE_INSERT) {
+					for (auto &column : columns) {
+						action->insert_columns.emplace_back(column);
+					}
+					action->expressions = WriteExprs(Require(entry, "values"), scope);
+					action->default_values = action->expressions.empty();
+				}
+				auto when = EnumUtil::FromString<MergeActionCondition>(StrOf(entry, "when").c_str());
+				merge->actions[when].push_back(std::move(action));
+			}
+			merge->returning_list = Returning(returning, TARGET);
+			auto statement = make_uniq<MergeIntoStatement>();
+			statement->node = std::move(merge);
+			return std::move(statement);
+		}
+
+		switch (verb) {
+		case CrossingVerb::CREATE: {
+			if (!source) {
+				throw InvalidInputException("substrait: a create table as has no source");
+			}
+			auto select = make_uniq<SelectNode>();
+			for (idx_t c = 0; c < target_columns.size(); c++) {
+				auto column = make_uniq<ColumnRefExpression>(Identifier(ColumnName(c)));
+				column->SetAlias(Identifier(target_columns[c]));
+				select->select_list.push_back(std::move(column));
+			}
+			select->from_table = std::move(source);
+			auto query = make_uniq<SelectStatement>();
+			query->node = std::move(select);
+			auto info = make_uniq<CreateTableInfo>(
+			    QualifiedName(Identifier(target_catalog), Identifier(schema), Identifier(table)));
+			info->query = std::move(query);
+			info->on_conflict = static_cast<OnCreateConflict>(yyjson_get_uint(Require(detail, "onConflict")));
+			auto statement = make_uniq<CreateStatement>();
+			statement->info = std::move(info);
+			return std::move(statement);
+		}
+		case CrossingVerb::INSERT: {
+			auto insert = make_uniq<InsertQueryNode>();
+			insert->SetQualifiedName(Identifier(target_catalog), Identifier(schema), Identifier(table));
+			for (auto &column : set_columns) {
+				insert->columns.emplace_back(column);
+			}
+			if (source) {
+				auto select = make_uniq<SelectNode>();
+				for (idx_t c = 0; c < source_width; c++) {
+					select->select_list.push_back(make_uniq<ColumnRefExpression>(Identifier(ColumnName(c))));
+				}
+				select->from_table = std::move(source);
+				auto statement = make_uniq<SelectStatement>();
+				statement->node = std::move(select);
+				insert->select_statement = std::move(statement);
+			} else {
+				insert->default_values = true;
+			}
+			insert->returning_list = Returning(returning, "");
+			auto statement = make_uniq<InsertStatement>();
+			statement->node = std::move(insert);
+			return std::move(statement);
+		}
+		case CrossingVerb::UPDATE: {
+			auto update = make_uniq<UpdateQueryNode>();
+			update->table = target_ref();
+			update->from_table = std::move(source);
+			update->set_info = SetInfo(set_columns, values, scope);
+			auto addressed = condition ? Expr(condition, scope) : nullptr;
+			bool reads_rows = !returning.empty() || (addressed && ReadsTarget(*addressed, SOURCE));
+			for (auto &value : update->set_info->expressions) {
+				reads_rows |= ReadsTarget(*value, SOURCE);
+			}
+			update->set_info->condition = std::move(addressed);
+			write_reads_rows = reads_rows;
+			update->returning_list = Returning(returning, TARGET);
+			auto statement = make_uniq<UpdateStatement>();
+			statement->node = std::move(update);
+			return std::move(statement);
+		}
+		case CrossingVerb::DELETE_: {
+			auto del = make_uniq<DeleteQueryNode>();
+			del->table = target_ref();
+			if (source) {
+				del->using_clauses.push_back(std::move(source));
+			}
+			auto addressed = condition ? Expr(condition, scope) : nullptr;
+			bool reads_rows = !returning.empty() || (addressed && ReadsTarget(*addressed, SOURCE));
+			del->condition = std::move(addressed);
+			write_reads_rows = reads_rows;
+			del->returning_list = Returning(returning, TARGET);
+			auto statement = make_uniq<DeleteStatement>();
+			statement->node = std::move(del);
+			return std::move(statement);
+		}
+		default:
+			throw InvalidInputException("substrait: '%s' is not a write verb", CrossingVerbName(verb));
+		}
+	}
+
 	string FunctionName(yyjson_val *node) {
 		auto ref = Int64Of(yyjson_obj_get(node, "functionReference"), -1);
 		auto it = functions.find(NumericCast<uint64_t>(ref));
@@ -237,7 +553,7 @@ private:
 			return ConstantExpression::FromValue(Value::DOUBLE(yyjson_get_num(body)));
 		}
 		if (key == "string") {
-			return ConstantExpression::FromValue(Value(string(yyjson_get_str(body))));
+			return ConstantExpression::FromValue(Value(string(yyjson_get_str(body), yyjson_get_len(body))));
 		}
 		if (key == "date") {
 			return ConstantExpression::FromValue(Value::DATE(date_t(NumericCast<int32_t>(Int64Of(body, 0)))));
@@ -426,11 +742,6 @@ private:
 	//! Everything a parent reads emits c0..c(width-1), so a parent never needs it bound to name its columns.
 	//! An EmptyRead of width 0 emits one unnamed NULL instead: no parent names it, but `*` and a root
 	//! without names pass it on.
-	struct Built {
-		unique_ptr<QueryNode> node;
-		idx_t width = 0;
-	};
-
 	static unique_ptr<TableRef> AsRef(Built built, const string &alias) {
 		auto statement = make_uniq<SelectStatement>();
 		statement->node = std::move(built.node);
@@ -492,23 +803,58 @@ private:
 		return out;
 	}
 
+	vector<LogicalType> BaseSchemaTypes(yyjson_val *read) {
+		vector<LogicalType> types;
+		size_t idx, max;
+		yyjson_val *type;
+		yyjson_arr_foreach(Require(Require(Require(read, "baseSchema"), "struct"), "types"), idx, max, type) {
+			types.push_back(SubstraitTypeFromJson(*conn.context, type));
+		}
+		return types;
+	}
+
+	Built RowsRead(yyjson_val *read, yyjson_val *rows) {
+		auto types = BaseSchemaTypes(read);
+		auto list = make_uniq<ExpressionListRef>();
+		list->alias = "crossing_rows";
+		size_t idx, max;
+		yyjson_val *row;
+		yyjson_arr_foreach(rows, idx, max, row) {
+			auto *fields = Require(row, "fields");
+			if (yyjson_arr_size(fields) != types.size()) {
+				throw InvalidInputException("substrait: a row has %llu fields but its table has %llu columns",
+				                            yyjson_arr_size(fields), types.size());
+			}
+			vector<unique_ptr<ParsedExpression>> cells;
+			size_t field_idx, field_max;
+			yyjson_val *field;
+			yyjson_arr_foreach(fields, field_idx, field_max, field) {
+				// The cast keeps the planned type: a VALUES list otherwise infers its columns from the cells.
+				cells.push_back(make_uniq<CastExpression>(types[field_idx], Expr(field, PositionalScope()), false));
+			}
+			list->values.push_back(std::move(cells));
+		}
+		vector<unique_ptr<ParsedExpression>> exprs;
+		for (idx_t i = 0; i < types.size(); i++) {
+			exprs.push_back(make_uniq<ColumnRefExpression>(Identifier("col" + std::to_string(i))));
+		}
+		return Numbered(std::move(list), std::move(exprs));
+	}
+
 	// Fields are positions in the schema the plan was built against, so they mean nothing against any other.
 	void RequireSchemaUnchanged(yyjson_val *read, const string &schema, const string &table,
 	                            const vector<ColumnDefinition> &columns) {
-		auto *base = Require(read, "baseSchema");
-		auto expected_names = StrArrayOf(base, "names");
-		auto *wire_types = Require(Require(base, "struct"), "types");
-		vector<LogicalType> expected_types;
-		size_t idx, max;
-		yyjson_val *type;
-		yyjson_arr_foreach(wire_types, idx, max, type) {
-			expected_types.push_back(SubstraitTypeFromJson(*conn.context, type));
-		}
+		auto expected_names = StrArrayOf(Require(read, "baseSchema"), "names");
+		auto expected_types = BaseSchemaTypes(read);
 		vector<string> names;
 		vector<LogicalType> types;
 		for (auto &column : columns) {
 			names.push_back(column.Name().GetIdentifierName());
 			types.push_back(column.Type());
+		}
+		if (names.size() == expected_names.size() + 1 && names.back() == "rowid") {
+			names.pop_back();
+			types.pop_back();
 		}
 		if (names != expected_names || types != expected_types) {
 			throw CatalogException("crossing: '%s.%s' changed on the source: it now has [%s] as [%s], the plan expects "
@@ -519,30 +865,23 @@ private:
 	}
 
 	Built Read(yyjson_val *read) {
-		if (yyjson_obj_get(read, "virtualTable")) {
-			return EmptyRead(read);
+		if (auto *table = yyjson_obj_get(read, "virtualTable")) {
+			auto *rows = yyjson_obj_get(table, "expressions");
+			return rows && yyjson_arr_size(rows) > 0 ? RowsRead(read, rows) : EmptyRead(read);
 		}
 		auto *named = Require(read, "namedTable");
 		auto names = StrArrayOf(named, "names");
-		shared_ptr<Relation> rel;
-		if (names.size() == 1) {
-			auto view = seam_views.find(names[0]);
-			if (view == seam_views.end()) {
-				throw InvalidInputException("substrait: the plan reads seam '%s' but it was not staged", names[0]);
-			}
-			rel = conn.View(Identifier(view->second));
-		} else if (names.size() == 2 || names.size() == 3) {
-			if (names.size() == 3 && check) {
-				check(names[0]);
-			}
-			auto ref = make_uniq<BaseTableRef>();
-			ref->SetQualifiedName(Identifier(names.size() == 3 ? names[0] : catalog),
-			                      Identifier(names[names.size() - 2]), Identifier(names.back()));
-			rel = make_shared_ptr<ViewRelation>(conn.context, std::move(ref), names.back());
-			RequireSchemaUnchanged(read, names[names.size() - 2], names.back(), rel->Columns());
-		} else {
+		if (names.size() != 2 && names.size() != 3) {
 			throw InvalidInputException("substrait: a named table needs [schema, table]");
 		}
+		if (names.size() == 3 && check) {
+			check(names[0]);
+		}
+		auto ref = make_uniq<BaseTableRef>();
+		ref->SetQualifiedName(Identifier(names.size() == 3 ? names[0] : catalog), Identifier(names[names.size() - 2]),
+		                      Identifier(names.back()));
+		shared_ptr<Relation> rel = make_shared_ptr<ViewRelation>(conn.context, std::move(ref), names.back());
+		RequireSchemaUnchanged(read, names[names.size() - 2], names.back(), rel->Columns());
 		auto &columns = rel->Columns();
 		vector<idx_t> fields;
 		auto *projection = yyjson_obj_get(read, "projection");
@@ -561,10 +900,11 @@ private:
 		}
 		vector<unique_ptr<ParsedExpression>> exprs;
 		for (auto field : fields) {
-			if (field >= columns.size()) {
+			if (field > columns.size()) {
 				throw InvalidInputException("substrait: field %llu is past the end of the table", field);
 			}
-			exprs.push_back(make_uniq<ColumnRefExpression>(columns[field].Name()));
+			exprs.push_back(field == columns.size() ? make_uniq<ColumnRefExpression>(Identifier("rowid"))
+			                                        : make_uniq<ColumnRefExpression>(columns[field].Name()));
 		}
 		return Numbered(rel->GetTableRef(), std::move(exprs));
 	}
@@ -919,7 +1259,11 @@ private:
 			return Extension(multi, true);
 		}
 		if (auto *leaf = yyjson_obj_get(node, "extensionLeaf")) {
-			return CteRef(yyjson_get_uint(Require(Require(leaf, "detail"), "cte")));
+			auto *detail = Require(leaf, "detail");
+			if (DetailIs(detail, "Seam")) {
+				return SeamRead(detail);
+			}
+			return CteRef(yyjson_get_uint(Require(detail, "cte")));
 		}
 		if (auto *set = yyjson_obj_get(node, "set")) {
 			auto *inputs = Require(set, "inputs");
@@ -959,8 +1303,10 @@ private:
 
 	Connection &conn;
 	const string &catalog;
-	const SubstraitSeamViews &seam_views;
 	const SubstraitCatalogCheck &check;
+	CrossingFloorResolver resolver;
+	bool write_reads_rows = true;
+	vector<DecodedSeam> seams;
 	std::unordered_map<uint64_t, string> functions;
 	std::unordered_map<uint64_t, idx_t> cte_widths;
 };
@@ -968,13 +1314,13 @@ private:
 } // namespace
 
 shared_ptr<Relation> DecodeSubstraitJson(Connection &conn, const string &catalog, const string &json,
-                                         const SubstraitSeamViews &seam_views, const SubstraitCatalogCheck &check) {
+                                         const SubstraitCatalogCheck &check) {
 	auto *doc = yyjson_read(json.data(), json.size(), 0);
 	if (!doc) {
 		throw InvalidInputException("substrait: the plan is not valid JSON");
 	}
 	try {
-		Decoder decoder(conn, catalog, seam_views, check);
+		Decoder decoder(conn, catalog, check);
 		auto rel = decoder.Decode(yyjson_doc_get_root(doc));
 		yyjson_doc_free(doc);
 		return rel;
@@ -984,9 +1330,26 @@ shared_ptr<Relation> DecodeSubstraitJson(Connection &conn, const string &catalog
 	}
 }
 
+DecodedStatement DecodeSubstraitSlices(Connection &conn, const string &catalog, const string &json,
+                                       const SubstraitCatalogCheck &check, const CrossingFloorResolver &resolver) {
+	auto *doc = yyjson_read(json.data(), json.size(), 0);
+	if (!doc) {
+		throw InvalidInputException("substrait: the plan is not valid JSON");
+	}
+	try {
+		Decoder decoder(conn, catalog, check, resolver);
+		auto statement = decoder.DecodeSlices(yyjson_doc_get_root(doc));
+		yyjson_doc_free(doc);
+		return statement;
+	} catch (...) {
+		yyjson_doc_free(doc);
+		throw;
+	}
+}
+
 unique_ptr<SelectStatement> DecodeSubstraitView(Connection &conn, const string &catalog, const string &json,
                                                 const vector<string> &names, const SubstraitCatalogCheck &check) {
-	auto rel = DecodeSubstraitJson(conn, catalog, json, {}, check);
+	auto rel = DecodeSubstraitJson(conn, catalog, json, check);
 	auto &columns = rel->Columns();
 	if (columns.size() != names.size()) {
 		throw InvalidInputException("substrait: the view body has %llu columns but %llu names", columns.size(),

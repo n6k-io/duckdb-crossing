@@ -18,9 +18,7 @@ bool HasLimit(const FarCall &call) {
 } // namespace
 
 TEST_CASE("a filter and an order the source can compute run on the source", "[pushdown]") {
-	auto transport = EACH_TRANSPORT();
-	INFO(TransportName(transport));
-	Twin twin(transport);
+	Twin twin;
 	twin.Seed();
 
 	twin.Same("SELECT name FROM far.orders WHERE amt > 100 ORDER BY id");
@@ -33,9 +31,7 @@ TEST_CASE("a filter and an order the source can compute run on the source", "[pu
 }
 
 TEST_CASE("the source is read for the columns the query needs, in the order it names them", "[pushdown]") {
-	auto transport = EACH_TRANSPORT();
-	INFO(TransportName(transport));
-	Twin twin(transport);
+	Twin twin;
 	twin.Seed();
 
 	twin.Same("SELECT amt, id FROM far.orders ORDER BY id");
@@ -46,9 +42,7 @@ TEST_CASE("the source is read for the columns the query needs, in the order it n
 }
 
 TEST_CASE("a mixed filter leaves only the half the source cannot compute on the target", "[pushdown]") {
-	auto transport = EACH_TRANSPORT();
-	INFO(TransportName(transport));
-	Twin twin(transport);
+	Twin twin;
 	twin.store->refused_functions.insert("upper");
 	twin.Seed();
 
@@ -62,9 +56,7 @@ TEST_CASE("a mixed filter leaves only the half the source cannot compute on the 
 }
 
 TEST_CASE("a filter the source cannot compute at all stays on the target", "[pushdown]") {
-	auto transport = EACH_TRANSPORT();
-	INFO(TransportName(transport));
-	Twin twin(transport);
+	Twin twin;
 	twin.store->refused_functions.insert("upper");
 	twin.Seed();
 
@@ -76,9 +68,7 @@ TEST_CASE("a filter the source cannot compute at all stays on the target", "[pus
 }
 
 TEST_CASE("a limit and an offset cross with the order under them", "[pushdown]") {
-	auto transport = EACH_TRANSPORT();
-	INFO(TransportName(transport));
-	Twin twin(transport);
+	Twin twin;
 	twin.Seed();
 
 	twin.Same("SELECT id FROM far.orders ORDER BY amt DESC LIMIT 2 OFFSET 1");
@@ -89,9 +79,7 @@ TEST_CASE("a limit and an offset cross with the order under them", "[pushdown]")
 }
 
 TEST_CASE("an order whose key the source cannot compute stays, and the source sends every row", "[pushdown]") {
-	auto transport = EACH_TRANSPORT();
-	INFO(TransportName(transport));
-	Twin twin(transport);
+	Twin twin;
 	twin.store->refused_functions.insert("lower");
 	twin.Seed();
 
@@ -104,9 +92,7 @@ TEST_CASE("an order whose key the source cannot compute stays, and the source se
 }
 
 TEST_CASE("aggregates the source knows cross whole", "[pushdown]") {
-	auto transport = EACH_TRANSPORT();
-	INFO(TransportName(transport));
-	Twin twin(transport);
+	Twin twin;
 	twin.Seed();
 
 	twin.Same("SELECT tenant, sum(amt) FROM far.orders GROUP BY tenant ORDER BY tenant");
@@ -122,9 +108,7 @@ TEST_CASE("aggregates the source knows cross whole", "[pushdown]") {
 }
 
 TEST_CASE("an aggregate the source refuses stays, and only the scan crosses", "[pushdown]") {
-	auto transport = EACH_TRANSPORT();
-	INFO(TransportName(transport));
-	Twin twin(transport);
+	Twin twin;
 	twin.store->refused_functions.insert("sum");
 	twin.Seed();
 
@@ -136,9 +120,7 @@ TEST_CASE("an aggregate the source refuses stays, and only the scan crosses", "[
 }
 
 TEST_CASE("a window the source knows crosses; one it refuses stays", "[pushdown]") {
-	auto transport = EACH_TRANSPORT();
-	INFO(TransportName(transport));
-	Twin twin(transport);
+	Twin twin;
 	twin.Seed();
 
 	twin.Same("SELECT id, row_number() OVER (PARTITION BY tenant ORDER BY amt DESC) FROM far.orders ORDER BY id");
@@ -150,9 +132,7 @@ TEST_CASE("a window the source knows crosses; one it refuses stays", "[pushdown]
 }
 
 TEST_CASE("a join of two tables of one source is one query on the source", "[pushdown]") {
-	auto transport = EACH_TRANSPORT();
-	INFO(TransportName(transport));
-	Twin twin(transport);
+	Twin twin;
 	twin.Seed();
 
 	twin.Same("SELECT o.id, c.cname FROM far.orders o JOIN far.customers c ON o.tenant = c.tenant ORDER BY o.id");
@@ -165,9 +145,7 @@ TEST_CASE("a join of two tables of one source is one query on the source", "[pus
 }
 
 TEST_CASE("an IN over one source's tables is one query on the source", "[pushdown]") {
-	auto transport = EACH_TRANSPORT();
-	INFO(TransportName(transport));
-	Twin twin(transport);
+	Twin twin;
 	twin.Seed();
 
 	twin.Same("SELECT id FROM far.orders WHERE tenant IN (SELECT tenant FROM far.customers WHERE cname <> 'acme') "
@@ -181,9 +159,7 @@ TEST_CASE("an IN over one source's tables is one query on the source", "[pushdow
 }
 
 TEST_CASE("an IN beside another condition is one query on the source", "[pushdown]") {
-	auto transport = EACH_TRANSPORT();
-	INFO(TransportName(transport));
-	Twin twin(transport);
+	Twin twin;
 	twin.Seed();
 
 	twin.Same("SELECT id FROM far.orders WHERE amt > 100 AND tenant IN (SELECT tenant FROM far.customers) ORDER BY id");
@@ -196,9 +172,7 @@ TEST_CASE("an IN beside another condition is one query on the source", "[pushdow
 }
 
 TEST_CASE("an IN over a table the target holds keeps the join on the target", "[pushdown]") {
-	auto transport = EACH_TRANSPORT();
-	INFO(TransportName(transport));
-	Twin twin(transport);
+	Twin twin;
 	twin.Seed();
 	twin.Both("CREATE TABLE regions(tenant INTEGER)");
 	twin.Both("INSERT INTO regions VALUES (1), (2)");
@@ -210,9 +184,7 @@ TEST_CASE("an IN over a table the target holds keeps the join on the target", "[
 }
 
 TEST_CASE("an IN whose NULL result matters answers as the source would", "[pushdown]") {
-	auto transport = EACH_TRANSPORT();
-	INFO(TransportName(transport));
-	Twin twin(transport);
+	Twin twin;
 	twin.Seed();
 
 	auto names = string("(SELECT name FROM far.orders WHERE id > 3)");
@@ -226,9 +198,7 @@ TEST_CASE("an IN whose NULL result matters answers as the source would", "[pushd
 }
 
 TEST_CASE("two INs over one source's tables are one query on the source", "[pushdown]") {
-	auto transport = EACH_TRANSPORT();
-	INFO(TransportName(transport));
-	Twin twin(transport);
+	Twin twin;
 	twin.Seed();
 
 	twin.Same("SELECT id FROM far.orders WHERE tenant IN (SELECT tenant FROM far.customers) "
@@ -241,9 +211,7 @@ TEST_CASE("two INs over one source's tables are one query on the source", "[push
 }
 
 TEST_CASE("an IN over several columns is one query on the source", "[pushdown]") {
-	auto transport = EACH_TRANSPORT();
-	INFO(TransportName(transport));
-	Twin twin(transport);
+	Twin twin;
 	twin.Seed();
 
 	twin.Same("SELECT o.id FROM far.orders o WHERE (o.tenant, o.amt) IN "
@@ -262,9 +230,7 @@ TEST_CASE("a comparison with ANY or ALL over one source's tables is one query on
 	                    "SELECT id FROM far.orders WHERE amt > ALL (SELECT tenant FROM far.customers) ORDER BY id",
 	                    "SELECT id FROM far.orders WHERE tenant <> ANY (SELECT tenant FROM far.customers) ORDER BY id",
 	                    "SELECT id FROM far.orders WHERE tenant = ALL (SELECT tenant FROM far.customers) ORDER BY id");
-	auto transport = EACH_TRANSPORT();
-	INFO(TransportName(transport));
-	Twin twin(transport);
+	Twin twin;
 	twin.Seed();
 
 	twin.Same(sql);
@@ -274,9 +240,7 @@ TEST_CASE("a comparison with ANY or ALL over one source's tables is one query on
 }
 
 TEST_CASE("an IN crosses when a filter beside it stays on the target", "[pushdown]") {
-	auto transport = EACH_TRANSPORT();
-	INFO(TransportName(transport));
-	Twin twin(transport);
+	Twin twin;
 	twin.store->refused_functions.insert("upper");
 	twin.Seed();
 
@@ -291,9 +255,7 @@ TEST_CASE("an IN crosses when a filter beside it stays on the target", "[pushdow
 }
 
 TEST_CASE("two VALUES lists in one plan each read their own rows", "[pushdown]") {
-	auto transport = EACH_TRANSPORT();
-	INFO(TransportName(transport));
-	Twin twin(transport);
+	Twin twin;
 	twin.Seed();
 
 	twin.Same(
@@ -308,9 +270,7 @@ TEST_CASE("a NOT IN or an IN read as a value over one source's tables is one que
 	    "SELECT id FROM far.orders WHERE tenant NOT IN (SELECT tenant FROM far.customers WHERE cname <> 'acme') "
 	    "ORDER BY id",
 	    "SELECT id, tenant IN (SELECT tenant FROM far.customers WHERE cname <> 'acme') FROM far.orders ORDER BY id");
-	auto transport = EACH_TRANSPORT();
-	INFO(TransportName(transport));
-	Twin twin(transport);
+	Twin twin;
 	twin.Seed();
 
 	twin.Same(sql);
@@ -333,9 +293,7 @@ TEST_CASE("a correlated subquery over one source's tables is one query on the so
 	    "SELECT id FROM far.orders o WHERE tenant NOT IN (SELECT tenant FROM far.customers c WHERE c.tenant < o.amt) "
 	    "ORDER BY id",
 	    "SELECT id, (SELECT cname FROM far.customers c WHERE c.tenant = o.tenant) FROM far.orders o ORDER BY id");
-	auto transport = EACH_TRANSPORT();
-	INFO(TransportName(transport));
-	Twin twin(transport);
+	Twin twin;
 	twin.Seed();
 
 	twin.Same(sql);
@@ -345,9 +303,7 @@ TEST_CASE("a correlated subquery over one source's tables is one query on the so
 }
 
 TEST_CASE("a correlated NOT IN answers each outer row by its own group's NULLs", "[pushdown]") {
-	auto transport = EACH_TRANSPORT();
-	INFO(TransportName(transport));
-	Twin twin(transport);
+	Twin twin;
 	twin.Seed();
 
 	twin.Same("SELECT id FROM far.orders o WHERE name NOT IN (SELECT i.name FROM far.orders i WHERE i.amt < o.amt) "
@@ -359,9 +315,7 @@ TEST_CASE("a correlated NOT IN answers each outer row by its own group's NULLs",
 }
 
 TEST_CASE("a correlated scalar matching several rows fails as the source would", "[pushdown]") {
-	auto transport = EACH_TRANSPORT();
-	INFO(TransportName(transport));
-	Twin twin(transport);
+	Twin twin;
 	twin.Seed();
 
 	REQUIRE_THAT(
@@ -370,9 +324,7 @@ TEST_CASE("a correlated scalar matching several rows fails as the source would",
 }
 
 TEST_CASE("a correlated scalar stays on a target that does not raise the multi-row error", "[pushdown]") {
-	auto transport = EACH_TRANSPORT();
-	INFO(TransportName(transport));
-	Twin twin(transport);
+	Twin twin;
 	twin.Seed();
 	twin.Query("SET scalar_subquery_error_on_multiple_rows = false");
 
@@ -384,9 +336,7 @@ TEST_CASE("a correlated scalar stays on a target that does not raise the multi-r
 }
 
 TEST_CASE("a correlated subquery over a table the target holds keeps the join on the target", "[pushdown]") {
-	auto transport = EACH_TRANSPORT();
-	INFO(TransportName(transport));
-	Twin twin(transport);
+	Twin twin;
 	twin.Seed();
 	twin.Both("CREATE TABLE regions(tenant INTEGER)");
 	twin.Both("INSERT INTO regions VALUES (2), (3)");
@@ -399,9 +349,7 @@ TEST_CASE("a correlated subquery over a table the target holds keeps the join on
 }
 
 TEST_CASE("a correlated subquery with a filter the source refuses reads each side apart", "[pushdown]") {
-	auto transport = EACH_TRANSPORT();
-	INFO(TransportName(transport));
-	Twin twin(transport);
+	Twin twin;
 	twin.store->refused_functions.insert("upper");
 	twin.Seed();
 
@@ -423,9 +371,7 @@ TEST_CASE("a CTE over one source's tables is one query on the source", "[pushdow
 	             "id > 2) SELECT x.id FROM x JOIN y ON x.id = y.id ORDER BY x.id",
 	             "WITH v(t) AS MATERIALIZED (VALUES (1), (2)) "
 	             "SELECT o.id FROM far.orders o JOIN v a ON o.tenant = a.t JOIN v e ON o.id = e.t ORDER BY o.id");
-	auto transport = EACH_TRANSPORT();
-	INFO(TransportName(transport));
-	Twin twin(transport);
+	Twin twin;
 	twin.Seed();
 
 	twin.Same(sql);
@@ -434,9 +380,7 @@ TEST_CASE("a CTE over one source's tables is one query on the source", "[pushdow
 }
 
 TEST_CASE("a CTE reference to a sample reads the same rows every time", "[pushdown]") {
-	auto transport = EACH_TRANSPORT();
-	INFO(TransportName(transport));
-	Twin twin(transport);
+	Twin twin;
 	twin.Seed();
 
 	auto result = twin.Query("WITH x AS MATERIALIZED (SELECT id FROM far.orders USING SAMPLE 2) "
@@ -447,10 +391,8 @@ TEST_CASE("a CTE reference to a sample reads the same rows every time", "[pushdo
 }
 
 TEST_CASE("an order inside a CTE's body comes back in order across partitions", "[pushdown]") {
-	auto transport = EACH_TRANSPORT();
-	INFO(TransportName(transport));
-	Twin twin(transport);
-	twin.store->read_partitions = 4;
+	Twin twin;
+	twin.store->streams = 4;
 	twin.Seed();
 
 	twin.Same("WITH x AS MATERIALIZED (SELECT id FROM far.orders) SELECT a.id FROM x a JOIN x e ON a.id = e.id "
@@ -462,9 +404,9 @@ TEST_CASE("an order inside a CTE's body comes back in order across partitions", 
 
 TEST_CASE("a limit under a correlated subquery crosses whichever comparison it uses", "[pushdown]") {
 	auto comparison = GENERATE(as<string> {}, "=", ">");
-	auto transport = EACH_TRANSPORT();
-	INFO(TransportName(transport) << " " << comparison);
-	Twin twin(transport);
+	INFO(""
+	     << " " << comparison);
+	Twin twin;
 	twin.Seed();
 
 	twin.Same("SELECT id FROM (SELECT * FROM far.orders ORDER BY id LIMIT 3) o WHERE EXISTS (SELECT 1 FROM "
@@ -475,9 +417,7 @@ TEST_CASE("a limit under a correlated subquery crosses whichever comparison it u
 }
 
 TEST_CASE("stacked correlated subqueries read each table use once", "[pushdown]") {
-	auto transport = EACH_TRANSPORT();
-	INFO(TransportName(transport));
-	Twin twin(transport);
+	Twin twin;
 	twin.Seed();
 
 	twin.Same("SELECT id FROM far.orders o WHERE EXISTS (SELECT 1 FROM far.customers c WHERE c.tenant > o.tenant) "
@@ -498,9 +438,7 @@ TEST_CASE("a correlated count and a lateral are one query on the source", "[push
 	    "SELECT id, (SELECT count(*) FROM far.customers c WHERE c.tenant > o.tenant) FROM far.orders o ORDER BY id",
 	    "SELECT o.id, l.n FROM far.orders o, LATERAL (SELECT count(*) AS n FROM far.customers c WHERE c.tenant > "
 	    "o.tenant) l ORDER BY o.id");
-	auto transport = EACH_TRANSPORT();
-	INFO(TransportName(transport));
-	Twin twin(transport);
+	Twin twin;
 	twin.Seed();
 
 	twin.Same(sql);
@@ -509,9 +447,7 @@ TEST_CASE("a correlated count and a lateral are one query on the source", "[push
 }
 
 TEST_CASE("a join with a table the target holds keeps the join on the target", "[pushdown]") {
-	auto transport = EACH_TRANSPORT();
-	INFO(TransportName(transport));
-	Twin twin(transport);
+	Twin twin;
 	twin.Seed();
 	twin.Both("CREATE TABLE regions(tenant INTEGER, region VARCHAR)");
 	twin.Both("INSERT INTO regions VALUES (1, 'north'), (2, 'south')");
@@ -527,9 +463,7 @@ TEST_CASE("a join with a table the target holds keeps the join on the target", "
 }
 
 TEST_CASE("two attaches of one source type are two sources that never share a query", "[pushdown]") {
-	auto transport = EACH_TRANSPORT();
-	INFO(TransportName(transport));
-	Twin twin(transport);
+	Twin twin;
 	twin.Seed();
 	twin.Attach("second", "b");
 
@@ -544,9 +478,7 @@ TEST_CASE("two attaches of one source type are two sources that never share a qu
 }
 
 TEST_CASE("expressions the source knows cross inside filters and projections", "[pushdown]") {
-	auto transport = EACH_TRANSPORT();
-	INFO(TransportName(transport));
-	Twin twin(transport);
+	Twin twin;
 	twin.Seed();
 
 	twin.Same("SELECT id FROM far.orders WHERE name IS NULL OR score IS NULL ORDER BY id");
@@ -577,9 +509,7 @@ TEST_CASE("expressions the source knows cross inside filters and projections", "
 }
 
 TEST_CASE("an operator the source refuses stays, with everything above it", "[pushdown]") {
-	auto transport = EACH_TRANSPORT();
-	INFO(TransportName(transport));
-	Twin twin(transport);
+	Twin twin;
 	twin.store->refused_operators.push_back(Op::LOGICAL_AGGREGATE_AND_GROUP_BY);
 	twin.Seed();
 
@@ -593,9 +523,7 @@ TEST_CASE("an operator the source refuses stays, with everything above it", "[pu
 }
 
 TEST_CASE("a volatile function never crosses", "[pushdown]") {
-	auto transport = EACH_TRANSPORT();
-	INFO(TransportName(transport));
-	Twin twin(transport);
+	Twin twin;
 	twin.Seed();
 
 	twin.Same("SELECT id FROM far.orders WHERE random() >= 0 ORDER BY id");
@@ -606,9 +534,7 @@ TEST_CASE("a volatile function never crosses", "[pushdown]") {
 }
 
 TEST_CASE("a type the source refuses keeps the expression carrying it on the target", "[pushdown]") {
-	auto transport = EACH_TRANSPORT();
-	INFO(TransportName(transport));
-	Twin twin(transport);
+	Twin twin;
 	twin.store->refused_types.push_back(LogicalTypeId::UUID);
 	twin.Seed();
 
@@ -619,9 +545,7 @@ TEST_CASE("a type the source refuses keeps the expression carrying it on the tar
 }
 
 TEST_CASE("an expression kind crossing never moves stays without asking the source", "[pushdown]") {
-	auto transport = EACH_TRANSPORT();
-	INFO(TransportName(transport));
-	Twin twin(transport);
+	Twin twin;
 	twin.Seed();
 
 	twin.Same("SELECT list_transform(l, lambda x: x + 1) FROM far.types_t");
@@ -631,9 +555,7 @@ TEST_CASE("an expression kind crossing never moves stays without asking the sour
 }
 
 TEST_CASE("every type crosses and comes back as itself", "[pushdown]") {
-	auto transport = EACH_TRANSPORT();
-	INFO(TransportName(transport));
-	Twin twin(transport);
+	Twin twin;
 	twin.Seed();
 
 	twin.Same("SELECT * FROM far.types_t");
@@ -646,9 +568,7 @@ TEST_CASE("every type crosses and comes back as itself", "[pushdown]") {
 }
 
 TEST_CASE("set operations, distinct, subqueries and CTEs over one source cross", "[pushdown]") {
-	auto transport = EACH_TRANSPORT();
-	INFO(TransportName(transport));
-	Twin twin(transport);
+	Twin twin;
 	twin.Seed();
 
 	twin.Same("SELECT DISTINCT tenant FROM far.orders ORDER BY tenant");
@@ -669,9 +589,7 @@ TEST_CASE("set operations, distinct, subqueries and CTEs over one source cross",
 }
 
 TEST_CASE("a sample that crosses returns the asked-for number of the source's rows", "[pushdown]") {
-	auto transport = EACH_TRANSPORT();
-	INFO(TransportName(transport));
-	Twin twin(transport);
+	Twin twin;
 	twin.Seed();
 
 	auto sampled = twin.Query("SELECT id FROM far.orders USING SAMPLE 3 ROWS");
@@ -688,9 +606,7 @@ TEST_CASE("a sample that crosses returns the asked-for number of the source's ro
 }
 
 TEST_CASE("a column-free query still reads the source once per row", "[pushdown]") {
-	auto transport = EACH_TRANSPORT();
-	INFO(TransportName(transport));
-	Twin twin(transport);
+	Twin twin;
 	twin.Seed();
 
 	twin.Same("SELECT 1 FROM far.orders");
@@ -700,11 +616,9 @@ TEST_CASE("a column-free query still reads the source once per row", "[pushdown]
 
 TEST_CASE("a join the source runs, read by an expression only the target computes, keeps both sides' columns",
           "[pushdown]") {
-	auto transport = EACH_TRANSPORT();
-	INFO(TransportName(transport));
 	auto from = GENERATE(as<string> {}, "(SELECT 2 AS id, 'z' AS n) s", "(VALUES (2, 'z')) s(id, n)");
 	INFO(from);
-	Twin twin(transport);
+	Twin twin;
 	twin.store->refused_functions.insert("upper");
 	twin.Seed();
 
@@ -712,9 +626,7 @@ TEST_CASE("a join the source runs, read by an expression only the target compute
 }
 
 TEST_CASE("a VALUES row calling a function only the target has stays on the target", "[pushdown]") {
-	auto transport = EACH_TRANSPORT();
-	INFO(TransportName(transport));
-	Twin twin(transport);
+	Twin twin;
 	twin.Seed();
 	// Volatile, so crossing does not turn the VALUES list into rows.
 	ScalarFunction near_only(

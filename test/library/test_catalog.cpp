@@ -67,7 +67,7 @@ bool RefreshReturnsWhileHeld(HeldCall &held, const std::function<void()> &refres
 } // namespace
 
 TEST_CASE("the attached path reaches the source and never becomes a file", "[catalog]") {
-	Twin twin(Transport::NATIVE);
+	Twin twin;
 	twin.Seed();
 	string path = "fardb_attach_path_is_not_a_file.db";
 
@@ -78,7 +78,7 @@ TEST_CASE("the attached path reaches the source and never becomes a file", "[cat
 }
 
 TEST_CASE("the catalog lists the source's schemas and tables and nothing else", "[catalog]") {
-	Twin twin(Transport::NATIVE);
+	Twin twin;
 	twin.Far("CREATE SCHEMA aux");
 	twin.Far("CREATE TABLE aux.side(x INTEGER)");
 	twin.Seed();
@@ -95,7 +95,7 @@ TEST_CASE("the catalog lists the source's schemas and tables and nothing else", 
 }
 
 TEST_CASE("a table added after attach appears once the attach is refreshed", "[catalog]") {
-	Twin twin(Transport::NATIVE);
+	Twin twin;
 	twin.Seed();
 	twin.Query("SELECT * FROM far.orders");
 
@@ -114,7 +114,7 @@ TEST_CASE("a table added after attach appears once the attach is refreshed", "[c
 }
 
 TEST_CASE("refreshing one schema relists only that schema", "[catalog]") {
-	Twin twin(Transport::NATIVE);
+	Twin twin;
 	twin.Far("CREATE SCHEMA aux");
 	twin.Seed();
 	twin.Query("SELECT count(*) FROM duckdb_tables() WHERE database_name = 'far'");
@@ -130,7 +130,7 @@ TEST_CASE("refreshing one schema relists only that schema", "[catalog]") {
 }
 
 TEST_CASE("a refresh does not wait for a schema listing in progress, and the next lookup relists", "[catalog]") {
-	Twin twin(Transport::NATIVE);
+	Twin twin;
 	twin.Seed();
 	auto &attach = AttachedAs(twin, "far");
 	attach.Refresh();
@@ -149,7 +149,7 @@ TEST_CASE("a refresh does not wait for a schema listing in progress, and the nex
 
 TEST_CASE("a schema refresh does not wait for a description in progress, and the next lookup redescribes",
           "[catalog]") {
-	Twin twin(Transport::NATIVE);
+	Twin twin;
 	twin.Seed();
 	auto &attach = AttachedAs(twin, "far");
 	HeldCall held(*twin.store, "describe");
@@ -166,7 +166,7 @@ TEST_CASE("a schema refresh does not wait for a description in progress, and the
 }
 
 TEST_CASE("a description is taken once per table for the life of the attach", "[catalog]") {
-	Twin twin(Transport::NATIVE);
+	Twin twin;
 	twin.Seed();
 
 	twin.Query("SELECT id FROM far.orders");
@@ -183,7 +183,7 @@ TEST_CASE("a description is taken once per table for the life of the attach", "[
 }
 
 TEST_CASE("schema and table names resolve regardless of case", "[catalog]") {
-	Twin twin(Transport::NATIVE);
+	Twin twin;
 	twin.Seed();
 
 	twin.Same("SELECT count(*) FROM far.MAIN.orders", "SELECT count(*) FROM main.orders");
@@ -192,7 +192,7 @@ TEST_CASE("schema and table names resolve regardless of case", "[catalog]") {
 }
 
 TEST_CASE("nothing can be created in a served schema that does not declare create", "[catalog]") {
-	Twin twin(Transport::NATIVE);
+	Twin twin;
 	twin.store->schema_verbs["main"] = {};
 	twin.Seed();
 
@@ -207,7 +207,7 @@ TEST_CASE("nothing can be created in a served schema that does not declare creat
 }
 
 TEST_CASE("served tables that do not declare drop or alter cannot be dropped or altered", "[catalog]") {
-	Twin twin(Transport::NATIVE);
+	Twin twin;
 	twin.store->verbs["orders"] = {CrossingVerb::SELECT};
 	twin.Seed();
 
@@ -220,7 +220,7 @@ TEST_CASE("served tables that do not declare drop or alter cannot be dropped or 
 }
 
 TEST_CASE("a detached source is told, and is gone", "[catalog]") {
-	Twin twin(Transport::NATIVE);
+	Twin twin;
 	twin.Seed();
 	twin.Query("SELECT count(*) FROM far.orders");
 
@@ -233,7 +233,7 @@ TEST_CASE("a detached source is told, and is gone", "[catalog]") {
 }
 
 TEST_CASE("two attaches on one connection are two sources", "[catalog]") {
-	Twin twin(Transport::NATIVE);
+	Twin twin;
 	twin.Seed();
 	twin.Attach("two", "b");
 
@@ -245,7 +245,7 @@ TEST_CASE("two attaches on one connection are two sources", "[catalog]") {
 }
 
 TEST_CASE("the attach lists the source lazily, not at ATTACH", "[catalog]") {
-	Twin twin(Transport::NATIVE);
+	Twin twin;
 	twin.Seed();
 
 	REQUIRE(twin.store->listings.empty());
