@@ -16,6 +16,8 @@ struct SubtreeLabel {
 	bool runs_anywhere = false;
 	//! CTEs a ref inside names but nothing inside defines. A subtree with any is never folded on its own.
 	set<TableIndex> open;
+	//! A scan inside already takes rows from the target. One crossing takes one seam, so two never merge.
+	bool holds_seam = false;
 };
 
 using SubtreeLabels = unordered_map<LogicalOperator *, SubtreeLabel>;

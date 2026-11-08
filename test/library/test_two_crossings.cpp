@@ -3,10 +3,9 @@
 using namespace duckdb;
 
 TEST_CASE("two crossings on one instance each read only their own source", "[two_crossings]") {
-	auto transport = EACH_TRANSPORT();
 	auto other_first = GENERATE(false, true);
-	INFO(TransportName(transport) << (other_first ? " other first" : " far first"));
-	Pair pair(transport, other_first);
+	INFO("" << (other_first ? " other first" : " far first"));
+	Pair pair(other_first);
 	pair.Seed();
 
 	REQUIRE(pair.Query("SELECT count(*) FROM far.t")->GetValue(0, 0) == Value::BIGINT(2));
@@ -19,10 +18,9 @@ TEST_CASE("two crossings on one instance each read only their own source", "[two
 }
 
 TEST_CASE("two crossings on one instance each write only their own source", "[two_crossings]") {
-	auto transport = EACH_TRANSPORT();
 	auto other_first = GENERATE(false, true);
-	INFO(TransportName(transport) << (other_first ? " other first" : " far first"));
-	Pair pair(transport, other_first);
+	INFO("" << (other_first ? " other first" : " far first"));
+	Pair pair(other_first);
 	pair.Seed();
 
 	pair.Query("INSERT INTO far.t VALUES (9, 90)");

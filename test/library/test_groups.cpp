@@ -19,8 +19,7 @@ constexpr const char *FAR_JOIN_SQL = "SELECT o.id, c.cname FROM orders o JOIN cu
 } // namespace
 
 TEST_CASE("a join of two attaches in one group is one read", "[groups]") {
-	auto transport = EACH_TRANSPORT();
-	Twin twin(transport);
+	Twin twin;
 	twin.Seed();
 	AttachPair(twin, "g", "g");
 	twin.store->reads.clear();
@@ -32,10 +31,10 @@ TEST_CASE("a join of two attaches in one group is one read", "[groups]") {
 }
 
 TEST_CASE("a join of attaches outside one group reads each apart", "[groups]") {
-	auto transport = EACH_TRANSPORT();
 	auto groups = GENERATE(std::make_pair("", ""), std::make_pair("g", ""), std::make_pair("g", "h"));
-	INFO(TransportName(transport) << " groups '" << groups.first << "' '" << groups.second << "'");
-	Twin twin(transport);
+	INFO(""
+	     << " groups '" << groups.first << "' '" << groups.second << "'");
+	Twin twin;
 	twin.Seed();
 	AttachPair(twin, groups.first, groups.second);
 	twin.store->reads.clear();
@@ -49,9 +48,7 @@ TEST_CASE("a join of attaches outside one group reads each apart", "[groups]") {
 }
 
 TEST_CASE("a correlated subquery across attaches in one group is one read", "[groups]") {
-	auto transport = EACH_TRANSPORT();
-	INFO(TransportName(transport));
-	Twin twin(transport);
+	Twin twin;
 	twin.Seed();
 	AttachPair(twin, "g", "g");
 	twin.store->reads.clear();
@@ -64,9 +61,7 @@ TEST_CASE("a correlated subquery across attaches in one group is one read", "[gr
 }
 
 TEST_CASE("a correlated subquery across attaches outside one group reads each apart", "[groups]") {
-	auto transport = EACH_TRANSPORT();
-	INFO(TransportName(transport));
-	Twin twin(transport);
+	Twin twin;
 	twin.Seed();
 	AttachPair(twin, "", "");
 	twin.store->reads.clear();
@@ -79,8 +74,7 @@ TEST_CASE("a correlated subquery across attaches outside one group reads each ap
 }
 
 TEST_CASE("a view over attaches in one group is accepted", "[groups][view]") {
-	auto transport = EACH_TRANSPORT();
-	Twin twin(transport);
+	Twin twin;
 	twin.Seed();
 	AttachPair(twin, "g", "g");
 
@@ -96,8 +90,7 @@ TEST_CASE("a view over attaches in one group is accepted", "[groups][view]") {
 }
 
 TEST_CASE("a view whose body is outside the owner's group is refused", "[groups][view]") {
-	auto transport = EACH_TRANSPORT();
-	Twin twin(transport);
+	Twin twin;
 	twin.Seed();
 	AttachPair(twin, "g", "h");
 
@@ -126,8 +119,7 @@ constexpr const char *FAR_CATALOGS_JOIN_SQL =
 } // namespace
 
 TEST_CASE("a join across catalogs of one group reads each table from its own catalog", "[groups]") {
-	auto transport = EACH_TRANSPORT();
-	Twin twin(transport);
+	Twin twin;
 	twin.Seed();
 	SeedSecondCatalog(twin);
 	twin.store->reads.clear();
@@ -143,13 +135,11 @@ TEST_CASE("a join across catalogs of one group reads each table from its own cat
 	}
 	std::sort(catalogs.begin(), catalogs.end());
 	REQUIRE(catalogs == vector<string> {"far2", "memory"});
-	if (transport == Transport::SUBSTRAIT) {
-		REQUIRE(read.wire.find("[\"far2\",\"main\",\"customers\"]") != string::npos);
-	}
+	REQUIRE(read.wire.find("[\"far2\",\"main\",\"customers\"]") != string::npos);
 }
 
 TEST_CASE("a view across catalogs of one group reads each table from its own catalog", "[groups][view]") {
-	Twin twin(Transport::SUBSTRAIT);
+	Twin twin;
 	twin.Seed();
 	SeedSecondCatalog(twin);
 
@@ -159,7 +149,7 @@ TEST_CASE("a view across catalogs of one group reads each table from its own cat
 }
 
 TEST_CASE("the receiver's catalog check refuses a plan naming a catalog", "[groups]") {
-	Twin twin(Transport::SUBSTRAIT);
+	Twin twin;
 	twin.Seed();
 	SeedSecondCatalog(twin);
 	twin.store->catalog_check = [](const string &catalog) {
@@ -181,10 +171,9 @@ TEST_CASE("floors in different catalogs are different floors", "[groups]") {
 }
 
 TEST_CASE("a join after a write in a transaction reads through the written attach", "[groups][transaction]") {
-	auto transport = EACH_TRANSPORT();
 	auto written_first = GENERATE(false, true);
-	INFO(TransportName(transport) << (written_first ? " written attach first" : " written attach second"));
-	Twin twin(transport);
+	INFO("" << (written_first ? " written attach first" : " written attach second"));
+	Twin twin;
 	twin.Seed();
 	SeedSecondCatalog(twin);
 	auto sql = written_first

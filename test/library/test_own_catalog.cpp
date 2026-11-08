@@ -14,7 +14,7 @@ struct Own {
 	DuckDB near;
 	Connection con;
 
-	Own() : store(make_shared_ptr<FarStore>(Transport::NATIVE)), near(nullptr), con(near) {
+	Own() : store(make_shared_ptr<FarStore>()), near(nullptr), con(near) {
 		ExtensionLoader loader(*near.instance, "owndb");
 		own::OwnCatalog::Register(loader, store);
 		Far("CREATE TABLE t(id INTEGER PRIMARY KEY, v INTEGER)");
@@ -31,7 +31,6 @@ struct Own {
 
 	unique_ptr<TestResult> Query(const string &sql) {
 		auto result = Collected(con.Query(sql));
-		store->JoinArrivals();
 		if (result->HasError()) {
 			FAIL(sql + "\n" + result->GetError());
 		}
@@ -66,7 +65,7 @@ TEST_CASE("a catalog of its own reaches its source type through the attach", "[o
 	own.con.Commit();
 
 	auto &attach = CrossingAttach::Of(attached.GetCatalog());
-	REQUIRE(attach.Source<FarSource>().Tables("main") == vector<string> {"t"});
+	REQUIRE(attach.Source().Tables("main") == vector<string> {"t"});
 }
 
 TEST_CASE("create index in a catalog of its own is refused and the connection survives",

@@ -1,410 +1,140 @@
 # Implementing a source
 
-Crossing moves part of a DuckDB query onto another database. You write one plain
-type; it becomes attachable:
+Crossing moves part of a DuckDB query onto another DuckDB. A source says what it has and moves frames between the two:
 
 ```sql
 ATTACH 'toy.example.com' AS toy (TYPE toydb);
 SELECT upper(name) FROM toy.orders WHERE amt > 100 LIMIT 10;
 ```
 
-## Interface
+Near is the DuckDB attaching the source, far the DuckDB behind it. `crossing[a | B | c]` is one operator on near and ordinary pipelines `a | B | c` on far, with streams between them. DuckDB runs both sides: its threads, its ordering and its waiting. The source never sees a thread count.
+
+## Near: the source
 
 ```cpp
-struct ToyDB {
-	using Session = ToySession;
-
-	vector<string> Schemas();
-	vector<string> Tables(const string &schema);
-	CrossingTable Describe(const string &schema, const string &name);
-	CrossingSchema DescribeSchema(const string &schema);
-	CrossingPlan Plan(const CrossingPlanRequest &request);
-
-	CrossingVerdict AcceptsCall(const Expression &expr);
-	CrossingVerdict AcceptsType(const LogicalType &type);
-	CrossingVerdict AcceptsOperator(const LogicalOperator &op);
-
-	unique_ptr<Session> Begin(ClientContext &context);
-	void Detach(ClientContext &context);
-	const void *Group();
+class ToyDB : public CrossingSource {
+public:
+	vector<string> Tables(const string &schema) override;
+	CrossingTable Describe(const string &schema, const string &name) override;
+	unique_ptr<CrossingLink> Connect(ClientContext &context) override;
 };
 
-struct ToySession {
-	CrossingScan Read(ClientContext &context, const CrossingQuery &query);
-	CrossingWriter Write(ClientContext &context, const CrossingQuery &query);
-	void Ddl(ClientContext &context, const CrossingDdl &ddl);
-	vector<string> Tables(const string &schema);
-	CrossingTable Describe(const string &schema, const string &name);
-	void Commit();
-	void Rollback();
-};
-```
-
-No base class. `Crossing<ToyDB>` finds members by name. Required: `Session`,
-`Tables`, `Describe`, `Plan`, `Begin`, `Session::Read`. Optional, with the
-default when absent:
-
-| member | absent |
-|---|---|
-| `Schemas` | one schema, `main` |
-| `DescribeSchema` | no schema allows `CREATE` |
-| `AcceptsCall` | no function, operator, aggregate or window crosses |
-| `AcceptsType` | no expression crosses except a bare reference to a described column |
-| `AcceptsOperator` | every operator accepted |
-| `Detach` | nothing |
-| `Group` | the source is its own group |
-| `Session::Write` | no table may declare a write verb; one that does is refused at first use |
-| `Session::Ddl` | no table may declare `ALTER` or `DROP`, no schema `CREATE`; one that does is refused at first use |
-| `Session::Tables`, `Session::Describe` | the source's `Tables` and `Describe` |
-| `Session::Commit`, `Session::Rollback` | nothing |
-
-Members must be public. Neither type may be `final`. A member with the right name
-and the wrong signature fails to compile with the member, the signature wanted
-and the return type found. `test/contract/` holds wrong sources; `CMakeLists.txt`
-holds the message each must produce.
-
-A source may instead derive from `CrossingSource` and `CrossingSession` directly.
-
-## Describe
-
-Asked once per table, on first use, and kept until the attach or schema is refreshed.
-A lookup under a different `owner` asks again.
-
-```cpp
-CrossingTable ToyDB::Describe(const string &schema, const string &name) {
-	CrossingTable table;
-	table.name = name;
-	table.Column("id", LogicalType::INTEGER);
-	table.Column("amt", LogicalType::INTEGER);
-	table.key = {"id"};
-	table.verbs = {CrossingVerb::SELECT, CrossingVerb::INSERT, CrossingVerb::UPDATE};
-	return table;
-}
-```
-
-- `column_names` / `column_types` — in order. Every column position in a query
-  means this order.
-- `key` — columns that identify a row. Without one, an update or delete that
-  reads its rows, or a `MERGE` that updates or deletes, is a `BinderException`.
-  See `CrossingTable::key_unique`.
-- `verbs` — the only source of what a table allows; see `CrossingTable::verbs`.
-  `ALTER` and `DROP` go through `Session::Ddl`.
-- `constraints` — constraints the source enforces.
-
-`DescribeSchema(schema)` returns a `CrossingSchema` the same way; `CREATE`
-lives there, since the table does not exist yet. Asked once per schema and
-kept until the schema is refreshed.
-
-## Ddl
-
-```cpp
-void ToySession::Ddl(ClientContext &, const CrossingDdl &ddl) {
-	switch (ddl.verb) {
-	case CrossingVerb::CREATE:  ToyCreate(conn, *ddl.create); break;
-	case CrossingVerb::ALTER:   ToyAlter(conn, *ddl.alter); break;
-	default:                    ToyDrop(conn, *ddl.drop); break;
-	}
-}
-```
-
-`CREATE TABLE`, `ALTER TABLE` and `DROP TABLE` on a served schema or table
-arrive as DuckDB's parsed `CreateInfo`, `AlterInfo` or `DropInfo`, in the
-session of the statement's transaction. The verb is checked against
-`DescribeSchema` or `Describe` first; the source is never asked about a verb it
-did not declare. After the call the schema is listed and described again
-through `Session::Tables` and `Session::Describe` for the rest of that
-transaction, so the transaction sees its own uncommitted DDL and no other
-transaction's; once it commits or rolls back the schema is listed again through
-the source. Indexes, sequences and schemas themselves are never created
-through crossing.
-
-`CREATE VIEW` is a `CREATE` whose `ddl.create` is a `CreateViewInfo` and whose
-`ddl.plan` is the body, planned and folded as a read: floors only, the same plan
-`Session::Read` would get. A body that does not fold wholly onto the source is
-refused before the source is asked. The plan's columns are
-`CrossingViewColumnNames(view)`, in order; rendered Substrait names them `c0`,
-`c1`, ... A source that stores views as SQL renders the plan rather than reusing
-`view.query`, which names the target's catalog: `DecodeSubstraitView` gives the
-body as a query with its columns named. A source that serves views lists and describes them as tables;
-`DROP VIEW` and `CREATE OR REPLACE VIEW` need `DROP` on the described view.
-A `CREATE` with no `ddl.plan` is a table.
-
-`CREATE TABLE ... AS` is a `CREATE` followed by an `INSERT` of the gathered
-rows into the new table, so it needs `CREATE` on the schema and `INSERT` on
-the table the source then describes. The rows are always gathered on the
-target.
-
-## Plan
-
-Asked once per read scan and once per write operator (`MERGE` plans once per
-action).
-
-```cpp
-CrossingPlan ToyDB::Plan(const CrossingPlanRequest &request) {
-	if (request.verb == CrossingVerb::SELECT) {
-		return CrossingPlan::Of(MakeFloorNode(0, request.schema, request.table, names, types));
-	}
-	return CrossingPlan::Of(MakeSeamNode(0, request.seam.types));
-}
-```
-
-- `SELECT` — a floor: the table named, emitting one column per described
-  column, in order. Crossed work is stacked on it; it is still there in `Read`.
-  Row filtering may be stacked on the floor here.
-- Write — a seam node: where the rows go, with the columns of `request.seam`;
-  see `CrossingSeam`. A delete that reads nothing gets no write `Plan`.
-- `CrossingPlan::Declined(reason)` refuses; the reason is in the error.
-- The plan names tables and never scans them; see `RequirePlaceholderScans` in
-  `src/crossing_read.cpp`. Bind the table where the plan runs: `BindFloors` in
-  `Read`, `ExecuteWrite` in `Write`. `FloorOf(node)` returns the schema and
-  table named.
-- Table indices you use are yours; crossing remaps them.
-
-## Accepts
-
-Each returns `CrossingVerdict::Yes()` or `No(reason)`. A no keeps the operator
-carrying it on the target.
-
-- `AcceptsCall` — asked per call, operator, aggregate and window expression.
-  Column refs, constants, comparisons, `AND`/`OR`, casts, `BETWEEN`, `CASE`,
-  `UNNEST` pass without asking. Lambdas, volatile and inconsistent expressions
-  never cross.
-- `AcceptsType` — asked about the type of every expression that would move,
-  except a bare reference to a described column.
-- `AcceptsOperator` — asked per operator after its expressions passed, except
-  `CHUNK_GET` and `EMPTY_RESULT`, which are never asked about. A subquery
-  is asked about as the operators DuckDB plans it to, such as `MARK` and `SINGLE`
-  joins and materialized CTEs. A CTE ref is asked about only when its definition
-  reads no source. A yes on a `SINGLE` join claims the source raises the multi-row
-  error. While the target's `scalar_subquery_error_on_multiple_rows` is off, a
-  `SINGLE` join is not asked about: it stays on the target in a read or write, and
-  `CREATE VIEW` refuses a body holding one. A view is judged only when created, so
-  turning the setting off later leaves its join on the source.
-
-A yes claims the source computes the expression as DuckDB does.
-
-## Group
-
-Attaches whose sources return one non-null `Group()` cross together: a join or
-view body over them folds into one fragment, carried by its first scan. See
-`CrossingSource::Group` for what a group promises. A view's body must be in the
-group of the attach that holds the view.
-
-The fragment is read through one attach's session, so each floor must say where
-its table lives: pass `catalog` to `MakeFloorNode` when the group spans
-catalogs. Substrait then names the table `[catalog, schema, table]`, and
-`BindFloors` binds it there instead of in the receiver's catalog. A receiver
-decoding Substrait checks those catalogs with the `check` argument of
-`DecodeSubstraitJson` / `DecodeSubstraitView`.
-
-For which attach's session reads the fragment, see `ReadingCatalog` in
-`src/crossing_read.cpp`.
-
-## Read
-
-```cpp
-CrossingScan ToySession::Read(ClientContext &, const CrossingQuery &query) {
-	auto cursor = make_shared_ptr<ToyCursor>(ToyOpen(conn, query));
-	CrossingScan scan;
-	scan.open = [cursor](ClientContext &, idx_t) -> CrossingReader {
-		return [cursor](ClientContext &, DataChunk &chunk, CrossingWaker) {
-			return ToyFetch(*cursor, chunk) ? CrossingReadResult::Rows() : CrossingReadResult::Done();
-		};
-	};
-	return scan;
-}
-```
-
-`CrossingQuery` is in `include/crossing.hpp`. `query.plan.ToString()` prints the
-plan; `SerializeCrossingPlan(query.plan)` gives bytes.
-
-- Called once per scan operator. The chunk must carry exactly `query.types`.
-  Pull outcomes: see `CrossingReadResult`.
-- `partitions` > 1 lets DuckDB pull with that many threads. Together partitions
-  produce every row once. Claiming, ordering and batch indexes: see `CrossingScan`.
-- `waker.Wake()` may come from any thread. It is idempotent, safe before the pull
-  returns and after the statement ended. Each pull gets its own waker.
-- Scan and readers are destroyed when DuckDB stops asking.
-
-### Running the plan on a DuckDB
-
-```cpp
-auto plan = DeserializeCrossingPlan(context, SerializeCrossingPlan(query.plan));
-BindFloors(context, plan, "mycatalog");
-auto result = SubmitCrossingPlan(context, std::move(plan));
-result->ThrowIfError();
-QueryResultStream<ChunkFormat> stream(std::move(result));
-```
-
-For `SubmitCrossingPlan` and `BindFloors`, see `include/crossing.hpp`. Calling
-`Fetch` on the result itself collects every row first; move it into a
-`QueryResultStream` to stream.
-
-A `CrossingFloorResolver` may stand something else in for a floor, such as a
-subquery with a row filter:
-
-```cpp
-BindFloors(context, plan, "mycatalog", [&](const CrossingFloor &floor) -> unique_ptr<TableRef> {
-	return con.Table("mycatalog", floor.schema, floor.table)->Filter(policy)->GetTableRef();
-});
-```
-
-## Write
-
-```cpp
-CrossingWriter ToySession::Write(ClientContext &, const CrossingQuery &query) {
-	return [this, &query](ClientContext &, CrossingWaker) {
-		return CrossingWriteResult::Done(ToyRun(conn, query));
-	};
-}
-```
-
-- Called once per write operator; not at all when the target gathered no rows.
-  `query` outlives the writer.
-- The plan is the one from `Plan` with the seam filled: by a read of this
-  source's tables when the rows came from it, else by gathered rows.
-  `SeamRowsOf(op)` returns those rows.
-- `Wait()` / `waker.Wake()` as for readers.
-- `Done(n)` is the rows the source changed, which DuckDB reports.
-- `RETURNING` never runs wholly on the source.
-- A write that reads none of its rows: see `CrossingQuery::reads_rows`.
-
-### Running the write on a DuckDB
-
-```cpp
-CrossingWriteTarget target {"mycatalog", query.written.schema, query.written.table, query.kind,
-                            query.key_columns, query.set_columns, query.reads_rows};
-if (query.types.empty()) {
-	return ExecuteWrite(context, target, unique_ptr<TableRef>());
-}
-if (auto rows = SeamRowsOf(query.plan)) {
-	return ExecuteWrite(context, target, SeamRefOfRows(*rows));
-}
-auto plan = DeserializeCrossingPlan(context, SerializeCrossingPlan(query.plan));
-BindFloors(context, plan, "mycatalog");
-return ExecuteWrite(context, target, std::move(plan));
-```
-
-For `ExecuteWrite`, its seam and `CrossingWriteShaper`, see `include/crossing.hpp`.
-Keys match with `IS NOT DISTINCT FROM`.
-
-### Shipping the plan
-
-```cpp
-unique_ptr<LogicalOperator> plan = DeserializeCrossingPlan(context, bytes);
-for (auto &use : CrossingTablesOf(*plan)) { ... }
-```
-
-The receiver is a DuckDB instance of the same commit with
-`RegisterCrossingPlanFunctions(db)` called; `context` has a transaction open.
-
-Rendered as Substrait, a plan can read several seams, each as its own one-part
-table. `SubstraitSeamsOf(plan)` lists each name with its rows. Stage them and
-pass `DecodeSubstraitJson` the view holding each one.
-
-## Transactions
-
-`Begin` is called on a DuckDB transaction's first `Read`, `Write` or `Ddl`. Every
-`Read` and `Write` in that transaction goes through the returned session; when
-the transaction resolves, `Commit` or `Rollback` is called and the session
-destroyed. A `Commit` that throws fails the statement; nothing is undone
-elsewhere. A `Rollback` that throws is discarded.
-
-## Detach
-
-`Detach(context)` runs on `DETACH` from that connection. Open sessions are
-rolled back and destroyed afterwards. The source object is destroyed later.
-
-## Threads
-
-Any member may be called from any thread. Unless stated, calls may overlap with
-each other and themselves.
-
-| call | when |
-|---|---|
-| `Schemas`, `Tables`, `DescribeSchema` | cached per attach or schema, asked again after `Refresh`; serialized per attach; must not re-enter crossing |
-| `Describe` | cached per table, asked again after `Refresh`; serialized per schema; must not re-enter crossing |
-| `Plan`, `Accepts*` | binding and optimization, concurrent across statements |
-| `Begin` | once per transaction, on the thread that first needs the session (the binding thread for `Ddl`); different transactions may overlap; must not re-enter crossing |
-| `Detach` | once, DETACH thread |
-| `Session::Read` | once per scan operator; two scans of one statement may overlap on one session |
-| `CrossingScan::open` | once per partition, by the claiming thread; opens overlap |
-| reader | see `CrossingReader`; partitions run concurrently |
-| `Session::Write` | once per write operator; may repeat per session (`MERGE`) |
-| writer | one thread at a time until `DONE`; thread may change after `WAIT` |
-| `Session::Ddl` | once per DDL statement, on the binding thread; may repeat per session |
-| `Session::Tables`, `Session::Describe` | after `Ddl` in that session, once per schema or table until the next `Ddl` |
-| `Commit`, `Rollback` | once, after every reader and writer returned |
-| `Waker::Wake` | any thread, any time |
-
-## Registering
-
-```cpp
 void ToyExtension::Load(ExtensionLoader &loader) {
-	Crossing<ToyDB>::Register(loader, "toydb", [](ClientContext &, AttachInfo &info) {
+	RegisterCrossing(loader, "toydb", [](ClientContext &, AttachInfo &info) -> unique_ptr<CrossingSource> {
 		return make_uniq<ToyDB>(info.path);
 	});
 }
 ```
 
-`"toydb"` is `ATTACH ... (TYPE toydb)`. `info.path` and `info.options` are
-passed through; the path is never opened as a file. The factory runs once per
-`ATTACH`. Registering installs the storage extension, transaction manager and,
-once per `Crossing<S>` per instance, the optimizer pass. The catalog holds the source's tables
-only; `CREATE TABLE`, `ALTER TABLE`, `DROP TABLE`, `CREATE VIEW` and `DROP VIEW`
-go to the source when the verb is declared, and everything else is refused.
+Optional members, with what happens if you leave them:
 
-### Identity
+| member | default |
+|---|---|
+| `Schemas` | one schema, `main` |
+| `DescribeSchema` | no schema allows `CREATE` |
+| `AcceptsCall` | no function, operator, aggregate or window crosses; casts, comparisons and `BETWEEN` are not asked about |
+| `AcceptsType` | no expression crosses except a bare reference to a described column |
+| `AcceptsOperator` | every operator Substrait can carry crosses |
+| `AcceptsSeam` | no join runs on far over rows near sends |
+| `Group` | the source is its own group |
+| `Detach` | nothing |
+| `DescribeChanged` | `SELECT` and `DROP`, plus `INSERT`, `UPDATE`, `DELETE` and `ALTER` when far's table has a `rowid`, with `RETURNING` allowed; fills in a table this transaction changed, of which far has given the columns and its primary key, unique and not-null constraints. Remove any you do not declare in `Describe`, so a table describes the same before and after DDL |
+| `Planned` | nothing; told of each slice as it is planned, for logging and tests |
 
-`Crossing<S>` is the identity: one address per `Crossing<S>` per loaded copy of
-crossing, compared by address. Every node crossing plants carries it; a pass
-touches only nodes of its own identity. Two extensions each compiling crossing
-in coexist; both passes run on every plan. Build against the same DuckDB commit
-as the extension.
+`Describe` fills in `CrossingTable`: columns in source order, the verbs allowed, whether `RETURNING` is allowed, any constraints far enforces, and whether far's table has a `rowid` (a view has not). A verb left out is refused before the statement runs. Answers are cached per attach until `Refresh`.
 
-### Your own catalog
+Sources with the same `Group` serve one store through one link, so a plan may join their tables. They must answer the `Accepts*` calls alike. A source whose group spans catalogs sets `CrossingTable::catalog`.
 
-`crossing_attach.hpp` gives `CrossingAttach`, one per `ATTACH`: holds the
-source, lists and describes tables, hands out entries, keeps each transaction's
-session.
+## Moving frames: the link
+
+```cpp
+class ToyLink : public CrossingLink {
+public:
+	idx_t Streams() override;
+	unique_ptr<CrossingStream> Open(idx_t id, optional_ptr<CrossingReceiver> receiver) override;
+};
+
+class ToyStream : public CrossingStream {
+public:
+	CrossingIo Send(CrossingFrame &frame, CrossingWaker waker) override;
+	void Close(optional_ptr<const ErrorData> error) override;
+};
+```
+
+- **A link is one far transaction.** `Connect` is called when a transaction first needs far. The link is destroyed after far has answered its commit or rollback. A read-only autocommit statement is the exception: far commits it itself, near waits for no reply, and a later statement in that near transaction connects a new link.
+- **`Streams`** is how many streams a slice may use in each direction. It caps DuckDB's threads on that slice. Only near's end is asked; far uses the number near sends.
+- **`Open(id, receiver)`** gives one end of a stream, and says where to hand what arrives. Both ends open the same id, in either order; hold what arrives before this end opens. `receiver` is null at an end that only sends. Streams are independent, so they can be connections, HTTP/2 streams or anything else.
+- **`Send`** returns `TAKEN` once it no longer needs the frame, `WAIT` when it can't take it yet, or `DONE` when the other end closed without an error. On `WAIT`, call the waker when it may go on; crossing sends the same frame again.
+- **`CrossingReceiver::Deliver`** takes each frame that arrives. Initialize `rows` from the receiver's `Types()` when the frame carries rows. It never waits on the transport, so one thread can deliver everything. `Closed` follows the last frame, with the error the other end closed with.
+- **`Close`** ends this end, and nothing is delivered to it once `Close` returns. A non-null error reaches the other end: `Closed` gets it, and `Send` throws it.
+- **`header`** is crossing's: carry it unread. **`rows`** may be empty, and has no columns on a frame that carries only a header. Encode rows however you like.
+
+`Send` and `Close` are called from any thread, one thread at a time on each end of a stream. `Deliver` is called one at a time for each stream. `Open`, and `Wake` on a waker, may be called from any thread at any time. A waker may fire before the call that was given it returns.
+
+## Far: serving the link
+
+```cpp
+Connection connection(db);
+CrossingFar far(connection, "mycatalog");
+far.Serve(link);
+```
+
+Crossing owns everything on far. `Serve` opens a transaction on `connection`, runs each statement near sends, and returns when near commits, rolls back or closes the link. Run one per link, on its own thread. It blocks. `Cancel` from any thread fails its statement, rolls back and makes it return.
+
+`CrossingFarOptions` takes:
+
+- `floors`: what stands for a table far reads, such as a subquery with a row filter. Its columns are the table's, in order, then `rowid`. An `UPDATE` or `DELETE` reaches only rows it produces, and fails with a clear error if it hides `rowid`. A `MERGE` into a table it replaces is refused. It is asked for a write's target too, with `verb` saying which write; `reads_rows` is false when the write reads nothing of the target's rows (no target column in `WHERE` or `SET`, no subquery, no `RETURNING`), which as in Postgres needs no `SELECT` on the target.
+- `catalogs`: called with each catalog a plan names; throw to refuse the plan.
+
+## What travels
+
+Every plan travels as Substrait, in frame headers. A statement's slices are one Substrait plan with one relation each, and crossing's own operators are extension relations: a seam is an `extensionLeaf`, a write an `extensionSingle`. Far binds them as ordinary statements under one plan on one executor, so slices never collide on the connection.
+
+Whatever Substrait cannot express stays on near.
+
+- **Rows** go through streams as they are produced, and land in an inbox DuckDB's scan reads, on either side. A seam takes every row and spills if it has to, so a sender never waits on far's results. Far's results are held back by what near has not yet read, by DuckDB's own rule for streaming results and its `streaming_buffer_size`. `VALUES` lists inside a slice still travel in the plan's JSON.
+- **Writes** are native statements on far: `UPDATE ... FROM`, `DELETE ... USING`, `MERGE`, `INSERT`, and `CREATE TABLE AS`. When a write's shape cannot be split into target, source and condition, such as a `WHERE` with a subquery, its rows are addressed by far's `rowid`, which holds within the transaction. On a table declared with `row_ids = false`, such a write is refused at bind.
+- **Order:** when row order matters, rows carry batch positions, and the receiving end releases them in order.
+- **DDL** travels as SQL text, and a view's body as Substrait. Crossing asks far what a transaction sees of a schema it changed, then `DescribeChanged` fills in the rest.
+- **Errors:** near does not wait for far to bind. Far closes the statement's streams with the error, keeping its type.
+
+Writes on far run after the statement's reads have finished, and one at a time, so a transaction never scans a table while changing it.
+
+## Transactions
+
+A statement's failure on either side reaches the other: near closes its streams with the error, and far's errors arrive with their type. A commit that fails on far fails the statement. Nothing is undone elsewhere, so commit is not atomic across sources or between near and far.
+
+## What is not supported
+
+- The recursive part of a `WITH RECURSIVE` cannot read a source's table: its far plan runs once per statement, and recursion would need it to run again. This fails with an error.
+
+## Your own catalog
+
+`crossing_attach.hpp` gives `CrossingAttach`, one per `ATTACH`: it holds the source, lists and describes tables, hands out entries, and keeps each transaction's link.
 
 ```cpp
 class MyCatalog : public DuckCatalog, public CrossingAttachOwner {
 	CrossingAttach attach;
-	MyCatalog(AttachedDatabase &db, unique_ptr<ToyDB> source)
-	    : DuckCatalog(db), attach(db, Crossing<ToyDB>::Adapt(std::move(source))) {}
+	MyCatalog(AttachedDatabase &db, unique_ptr<ToyDB> source) : DuckCatalog(db), attach(db, std::move(source)) {}
 	CrossingAttach &Attach() override { return attach; }
 };
 ```
 
-- `LookupTable(schema, owner, name, transaction)`, `ScanTables`, `Described` — entries and
-  descriptions, cached; `Refresh()` / `Refresh(schema)` forget them.
-- `Ddl(context, transaction, owner, ddl)` — checks the verb and runs it in the
-  transaction's session. That transaction reads the schema through its session;
-  the schema is forgotten once it resolves. `DescribedSchema(schema)` is what
-  the schema declares. `PlanCreateTableAs(...)` is what a catalog's own
-  `PlanCreateTableAs` forwards to; `CreateView(context, transaction, owner,
-  info)` what its schema's `CreateView` forwards to.
-- `ServesTable`, `ThrowIfServed`, `ThrowIfSchemaServed` — for a catalog that
-  refuses `DROP`/`ALTER` instead.
-- `Session(context, transaction)`; `Release(transaction)` then
-  `Commit`/`Rollback` on the result, before a base manager frees the
-  `Transaction`; or `Commit(transaction)`/`Rollback(transaction)`.
+- `LookupTable(schema, owner, name, transaction)`, `ScanTables`, `Described`: entries and descriptions, cached. `Refresh()` and `Refresh(schema)` forget them.
+- `Ddl(context, transaction, owner, ddl)` checks the verb and runs it on far in the transaction. `DescribedSchema(schema)` is what the schema declares. `PlanCreateTableAs(...)` and `CreateView(context, transaction, owner, info)` are what a catalog's own methods forward to.
+- `ServesTable`, `ThrowIfServed`, `ThrowIfSchemaServed` are for a catalog that refuses `DROP` or `ALTER`.
+- `Release(transaction)` then `Commit` or `Rollback` on the result, before a base manager frees the `Transaction`; or `Commit(transaction)` and `Rollback(transaction)`.
 - `OnDetach` calls `attach.Detach(context)`.
-- `attach.Source<ToyDB>()` returns the native source.
-- Call `Crossing<ToyDB>::RegisterPass(db)`, or every read and write of a served
-  table fails. Repeat calls do nothing.
+- Call `RegisterCrossingPass(db)`, or every read and write of a served table fails. Repeat calls do nothing. A far database needs `RegisterCrossingFarFunctions`, which `CrossingFar` calls itself.
 
 `test/own_catalog/` is a complete example.
 
-### Building
+## Building
 
 ```cmake
 crossing_add_to_target(toy_extension)
 ```
 
-Adds sources and include path. `crossing_sources` and `crossing_includes` give
-the lists. A source includes `crossing.hpp`. Its own catalog also needs
-`crossing_attach.hpp`. Substrait needs `crossing_substrait.hpp`, whose sources and
-include path come from `crossing_substrait_sources` and `crossing_substrait_includes`.
-Streaming a result needs DuckDB's `duckdb/main/query_result_stream.hpp`.
+Adds the sources and include paths, including Substrait, which also needs DuckDB's `third_party/yyjson/include` on the include path and `libduckdb_yyjson` linked. `crossing_sources` and `crossing_includes` give the lists. A source includes `crossing.hpp` and `crossing_link.hpp`, and a far server `crossing_far.hpp`.
+
+Two extensions each compiling crossing in coexist, each with its own identity. Build against the same DuckDB commit as the extension.

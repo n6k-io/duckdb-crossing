@@ -6,6 +6,7 @@
 #include "internal/crossing_write.hpp"
 #include "internal/fill.hpp"
 #include "internal/pass.hpp"
+#include "internal/shaped_write.hpp"
 
 #include "duckdb/main/settings.hpp"
 #include "duckdb/optimizer/optimizer.hpp"
@@ -46,13 +47,35 @@ void SwapCrossingGetsForTheirNodes(ClientContext &context, unique_ptr<LogicalOpe
 		auto read =
 		    make_uniq<LogicalCrossingRead>(get.table_index, get.GetColumnIds(), get.types, std::move(bind_data));
 		read->SetEstimatedCardinality(cardinality);
+		if (!get.children.empty()) {
+			read->children.push_back(std::move(get.children[0]->children[0]));
+		}
 		node = std::move(read);
 		return;
 	}
+	get.ResolveOperatorTypes();
+	vector<optional_idx> emit;
+	auto add = [&emit](const ColumnIndex &id) {
+		emit.push_back(id.IsVirtualColumn() ? optional_idx() : optional_idx(id.GetPrimaryIndex()));
+	};
+	auto &ids = get.GetColumnIds();
+	if (get.projection_ids.empty()) {
+		for (auto &id : ids) {
+			add(id);
+		}
+	} else {
+		for (auto &position : get.projection_ids) {
+			add(ids[position.GetIndex()]);
+		}
+	}
 	auto bind_data = unique_ptr_cast<FunctionData, CrossingBindData>(std::move(get.bind_data));
-	auto fence = make_uniq<LogicalCrossingFence>(get.table_index, std::move(bind_data));
-	fence->SetEstimatedCardinality(1);
-	node = std::move(fence);
+	auto near_node = make_uniq<LogicalCrossingNear>(get.table_index, get.GetColumnBindings(), get.types,
+	                                                std::move(emit), std::move(bind_data));
+	near_node->SetEstimatedCardinality(1);
+	if (!get.children.empty()) {
+		near_node->children.push_back(std::move(get.children[0]->children[0]));
+	}
+	node = std::move(near_node);
 }
 
 } // namespace
@@ -67,9 +90,12 @@ void CrossingFoldPass(OptimizerExtensionInput &input, unique_ptr<LogicalOperator
 	if (PlanHoldsCrossing(*plan, identity)) {
 		MaterialiseConstantRows(input.context, plan);
 	}
+	RefuseWritesInCtes(*plan, identity);
+	LeaveInsertDefaultsToSource(*plan, identity);
+	NarrowSetsToWhatChanges(*plan, identity);
+	ShapeWrites(input.context, plan, fresh, identity);
 	FillBareWrites(input.context, plan, fresh, identity);
-	ResolveKeyAliases(*plan, identity);
-	AddRowImageForReturning(*plan, identity);
+	ResolveRowIds(*plan, identity);
 	FoldCrossableWorkIntoFragments(plan, fresh, identity,
 	                               Settings::Get<ScalarSubqueryErrorOnMultipleRowsSetting>(input.context));
 	FillWrites(input.context, plan, fresh, identity);

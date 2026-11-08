@@ -47,12 +47,18 @@ vector<string> CrossingViewColumnNames(const CreateViewInfo &view) {
 	return names;
 }
 
-CrossingWriter CrossingSession::Write(ClientContext &, const CrossingQuery &) {
-	throw NotImplementedException("crossing: this source's session has no Write");
+void CrossingSource::DescribeChanged(const string &, CrossingTable &table) {
+	table.returning = true;
+	table.verbs = {CrossingVerb::SELECT, CrossingVerb::DROP};
+	if (table.row_ids) {
+		table.verbs.insert(table.verbs.end(),
+		                   {CrossingVerb::INSERT, CrossingVerb::UPDATE, CrossingVerb::DELETE_, CrossingVerb::ALTER});
+	}
 }
 
-void CrossingSession::Ddl(ClientContext &, const CrossingDdl &) {
-	throw NotImplementedException("crossing: this source's session has no Ddl");
+const CrossingIdentity &CrossingDefaultIdentity() {
+	static const CrossingIdentity identity;
+	return identity;
 }
 
 } // namespace duckdb

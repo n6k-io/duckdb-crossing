@@ -1,8 +1,11 @@
 #include "far_source/far_source.hpp"
 #include "crossing_substrait.hpp"
 
+#include "internal/control_frames.hpp"
+#include "internal/far_plan.hpp"
+#include "internal/stream_sink.hpp"
+
 #include "duckdb/common/types/column/column_data_collection.hpp"
-#include "duckdb/main/appender.hpp"
 #include "duckdb/main/extension/extension_loader.hpp"
 #include "duckdb/main/query_result.hpp"
 #include "duckdb/main/query_parameters.hpp"
@@ -13,14 +16,18 @@
 #include "duckdb/parser/parsed_data/create_info.hpp"
 #include "duckdb/parser/parsed_data/create_view_info.hpp"
 #include "duckdb/parser/parsed_data/drop_info.hpp"
+#include "duckdb/common/string_util.hpp"
+#include "duckdb/parser/parser.hpp"
 #include "duckdb/parser/statement/alter_statement.hpp"
 #include "duckdb/parser/statement/create_statement.hpp"
 #include "duckdb/parser/statement/drop_statement.hpp"
 #include "duckdb/parser/statement/select_statement.hpp"
 #include "duckdb/common/sql_identifier.hpp"
 #include "duckdb/planner/expression/bound_aggregate_expression.hpp"
+#include "duckdb/planner/operator/logical_get.hpp"
 #include "duckdb/planner/expression/bound_function_expression.hpp"
 #include "duckdb/planner/expression/bound_window_expression.hpp"
+#include "duckdb/storage/buffer_manager.hpp"
 
 #include <algorithm>
 #include <chrono>
@@ -30,22 +37,6 @@ namespace duckdb {
 namespace {
 
 constexpr const char *FAR_CATALOG = "memory";
-
-vector<vector<Value>> RowsOf(QueryResult &result) {
-	if (result.HasError()) {
-		result.ThrowError();
-	}
-	auto &rows = result.Collection();
-	vector<vector<Value>> out;
-	for (idx_t r = 0; r < rows.Count(); r++) {
-		vector<Value> row;
-		for (idx_t c = 0; c < rows.ColumnCount(); c++) {
-			row.push_back(rows.GetValue(c, r));
-		}
-		out.push_back(std::move(row));
-	}
-	return out;
-}
 
 vector<vector<Value>> RowsOf(const ColumnDataCollection &collection) {
 	vector<vector<Value>> out;
@@ -61,134 +52,175 @@ vector<vector<Value>> RowsOf(const ColumnDataCollection &collection) {
 	return out;
 }
 
+vector<vector<Value>> RowsOf(QueryResult &result) {
+	if (result.HasError()) {
+		result.ThrowError();
+	}
+	return RowsOf(result.Collection());
+}
+
 void CollectOperators(const LogicalOperator &op, vector<LogicalOperatorType> &out) {
+	if (op.type == LogicalOperatorType::LOGICAL_GET &&
+	    op.Cast<LogicalGet>().function.GetName() == CROSSING_SEAM_FUNCTION) {
+		out.push_back(LogicalOperatorType::LOGICAL_CHUNK_GET);
+		return;
+	}
 	out.push_back(op.type);
 	for (auto &child : op.children) {
 		CollectOperators(*child, out);
 	}
 }
 
-unique_ptr<QueryResult> RunPlan(Connection &con, unique_ptr<LogicalOperator> plan) {
-	auto result = SubmitCrossingPlan(*con.context, std::move(plan));
-	result->ThrowIfError();
-	return result;
-}
-
-void ArriveLater(FarStore &store, CrossingWaker waker, std::function<void()> arrive) {
-	if (store.keep_wakers) {
-		store.kept_wakers.push_back(waker);
-	}
-	if (store.wake_before_returning) {
-		arrive();
-		waker.Wake();
-		return;
-	}
-	store.arrivals.emplace_back([&store, waker, arrive]() {
-		std::this_thread::sleep_for(std::chrono::milliseconds(1));
-		{
-			lock_guard<mutex> guard(store.lock);
-			arrive();
+vector<vector<Value>> RowsOfChunk(DataChunk &chunk) {
+	vector<vector<Value>> out;
+	for (idx_t r = 0; r < chunk.size(); r++) {
+		vector<Value> row;
+		for (idx_t c = 0; c < chunk.ColumnCount(); c++) {
+			row.push_back(chunk.GetValue(c, r));
 		}
-		waker.Wake();
-	});
+		out.push_back(std::move(row));
+	}
+	return out;
 }
 
-struct ReaderHandle {
-	explicit ReaderHandle(shared_ptr<FarStore> store_p) : store(std::move(store_p)) {
-		lock_guard<mutex> guard(store->lock);
-		store->readers_open++;
+FarDdl DdlOfFrame(ClientContext &context, const string &frame) {
+	const string view(CROSSING_CONTROL_VIEW);
+	if (frame.compare(0, view.size(), view) == 0) {
+		return FarDdl {CrossingVerb::CREATE, StringUtil::Split(frame.substr(view.size()), '\n')[1]};
 	}
-	~ReaderHandle() {
-		lock_guard<mutex> guard(store->lock);
-		store->readers_closed++;
+	Parser parser(context);
+	parser.ParseQuery(frame);
+	auto &statement = *parser.statements[0];
+	switch (statement.type) {
+	case StatementType::CREATE_STATEMENT:
+		return FarDdl {CrossingVerb::CREATE,
+		               statement.Cast<CreateStatement>().info->GetQualifiedName().Name().GetIdentifierName()};
+	case StatementType::ALTER_STATEMENT:
+		return FarDdl {CrossingVerb::ALTER,
+		               statement.Cast<AlterStatement>().info->GetQualifiedName().Name().GetIdentifierName()};
+	default:
+		return FarDdl {CrossingVerb::DROP,
+		               statement.Cast<DropStatement>().info->GetQualifiedName().Name().GetIdentifierName()};
 	}
+}
+
+bool HoldsSeam(const LogicalOperator &op) {
+	if (op.type == LogicalOperatorType::LOGICAL_GET &&
+	    op.Cast<LogicalGet>().function.GetName() == CROSSING_SEAM_FUNCTION) {
+		return true;
+	}
+	for (auto &child : op.children) {
+		if (HoldsSeam(*child)) {
+			return true;
+		}
+	}
+	return false;
+}
+
+bool PlanHoldsOrder(const LogicalOperator &op) {
+	if (op.type == LogicalOperatorType::LOGICAL_ORDER_BY || op.type == LogicalOperatorType::LOGICAL_TOP_N) {
+		return true;
+	}
+	for (auto &child : op.children) {
+		if (PlanHoldsOrder(*child)) {
+			return true;
+		}
+	}
+	return false;
+}
+
+//! Near's end of a link to a far transaction this process serves on its own connection.
+class FarLink : public CrossingLink {
+public:
+	FarLink(shared_ptr<FarStore> store_p, string catalog_p, string floor_catalog_p)
+	    : store(std::move(store_p)), catalog(std::move(catalog_p)), floor_catalog(std::move(floor_catalog_p)),
+	      parsing(store->db) {
+		auto instrumented = make_uniq<TestLinkPair>(store->streams, store->capacity, store->far_streams);
+		pair = instrumented.get();
+		pair->on_rows = [this](idx_t id, int side, DataChunk &rows) {
+			if (side == 1) {
+				store->far_rows_sent += rows.size();
+			}
+			Observe(id, side, rows);
+		};
+		pair->on_control = [this](const string &header) {
+			end_word = header == CROSSING_CONTROL_COMMIT ? "commit" : end_word;
+			if (header.compare(0, 5, CROSSING_CONTROL_PLAN) == 0 && header[5] == '1') {
+				end_word = "commit";
+			}
+			if (header.compare(0, 4, CROSSING_CONTROL_DDL) == 0) {
+				auto ddl = DdlOfFrame(*parsing.context, header.substr(4));
+				lock_guard<mutex> guard(store->lock);
+				store->ddls.push_back(std::move(ddl));
+			}
+		};
+		pair->stall = [this](idx_t id) {
+			return id == 0 ? store->stall_replies.load() : store->stall_results.load();
+		};
+		{
+			lock_guard<mutex> guard(store->lock);
+			store->release_link = [this]() {
+				pair->Release();
+			};
+		}
+		CrossingFarOptions options;
+		options.catalogs = store->catalog_check;
+		options.floors = store->floors;
+		options.writes = store->write_shaper;
+		options.ddl = store->ddl_shaper;
+		link = make_uniq<CrossingInProcessLink>(*store->db.instance, catalog, options, std::move(instrumented));
+	}
+
+	~FarLink() override {
+		link->Wait();
+		lock_guard<mutex> guard(store->lock);
+		store->transaction_ends.push_back(end_word);
+		store->seam_rows += pair->SeamRows();
+		store->waits += pair->Waits();
+		store->near_control_replies += pair->NearControlReplies();
+		store->near_recv_streams = pair->NearRecvStreams().size();
+		store->most_held_for_near = MaxValue(store->most_held_for_near, pair->MostHeldForNear());
+		store->release_link = nullptr;
+	}
+
+	idx_t Streams() override {
+		return link->Streams();
+	}
+	unique_ptr<CrossingStream> Open(idx_t id, optional_ptr<CrossingReceiver> receiver) override {
+		return link->Open(id, receiver);
+	}
+
+private:
+	void Observe(idx_t id, int side, DataChunk &rows) {
+		if (id == 0) {
+			return;
+		}
+		auto slice = ((id - 1) >> 17);
+		bool into_far = ((id - 1) >> 16) & 1;
+		lock_guard<mutex> guard(store->lock);
+		if (slice >= store->slices.size()) {
+			return;
+		}
+		auto &entry = store->slices[slice];
+		if (entry.first != into_far) {
+			return;
+		}
+		auto &call = entry.first ? store->writes[entry.second] : store->reads[entry.second];
+		for (auto &row : RowsOfChunk(rows)) {
+			call.rows.push_back(std::move(row));
+		}
+	}
+
 	shared_ptr<FarStore> store;
+	string catalog;
+	string floor_catalog;
+	Connection parsing;
+	optional_ptr<TestLinkPair> pair;
+	unique_ptr<CrossingInProcessLink> link;
+	string end_word = "rollback";
 };
 
-void CopyBlock(const vector<vector<Value>> &rows, idx_t first, idx_t count, DataChunk &chunk) {
-	for (idx_t r = 0; r < count; r++) {
-		for (idx_t c = 0; c < chunk.ColumnCount(); c++) {
-			chunk.data[c].SetValue(r, rows[first + r][c]);
-		}
-	}
-	chunk.SetChildCardinality(count);
-}
-
-CrossingReadResult IndexedRows(const FarStore &store, idx_t batch_index) {
-	return store.drop_batch_index ? CrossingReadResult::Rows() : CrossingReadResult::Rows(batch_index);
-}
-
-CrossingReader FarReader(shared_ptr<const vector<vector<Value>>> rows, idx_t partitions, idx_t partition,
-                         shared_ptr<FarStore> store, shared_ptr<idx_t> next_block) {
-	idx_t cursor = 0;
-	auto handle = make_shared_ptr<ReaderHandle>(store);
-	return [rows, partitions, partition, store, next_block, cursor, handle](ClientContext &, DataChunk &chunk,
-	                                                                        CrossingWaker waker) mutable {
-		{
-			lock_guard<mutex> guard(store->lock);
-			if (store->wait_before_chunks && store->arrived.erase(partition) == 0) {
-				auto raw = store.get();
-				ArriveLater(*raw, std::move(waker), [raw, partition]() {
-					raw->waits_served++;
-					raw->arrived.insert(partition);
-				});
-				return CrossingReadResult::Wait();
-			}
-		}
-		if (store->batch_block_rows > 0) {
-			auto block_rows = MinValue<idx_t>(store->batch_block_rows, STANDARD_VECTOR_SIZE);
-			lock_guard<mutex> guard(store->lock);
-			idx_t block = *next_block;
-			idx_t first = block * block_rows;
-			if (first >= rows->size()) {
-				return CrossingReadResult::Done();
-			}
-			(*next_block)++;
-			CopyBlock(*rows, first, MinValue<idx_t>(block_rows, rows->size() - first), chunk);
-			store->partitions_read.insert(partition);
-			return IndexedRows(*store, block);
-		}
-		if (store->round_robin_batch_rows > 0) {
-			auto block_rows = MinValue<idx_t>(store->round_robin_batch_rows, STANDARD_VECTOR_SIZE);
-			idx_t block = cursor;
-			while (block % partitions != partition) {
-				block++;
-			}
-			idx_t first = block * block_rows;
-			if (first >= rows->size()) {
-				return CrossingReadResult::Done();
-			}
-			CopyBlock(*rows, first, MinValue<idx_t>(block_rows, rows->size() - first), chunk);
-			cursor = block + 1;
-			lock_guard<mutex> guard(store->lock);
-			store->partitions_read.insert(partition);
-			return IndexedRows(*store, block);
-		}
-		idx_t count = 0;
-		while (cursor < rows->size() && count < STANDARD_VECTOR_SIZE) {
-			if (cursor % partitions == partition) {
-				for (idx_t c = 0; c < chunk.ColumnCount(); c++) {
-					chunk.data[c].SetValue(count, (*rows)[cursor][c]);
-				}
-				count++;
-			}
-			cursor++;
-		}
-		chunk.SetChildCardinality(count);
-		if (count == 0) {
-			return CrossingReadResult::Done();
-		}
-		lock_guard<mutex> guard(store->lock);
-		store->partitions_read.insert(partition);
-		return store->stray_batch_index ? CrossingReadResult::Rows(0) : CrossingReadResult::Rows();
-	};
-}
-
 } // namespace
-
-const char *TransportName(Transport transport) {
-	return transport == Transport::NATIVE ? "native" : "substrait";
-}
 
 bool FarCall::Has(LogicalOperatorType type) const {
 	return Count(type) > 0;
@@ -202,18 +234,20 @@ bool FarCall::Mentions(const string &text) const {
 	return plan_text.find(text) != string::npos;
 }
 
-FarStore::FarStore(Transport transport_p) : db(nullptr), con(db), transport(transport_p) {
-	RegisterCrossingPlanFunctions(*db.instance);
+FarStore::FarStore() : db(nullptr), con(db) {
+	RegisterCrossingFarFunctions(*db.instance);
 }
 
-void FarStore::JoinArrivals() {
-	vector<std::thread> pending;
+void FarStore::Release() {
+	stall_replies = false;
+	stall_results = false;
+	std::function<void()> release;
 	{
 		lock_guard<mutex> guard(lock);
-		pending.swap(arrivals);
+		release = release_link;
 	}
-	for (auto &thread : pending) {
-		thread.join();
+	if (release) {
+		release();
 	}
 }
 
@@ -241,8 +275,8 @@ FarSource::FarSource(shared_ptr<FarStore> store_p, string path_p, const string &
 	}
 }
 
-const void *FarSource::Group() {
-	return group;
+const void *FarSource::Group() const {
+	return group ? static_cast<const void *>(group) : this;
 }
 
 void FarSource::Detach(ClientContext &) {
@@ -291,9 +325,10 @@ bool FarSource::IsView(Connection &con, const string &catalog, const string &sch
 }
 
 CrossingTable FarSource::DescribeOn(FarStore &store, Connection &con, const string &catalog, const string &schema,
-                                    const string &name) {
+                                    const string &name, const string &floor_catalog) {
 	CrossingTable table;
 	table.name = name;
+	table.catalog = floor_catalog;
 	if (IsView(con, catalog, schema, name)) {
 		auto result = con.Query("SELECT * FROM " + SQLIdentifier::ToString(catalog) + "." +
 		                        SQLIdentifier::ToString(schema) + "." + SQLIdentifier::ToString(name) + " LIMIT 0");
@@ -306,6 +341,7 @@ CrossingTable FarSource::DescribeOn(FarStore &store, Connection &con, const stri
 		auto verbs = store.verbs.find(name);
 		table.verbs = verbs != store.verbs.end() ? verbs->second
 		                                         : vector<CrossingVerb> {CrossingVerb::SELECT, CrossingVerb::DROP};
+		table.row_ids = false;
 		return table;
 	}
 	auto description = con.TableInfo(Identifier(catalog), Identifier(schema), Identifier(name));
@@ -315,9 +351,10 @@ CrossingTable FarSource::DescribeOn(FarStore &store, Connection &con, const stri
 	for (auto &column : description->columns) {
 		table.Column(column.Name().GetIdentifierName(), column.Type());
 	}
+	vector<string> declared;
 	auto key = store.keys.find(name);
 	if (key != store.keys.end()) {
-		table.key = key->second;
+		declared = key->second;
 	} else {
 		auto prepared = con.Prepare("SELECT constraint_column_names FROM duckdb_constraints() WHERE database_name "
 		                            "= ? AND schema_name = ? AND table_name = ? AND constraint_type = 'PRIMARY KEY'");
@@ -325,15 +362,14 @@ CrossingTable FarSource::DescribeOn(FarStore &store, Connection &con, const stri
 		auto rows = RowsOf(*prepared->Execute(args));
 		if (!rows.empty()) {
 			for (auto &column : ListValue::GetChildren(rows[0][0])) {
-				table.key.push_back(column.GetValue<string>());
+				declared.push_back(column.GetValue<string>());
 			}
 		}
 	}
-	auto unique = store.key_unique.find(name);
-	table.key_unique = unique != store.key_unique.end() ? unique->second : !table.key.empty();
-	if (store.declare_key_constraints && !table.key.empty()) {
+	table.returning = store.returning;
+	if (store.declare_key_constraints && !declared.empty()) {
 		vector<Identifier> key_columns;
-		for (auto &column : table.key) {
+		for (auto &column : declared) {
 			key_columns.emplace_back(column);
 		}
 		table.constraints.push_back(make_uniq<UniqueConstraint>(std::move(key_columns), true));
@@ -353,7 +389,7 @@ CrossingTable FarSource::Describe(const string &schema, const string &name) {
 		store->on_source_call("describe");
 	}
 	lock_guard<mutex> guard(store->lock);
-	return DescribeOn(*store, store->con, catalog, schema, name);
+	return DescribeOn(*store, store->con, catalog, schema, name, floor_catalog);
 }
 
 CrossingSchema FarSource::DescribeSchema(const string &schema) {
@@ -363,21 +399,6 @@ CrossingSchema FarSource::DescribeSchema(const string &schema) {
 	auto verbs = store->schema_verbs.find(schema);
 	described.verbs = verbs != store->schema_verbs.end() ? verbs->second : vector<CrossingVerb> {CrossingVerb::CREATE};
 	return described;
-}
-
-CrossingPlan FarSource::Plan(const CrossingPlanRequest &request) {
-	{
-		lock_guard<mutex> guard(store->lock);
-		if (!store->declined.empty()) {
-			return CrossingPlan::Declined(store->declined);
-		}
-	}
-	if (request.verb == CrossingVerb::SELECT) {
-		auto &described = *request.described;
-		return CrossingPlan::Of(MakeFloorNode(0, request.schema, request.table, described.column_names,
-		                                      described.column_types, floor_catalog));
-	}
-	return CrossingPlan::Of(MakeSeamNode(0, request.seam.types));
 }
 
 CrossingVerdict FarSource::AcceptsCall(const Expression &expr) {
@@ -420,6 +441,21 @@ CrossingVerdict FarSource::AcceptsType(const LogicalType &type) {
 	return CrossingVerdict::Yes();
 }
 
+CrossingVerdict FarSource::AcceptsSeam(const vector<LogicalType> &types) {
+	lock_guard<mutex> guard(store->lock);
+	if (!store->takes_seams) {
+		return CrossingVerdict::No("far takes no rows into a read");
+	}
+	for (auto &type : types) {
+		for (auto refused : store->refused_types) {
+			if (type.id() == refused) {
+				return CrossingVerdict::No("far refuses " + type.ToString());
+			}
+		}
+	}
+	return CrossingVerdict::Yes();
+}
+
 CrossingVerdict FarSource::AcceptsOperator(const LogicalOperator &op) {
 	string reason;
 	if (!SubstraitCanRenderOperator(op, reason)) {
@@ -434,14 +470,85 @@ CrossingVerdict FarSource::AcceptsOperator(const LogicalOperator &op) {
 	return CrossingVerdict::Yes();
 }
 
-unique_ptr<FarSession> FarSource::Begin(ClientContext &) {
+unique_ptr<CrossingLink> FarSource::Connect(ClientContext &) {
+	{
+		lock_guard<mutex> guard(store->lock);
+		store->links_connected++;
+		store->slices.clear();
+	}
+	return make_uniq<FarLink>(store, catalog, floor_catalog);
+}
+
+void FarSource::DescribeChanged(const string &schema, CrossingTable &table) {
+	CrossingSource::DescribeChanged(schema, table);
+	table.catalog = floor_catalog;
 	lock_guard<mutex> guard(store->lock);
-	store->sessions_begun++;
-	return make_uniq<FarSession>(store, catalog);
+	table.returning = store->returning;
+	auto verbs = store->verbs.find(table.name);
+	if (verbs != store->verbs.end()) {
+		table.verbs = verbs->second;
+	}
+	if (store->keep_far_constraints) {
+		return;
+	}
+	vector<unique_ptr<Constraint>> far_constraints;
+	far_constraints.swap(table.constraints);
+	if (!store->declare_key_constraints) {
+		return;
+	}
+	auto key = store->keys.find(table.name);
+	if (key != store->keys.end()) {
+		vector<Identifier> key_columns;
+		for (auto &column : key->second) {
+			key_columns.emplace_back(column);
+		}
+		table.constraints.push_back(make_uniq<UniqueConstraint>(std::move(key_columns), true));
+		return;
+	}
+	for (auto &constraint : far_constraints) {
+		if (constraint->type == ConstraintType::UNIQUE && constraint->Cast<UniqueConstraint>().IsPrimaryKey()) {
+			table.constraints.push_back(std::move(constraint));
+		}
+	}
+}
+
+void FarSource::Planned(const LogicalOperator &plan) {
+	FarCall call;
+	call.kind = CrossingVerb::SELECT;
+	call.tables = CrossingTablesOf(plan);
+	call.ordered = PlanHoldsOrder(plan);
+	auto node = WriteOf(plan);
+	optional_ptr<const LogicalOperator> feed = &plan;
+	if (node) {
+		call.kind = node->verb;
+		call.written.schema = node->schema;
+		call.written.table = node->table;
+		call.set_columns = node->set_columns;
+		call.returning_columns = node->returning_columns;
+		feed = plan.children.empty() ? nullptr : plan.children[0].get();
+	}
+	if (feed) {
+		call.plan_text = feed->ToString();
+		CollectOperators(*feed, call.operators);
+		call.types = feed->types;
+		call.rows_only = node && feed->type == LogicalOperatorType::LOGICAL_GET &&
+		                 feed->Cast<LogicalGet>().function.GetName() == CROSSING_SEAM_FUNCTION;
+		if (!HoldsSeam(*feed)) {
+			call.wire = RenderSubstraitJson(*feed);
+		} else {
+			SubstraitSlice slice;
+			slice.source = feed;
+			call.wire = RenderSubstraitSlices({slice});
+		}
+	}
+	lock_guard<mutex> guard(store->lock);
+	auto &calls = node ? store->writes : store->reads;
+	store->slices.emplace_back(node != nullptr, calls.size());
+	calls.push_back(std::move(call));
 }
 
 void FarSource::Register(ExtensionLoader &loader, shared_ptr<FarStore> store) {
-	Crossing<FarSource>::Register(loader, "fardb", [store](ClientContext &, AttachInfo &info) {
+	RegisterCrossing(loader, "fardb", [store](ClientContext &, AttachInfo &info) -> unique_ptr<CrossingSource> {
 		auto option = [&info](const string &name) {
 			auto found = info.options.find(name);
 			return found == info.options.end() ? string() : found->second.ToString();
@@ -450,233 +557,26 @@ void FarSource::Register(ExtensionLoader &loader, shared_ptr<FarStore> store) {
 	});
 }
 
-FarSession::FarSession(shared_ptr<FarStore> store_p, string catalog_p)
-    : store(std::move(store_p)), catalog(std::move(catalog_p)), far(store->db) {
-	far.BeginTransaction();
-}
-
-FarSession::~FarSession() {
-	if (far.context->transaction.HasActiveTransaction()) {
-		far.Rollback();
-	}
-}
-
-vector<string> FarSession::Tables(const string &schema) {
-	lock_guard<mutex> guard(far_lock);
-	return FarSource::TablesOn(far, catalog, schema);
-}
-
-CrossingTable FarSession::Describe(const string &schema, const string &name) {
-	lock_guard<mutex> guard(far_lock);
-	lock_guard<mutex> store_guard(store->lock);
-	return FarSource::DescribeOn(*store, far, catalog, schema, name);
-}
-
-void FarSession::Commit() {
-	far.Commit();
-	lock_guard<mutex> guard(store->lock);
-	store->transaction_ends.push_back("commit");
-}
-
-void FarSession::Rollback() {
-	far.Rollback();
-	lock_guard<mutex> guard(store->lock);
-	store->transaction_ends.push_back("rollback");
-}
-
-void FarSession::Ddl(ClientContext &, const CrossingDdl &ddl) {
-	unique_ptr<SQLStatement> statement;
-	switch (ddl.verb) {
-	case CrossingVerb::CREATE: {
-		auto create = make_uniq<CreateStatement>();
-		if (ddl.plan) {
-			create->info = ReceiveView(ddl.create->Cast<CreateViewInfo>(), *ddl.plan);
-		} else {
-			create->info = ddl.create->Copy();
-			create->info->SetCatalog(Identifier(catalog));
-		}
-		statement = std::move(create);
-		break;
-	}
-	case CrossingVerb::ALTER: {
-		auto alter = make_uniq<AlterStatement>();
-		alter->info = ddl.alter->Copy();
-		auto &altered = alter->info->GetQualifiedName();
-		alter->info->SetQualifiedName(Identifier(catalog), altered.Schema(), altered.Name());
-		statement = std::move(alter);
-		break;
-	}
-	case CrossingVerb::DROP: {
-		auto drop = make_uniq<DropStatement>();
-		drop->info = ddl.drop->Copy();
-		drop->info->SetCatalog(Identifier(catalog));
-		statement = std::move(drop);
-		break;
-	}
-	default:
-		throw InternalException("far: '%s' is not a DDL verb", CrossingVerbName(ddl.verb));
-	}
-	lock_guard<mutex> guard(far_lock);
-	far.context->Query(std::move(statement), QueryParameters())->ThrowIfError();
-	lock_guard<mutex> store_guard(store->lock);
-	store->ddls.push_back(FarDdl {ddl.verb, ddl.schema, ddl.table});
-}
-
-// Over Substrait whatever the transport: a native plan cannot be turned back into a SelectStatement.
-unique_ptr<CreateViewInfo> FarSession::ReceiveView(const CreateViewInfo &view, const LogicalOperator &plan) {
-	lock_guard<mutex> guard(far_lock);
-	auto received = make_uniq<CreateViewInfo>(
-	    QualifiedName(Identifier(catalog), view.GetQualifiedName().Schema(), view.GetViewName()));
-	received->query = DecodeSubstraitView(far, catalog, RenderSubstraitJson(plan), CrossingViewColumnNames(view),
-	                                      store->catalog_check);
-	received->on_conflict = view.on_conflict;
-	return received;
-}
-
-FarCall FarSession::Record(const CrossingQuery &query) {
-	FarCall call;
-	call.kind = query.kind;
-	call.plan_text = query.plan.ToString();
-	call.tables = query.tables;
-	call.written = query.written;
-	CollectOperators(query.plan, call.operators);
-	call.types = query.types;
-	call.ordered = query.ordered;
-	call.key_columns = query.key_columns;
-	call.set_columns = query.set_columns;
-	return call;
-}
-
-vector<vector<Value>> FarSession::EvaluateNative(const LogicalOperator &plan, FarCall &call) {
-	call.wire = SerializeCrossingPlan(plan);
-	auto received = DeserializeCrossingPlan(*far.context, call.wire);
-	call.received_text = received->ToString();
-	BindFloors(*far.context, received, catalog);
-	return RowsOf(*RunPlan(far, std::move(received)));
-}
-
-SubstraitSeamViews FarSession::StageSeamRows(const LogicalOperator &plan) {
-	SubstraitSeamViews views;
-	for (auto &seam : SubstraitSeamsOf(plan)) {
-		auto view = "crossing_" + seam.table;
-		string columns;
-		for (idx_t c = 0; c < seam.rows.Types().size(); c++) {
-			columns += (c ? ", c" : "c") + to_string(c) + " " + seam.rows.Types()[c].ToString();
-		}
-		auto created = far.Query("CREATE OR REPLACE TEMP TABLE " + view + "(" + columns + ")");
-		if (created->HasError()) {
-			created->ThrowError();
-		}
-		Appender appender(far, "temp", "main", Identifier(view));
-		for (auto &chunk : seam.rows.Chunks()) {
-			appender.AppendDataChunk(chunk);
-		}
-		appender.Close();
-		views[seam.table] = view;
-	}
-	return views;
-}
-
-vector<vector<Value>> FarSession::EvaluateSubstrait(const LogicalOperator &plan, FarCall &call) {
-	call.wire = RenderSubstraitJson(plan);
-	auto rel = DecodeSubstraitJson(far, catalog, call.wire, StageSeamRows(plan), store->catalog_check);
-	call.received_text = rel->ToString();
-	return RowsOf(*rel->Execute());
-}
-
-vector<vector<Value>> FarSession::Evaluate(const LogicalOperator &plan, FarCall &call) {
-	if (auto rows = SeamRowsOf(plan)) {
-		return RowsOf(*rows);
-	}
-	lock_guard<mutex> guard(far_lock);
-	if (store->transport == Transport::NATIVE) {
-		return EvaluateNative(plan, call);
-	}
-	return EvaluateSubstrait(plan, call);
-}
-
-CrossingScan FarSession::Read(ClientContext &, const CrossingQuery &query) {
-	auto call = Record(query);
-	auto rows = make_shared_ptr<const vector<vector<Value>>>(Evaluate(query.plan, call));
-	call.rows = *rows;
-	lock_guard<mutex> guard(store->lock);
-	store->reads.push_back(std::move(call));
-	auto batch_indexed = store->batch_block_rows > 0 || store->round_robin_batch_rows > 0;
-	auto partitions = query.ordered && !store->partition_ordered_reads && !batch_indexed ? 1 : store->read_partitions;
-	auto store_ref = store;
-	auto next_block = make_shared_ptr<idx_t>(0);
-	CrossingScan scan;
-	scan.partitions = partitions;
-	scan.batch_indexed = batch_indexed;
-	scan.open = [=](ClientContext &, idx_t partition) {
-		return FarReader(rows, partitions, partition, store_ref, next_block);
-	};
-	return scan;
-}
-
-CrossingWriter FarSession::Write(ClientContext &, const CrossingQuery &query) {
-	return [this, &query](ClientContext &, CrossingWaker waker) {
-		{
-			lock_guard<mutex> guard(store->lock);
-			if (store->wait_before_write && !store->write_arrived) {
-				auto raw = store.get();
-				ArriveLater(*raw, std::move(waker), [raw]() {
-					raw->write_waits_served++;
-					raw->write_arrived = true;
-				});
-				return CrossingWriteResult::Wait();
-			}
-			store->write_arrived = false;
-		}
-		auto call = Record(query);
-		auto rows = query.types.empty() ? vector<vector<Value>>() : Evaluate(query.plan, call);
-		call.rows = rows;
-		{
-			lock_guard<mutex> guard(store->lock);
-			store->writes.push_back(std::move(call));
-		}
-		lock_guard<mutex> guard(far_lock);
-		return CrossingWriteResult::Done(Apply(query));
-	};
-}
-
-idx_t FarSession::Apply(const CrossingQuery &query) {
-	if (query.written.table.empty()) {
-		throw InternalException("far: a write names no table");
-	}
-	CrossingWriteTarget target;
-	target.catalog = catalog;
-	target.schema = query.written.schema;
-	target.table = query.written.table;
-	target.verb = query.kind;
-	target.key_columns = query.key_columns;
-	target.set_columns = query.set_columns;
-	target.reads_rows = query.reads_rows;
-	if (query.types.empty()) {
-		return ExecuteWrite(*far.context, target, unique_ptr<TableRef>());
-	}
-	if (auto rows = SeamRowsOf(query.plan)) {
-		return ExecuteWrite(*far.context, target, SeamRefOfRows(*rows));
-	}
-	if (store->transport == Transport::NATIVE) {
-		auto received = DeserializeCrossingPlan(*far.context, SerializeCrossingPlan(query.plan));
-		BindFloors(*far.context, received, catalog);
-		return ExecuteWrite(*far.context, target, std::move(received));
-	}
-	auto rel = DecodeSubstraitJson(far, catalog, RenderSubstraitJson(query.plan), StageSeamRows(query.plan),
-	                               store->catalog_check);
-	return ExecuteWrite(*far.context, target, rel->GetTableRef());
-}
-
 } // namespace duckdb
 
 namespace other {
 
+static const duckdb::CrossingIdentity &OtherIdentityOf() {
+	static const duckdb::CrossingIdentity identity;
+	return identity;
+}
+
+const duckdb::CrossingIdentity &OtherSource::Identity() const {
+	return OtherIdentityOf();
+}
+
 void OtherSource::Register(duckdb::ExtensionLoader &loader, duckdb::shared_ptr<duckdb::FarStore> store) {
-	duckdb::Crossing<OtherSource>::Register(loader, "otherdb",
-	                                        [store](duckdb::ClientContext &, duckdb::AttachInfo &info) {
-		                                        return duckdb::make_uniq<OtherSource>(store, info.path);
-	                                        });
+	duckdb::RegisterCrossing(
+	    loader, "otherdb",
+	    [store](duckdb::ClientContext &, duckdb::AttachInfo &info) -> duckdb::unique_ptr<duckdb::CrossingSource> {
+		    return duckdb::make_uniq<OtherSource>(store, info.path);
+	    },
+	    OtherIdentityOf());
 }
 
 } // namespace other

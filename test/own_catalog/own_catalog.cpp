@@ -1,5 +1,7 @@
 #include "own_catalog/own_catalog.hpp"
 
+#include "internal/far_plan.hpp"
+
 #include "duckdb/catalog/entry_lookup_info.hpp"
 #include "duckdb/main/config.hpp"
 #include "duckdb/main/database.hpp"
@@ -42,7 +44,7 @@ unique_ptr<TransactionManager> CreateOwnTransactionManager(optional_ptr<StorageE
 } // namespace
 
 OwnCatalog::OwnCatalog(AttachedDatabase &db, unique_ptr<FarSource> source)
-    : Catalog(db), attach(db, Crossing<FarSource>::Adapt(std::move(source))) {
+    : Catalog(db), attach(db, std::move(source)) {
 }
 
 OwnCatalog::~OwnCatalog() = default;
@@ -124,7 +126,8 @@ void OwnCatalog::Register(ExtensionLoader &loader, shared_ptr<FarStore> store) {
 	ext->storage_info = make_uniq<OwnStorageInfo>(std::move(store));
 	auto &db = loader.GetDatabaseInstance();
 	StorageExtension::Register(DBConfig::GetConfig(db), "owndb", std::move(ext));
-	Crossing<FarSource>::RegisterPass(db);
+	RegisterCrossingPass(db);
+	RegisterCrossingFarFunctions(db);
 }
 
 OwnSchema::OwnSchema(OwnCatalog &catalog, CreateSchemaInfo &info)

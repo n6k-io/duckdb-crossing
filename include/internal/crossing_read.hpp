@@ -1,19 +1,22 @@
 #pragma once
 
-#include "duckdb/common/atomic.hpp"
-#include "duckdb/execution/physical_operator.hpp"
 #include "duckdb/function/table_function.hpp"
 #include "duckdb/planner/operator/logical_extension_operator.hpp"
 #include "duckdb/planner/operator/logical_get.hpp"
 
 #include "crossing.hpp"
 #include "internal/carrier.hpp"
+#include "internal/fragment.hpp"
+#include "internal/floor.hpp"
 #include "internal/crossing_table_entry.hpp"
+#include "internal/seam.hpp"
 
 namespace duckdb {
 
 static constexpr const char *CROSSING_READ_FUNCTION = "crossing_read";
 static constexpr const char *CROSSING_WRITE_FUNCTION = "crossing_write";
+
+struct ShapedWrite;
 
 struct CrossingBindData : public TableFunctionData, public CrossingCarrier {
 	CrossingBindData(CrossingTableCatalogEntry &table, CrossingVerb verb, CrossingSeam seam,
@@ -23,6 +26,10 @@ struct CrossingBindData : public TableFunctionData, public CrossingCarrier {
 	CrossingVerb verb;
 	CrossingSeam seam;
 	shared_ptr<CrossingFragment> fragment;
+	//! A write the feed of which stays near: why.
+	string obstacle;
+	//! Set when far's native statement says the write, rather than a match on its key.
+	shared_ptr<ShapedWrite> shaped;
 
 	const CrossingIdentity &Identity() const override;
 	CrossingVerb Verb() const override {
@@ -50,10 +57,6 @@ struct CrossingBindData : public TableFunctionData, public CrossingCarrier {
 optional_ptr<CrossingBindData> CrossingBindDataOf(LogicalGet &get, const CrossingIdentity &identity);
 
 TableFunction CrossingReadFunction();
-
-//! The plan the source returned. Throws NotImplementedException with why it declined, or
-//! InternalException if the plan holds a scan other than a floor or seam.
-unique_ptr<LogicalOperator> RequirePlan(CrossingPlan planned, CrossingVerb verb, const string &table);
 
 unique_ptr<FunctionData> MakeReadBindData(CrossingTableCatalogEntry &entry);
 
@@ -84,70 +87,5 @@ public:
 protected:
 	void ResolveTypes() override;
 };
-
-struct CrossingReadGlobalState : public GlobalSourceState {
-	//! Borrows the plan from the fragment the bind data owns.
-	unique_ptr<CrossingQuery> query;
-	CrossingScan scan;
-	vector<column_t> column_ids;
-	vector<idx_t> source_position;
-	idx_t source_column_count = 0;
-	atomic<idx_t> next_partition {0};
-	atomic<idx_t> finished_partitions {0};
-	atomic<idx_t> rows_emitted {0};
-
-	idx_t MaxThreads() override {
-		return scan.partitions;
-	}
-};
-
-struct CrossingReadLocalState : public LocalSourceState {
-	DataChunk source_chunk;
-	CrossingReader reader;
-	idx_t partition = 0;
-	optional_idx batch_index;
-};
-
-class CrossingRead : public PhysicalOperator {
-public:
-	static constexpr const PhysicalOperatorType TYPE = PhysicalOperatorType::EXTENSION;
-
-	CrossingRead(PhysicalPlan &physical_plan, vector<LogicalType> types, unique_ptr<CrossingBindData> bind_data,
-	             vector<column_t> column_ids, idx_t estimated_cardinality);
-
-	unique_ptr<CrossingBindData> bind_data;
-	vector<column_t> column_ids;
-
-	unique_ptr<GlobalSourceState> GetGlobalSourceState(ClientContext &context) const override;
-	unique_ptr<LocalSourceState> GetLocalSourceState(ExecutionContext &context,
-	                                                 GlobalSourceState &gstate) const override;
-	SourceResultType GetDataInternal(ExecutionContext &context, DataChunk &chunk,
-	                                 OperatorSourceInput &input) const override;
-	ProgressData GetProgress(ClientContext &context, GlobalSourceState &gstate) const override;
-	OperatorPartitionData GetPartitionData(ExecutionContext &context, DataChunk &chunk, GlobalSourceState &gstate,
-	                                       LocalSourceState &lstate,
-	                                       const OperatorPartitionInfo &partition_info) const override;
-	bool IsSource() const override {
-		return true;
-	}
-	bool ParallelSource() const override {
-		return true;
-	}
-	//! Asked while planning, before the source says how it partitions: a reader's batch index or its
-	//! partition number always gives one.
-	bool SupportsPartitioning(const OperatorPartitionInfo &partition_info) const override {
-		return !partition_info.RequiresPartitionColumns();
-	}
-	OrderPreservationType SourceOrder() const override;
-
-	string GetName() const override;
-	InsertionOrderPreservingMap<string> ParamsToString() const override;
-};
-
-struct CrossingParking;
-
-//! After a WAIT. True with BLOCKED when parked, true with FINISHED when the operator can no longer
-//! block; false when the waker already fired and the source is to be asked again.
-bool ParkSource(CrossingParking &parking, GlobalSourceState &state, SourceResultType &result);
 
 } // namespace duckdb

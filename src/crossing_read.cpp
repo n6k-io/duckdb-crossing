@@ -1,13 +1,15 @@
 #include "internal/crossing_read.hpp"
 
 #include "crossing_attach.hpp"
+#include "internal/crossing_remote.hpp"
 #include "internal/floor.hpp"
-#include "internal/parking.hpp"
+#include "internal/function_tag.hpp"
 #include "internal/seam.hpp"
 #include "internal/table_indices.hpp"
 
 #include "duckdb/common/string_util.hpp"
 #include "duckdb/execution/physical_plan_generator.hpp"
+#include "duckdb/main/settings.hpp"
 #include "duckdb/planner/operator/logical_get.hpp"
 #include "duckdb/transaction/meta_transaction.hpp"
 #include "duckdb/transaction/transaction.hpp"
@@ -22,14 +24,6 @@ string TypeList(const vector<LogicalType> &types) {
 		names.push_back(type.ToString());
 	}
 	return StringUtil::Join(names, ", ");
-}
-
-void EmitRowIds(Vector &rowid_vec, DataChunk &source_chunk, CrossingReadGlobalState &state) {
-	auto row_ids = FlatVector::GetDataMutable<row_t>(rowid_vec);
-	auto first = state.rows_emitted.fetch_add(source_chunk.size());
-	for (idx_t i = 0; i < source_chunk.size(); i++) {
-		row_ids[i] = static_cast<row_t>(first + i);
-	}
 }
 
 bool PlanIsOrdered(const LogicalOperator &op) {
@@ -48,23 +42,6 @@ bool PlanIsOrdered(const LogicalOperator &op) {
 	}
 }
 
-void EmitChunk(CrossingReadGlobalState &state, DataChunk &source_chunk, DataChunk &output) {
-	output.SetChildCardinality(source_chunk.size());
-	for (idx_t idx = 0; idx < state.column_ids.size(); idx++) {
-		if (state.column_ids[idx] == COLUMN_IDENTIFIER_ROW_ID) {
-			EmitRowIds(output.data[idx], source_chunk, state);
-			continue;
-		}
-		auto position = state.source_position[idx];
-		if (position >= state.source_column_count) {
-			output.data[idx].SetVectorType(VectorType::CONSTANT_VECTOR);
-			ConstantVector::SetNull(output.data[idx], true);
-			continue;
-		}
-		output.data[idx].Reference(source_chunk.data[position]);
-	}
-}
-
 void CrossingReadFunc(ClientContext &, TableFunctionInput &data, DataChunk &) {
 	throw InternalException("crossing: the scan of '%s' reached execution without the crossing pass",
 	                        data.bind_data->Cast<CrossingBindData>().SourceTable());
@@ -79,75 +56,6 @@ InsertionOrderPreservingMap<string> CrossingReadToString(TableFunctionToStringIn
 		return InsertionOrderPreservingMap<string>();
 	}
 	return input.bind_data->Cast<CrossingBindData>().Params();
-}
-
-unique_ptr<CrossingReadGlobalState> PrepareReadState(const CrossingFragment &fragment, const string &source_table,
-                                                     const vector<column_t> &column_ids) {
-	auto &emitted = fragment.output_types;
-
-	auto state = make_uniq<CrossingReadGlobalState>();
-	state->column_ids = column_ids;
-	state->source_column_count = emitted.size();
-
-	auto &projected = fragment.projected_columns;
-	for (auto column : state->column_ids) {
-		if (column != COLUMN_IDENTIFIER_ROW_ID && ColumnIndex(column).IsVirtualColumn()) {
-			throw InternalException("crossing: the scan of '%s' was asked for a key alias the pass did not resolve",
-			                        source_table);
-		}
-		idx_t position = state->source_column_count;
-		for (idx_t p = 0; p < projected.size(); p++) {
-			if (projected[p] == column) {
-				position = p;
-				break;
-			}
-		}
-		state->source_position.push_back(position);
-	}
-	if (!fragment.plan) {
-		throw InternalException("crossing: the scan of '%s' carries no plan", source_table);
-	}
-	state->query = make_uniq<CrossingQuery>(CrossingVerb::SELECT, *fragment.plan);
-	state->query->types = emitted;
-	state->query->ordered = PlanIsOrdered(*fragment.plan);
-	state->query->tables = CrossingTablesOf(*fragment.plan);
-	return state;
-}
-
-void CheckScanPartitions(const CrossingReadGlobalState &state, const string &source_table) {
-	if (!state.scan.open) {
-		throw InternalException("crossing: the source returned no scan of '%s'", source_table);
-	}
-	if (state.scan.partitions == 0) {
-		throw InvalidInputException("crossing: the scan of '%s' offers no partitions", source_table);
-	}
-	if (state.query->ordered && state.scan.partitions > 1 && !state.scan.batch_indexed) {
-		throw InvalidInputException("crossing: the scan of '%s' is ordered but the source offered %llu partitions "
-		                            "without batch indexes; an ordered scan must come back as one or index its rows",
-		                            source_table, state.scan.partitions);
-	}
-}
-
-//! The thread's last index spans every reader it drained: DuckDB refuses an index that goes down.
-void CheckBatchIndex(const CrossingReadGlobalState &state, const CrossingReadLocalState &local,
-                     const CrossingReadResult &pulled, const string &source_table) {
-	if (!state.scan.batch_indexed) {
-		if (pulled.batch_index.IsValid()) {
-			throw InvalidInputException("crossing: the scan of '%s' is not batch indexed but a pull returned rows "
-			                            "with batch index %llu",
-			                            source_table, pulled.batch_index.GetIndex());
-		}
-		return;
-	}
-	if (!pulled.batch_index.IsValid()) {
-		throw InvalidInputException("crossing: the scan of '%s' is batch indexed but a pull returned rows without one",
-		                            source_table);
-	}
-	if (local.batch_index.IsValid() && pulled.batch_index.GetIndex() < local.batch_index.GetIndex()) {
-		throw InvalidInputException("crossing: the scan of '%s' handed batch index %llu after %llu on one thread; "
-		                            "batch indexes must never go down on a thread",
-		                            source_table, pulled.batch_index.GetIndex(), local.batch_index.GetIndex());
-	}
 }
 
 //! The host's catalog, unless this transaction wrote to another attach whose scans were folded in:
@@ -204,11 +112,14 @@ InsertionOrderPreservingMap<string> CrossingBindData::Params() const {
 }
 
 optional_ptr<CrossingBindData> CrossingBindDataOf(LogicalGet &get, const CrossingIdentity &identity) {
-	auto data = dynamic_cast<CrossingBindData *>(get.bind_data.get());
-	if (!data || &data->Identity() != &identity) {
+	if (!get.bind_data || !IsOwnCrossingFunction(get)) {
 		return nullptr;
 	}
-	return data;
+	auto &data = get.bind_data->Cast<CrossingBindData>();
+	if (&data.Identity() != &identity) {
+		return nullptr;
+	}
+	return &data;
 }
 
 TableFunction CrossingReadFunction() {
@@ -218,7 +129,7 @@ TableFunction CrossingReadFunction() {
 	// Without this, column_ids is not the output-slot-to-source-column map the scan reads it as.
 	// Filters stay off: crossing wants them as operators to fold, not as a TableFilterSet.
 	function.projection_pushdown = true;
-	return function;
+	return TagCrossingFunction(function);
 }
 
 shared_ptr<CrossingFragment> BuildScanFragment(unique_ptr<LogicalOperator> floor, const string &source_table,
@@ -246,6 +157,9 @@ shared_ptr<CrossingFragment> BuildScanFragment(unique_ptr<LogicalOperator> floor
 		                       source_table, TypeList(floor->types), TypeList(fragment->column_types));
 	}
 	fragment->SealFloor(*floor);
+	if (floor->type == LogicalOperatorType::LOGICAL_GET) {
+		fragment->floor_get = floor->Cast<LogicalGet>();
+	}
 	fragment->floor = std::move(floor);
 
 	vector<column_t> all_columns;
@@ -256,41 +170,9 @@ shared_ptr<CrossingFragment> BuildScanFragment(unique_ptr<LogicalOperator> floor
 	return fragment;
 }
 
-//! A scan of the source's own storage cannot travel: it is bound to the connection that made it.
-//! The source names its table with a floor or seam and binds it where the plan runs.
-void RequirePlaceholderScans(const LogicalOperator &op, CrossingVerb verb, const string &table) {
-	if (op.type == LogicalOperatorType::LOGICAL_GET) {
-		auto &get = op.Cast<LogicalGet>();
-		if (!FloorOf(get) && get.function.GetName() != CROSSING_SEAM_FUNCTION) {
-			throw InternalException("crossing: the source's %s of '%s' holds a %s scan; return MakeFloorNode or "
-			                        "MakeSeamNode and bind the table in Read or Write",
-			                        verb == CrossingVerb::SELECT ? "scan" : CrossingVerbName(verb), table,
-			                        get.function.GetName().GetIdentifierName());
-		}
-	}
-	for (auto &child : op.children) {
-		RequirePlaceholderScans(*child, verb, table);
-	}
-}
-
-unique_ptr<LogicalOperator> RequirePlan(CrossingPlan planned, CrossingVerb verb, const string &table) {
-	if (planned.plan) {
-		RequirePlaceholderScans(*planned.plan, verb, table);
-		return std::move(planned.plan);
-	}
-	auto &reason = planned.verdict.reason;
-	throw NotImplementedException("crossing: the source has no %s of '%s': %s",
-	                              verb == CrossingVerb::SELECT ? "scan" : CrossingVerbName(verb), table,
-	                              reason.empty() ? "declined" : reason);
-}
-
 unique_ptr<FunctionData> MakeReadBindData(CrossingTableCatalogEntry &entry) {
-	CrossingPlanRequest request;
-	request.verb = CrossingVerb::SELECT;
-	request.schema = entry.source_schema;
-	request.table = entry.described.name;
-	request.described = &entry.described;
-	auto floor = RequirePlan(entry.source.Plan(request), CrossingVerb::SELECT, entry.described.name);
+	auto floor = MakeFloorNode(0, entry.source_schema, entry.described.name, entry.described.column_names,
+	                           entry.described.column_types, entry.described.catalog);
 	auto fragment = BuildScanFragment(std::move(floor), entry.described.name, entry.described.column_names,
 	                                  entry.described.column_types);
 	return make_uniq<CrossingBindData>(entry, CrossingVerb::SELECT, CrossingSeam(), std::move(fragment));
@@ -303,11 +185,44 @@ LogicalCrossingRead::LogicalCrossingRead(TableIndex table_index_p, vector<Column
 }
 
 PhysicalOperator &LogicalCrossingRead::CreatePlan(ClientContext &context, PhysicalPlanGenerator &planner) {
-	vector<column_t> ids;
-	for (auto &column : column_ids) {
-		ids.push_back(column.GetPrimaryIndex());
+	auto &fragment = *bind_data->fragment;
+	auto &source_table = bind_data->SourceTable();
+	if (!fragment.plan) {
+		throw InternalException("crossing: the scan of '%s' carries no plan", source_table);
 	}
-	return planner.Make<CrossingRead>(types, std::move(bind_data), std::move(ids), estimated_cardinality);
+	CrossingRemoteColumns columns;
+	columns.received = fragment.output_types;
+	for (auto &column : column_ids) {
+		auto id = column.GetPrimaryIndex();
+		auto position = CrossingRemoteColumns::NULL_COLUMN;
+		for (idx_t p = 0; p < fragment.projected_columns.size(); p++) {
+			if (fragment.projected_columns[p] == id) {
+				position = p;
+				break;
+			}
+		}
+		columns.positions.push_back(position);
+	}
+	auto &catalog = ReadingCatalog(context, *bind_data);
+	auto &attach = CrossingAttach::Of(catalog);
+	auto statement = attach.RemoteStatement(context, Transaction::Get(context, catalog));
+	bind_data->table.source.Planned(*fragment.plan);
+
+	CrossingRemoteSlice slice;
+	slice.id = statement->Remote().NextSliceId();
+	slice.ordered = PlanIsOrdered(*fragment.plan) || Settings::Get<PreserveInsertionOrderSetting>(context);
+	slice.borrowed = fragment.plan.get();
+	slice.keep = bind_data->fragment;
+	optional_ptr<PhysicalOperator> feed;
+	unique_ptr<CrossingRemoteSeamSink> seam;
+	optional_idx estimate;
+	if (!children.empty()) {
+		feed = planner.CreatePlan(*children[0]);
+		seam = CrossingSeamSinkOf(context, *feed);
+		estimate = feed->estimated_cardinality;
+	}
+	return PlanCrossingRemote(context, planner, types, std::move(statement), std::move(slice), std::move(columns),
+	                          std::move(seam), feed, estimate, estimated_cardinality);
 }
 
 vector<ColumnBinding> LogicalCrossingRead::GetColumnBindings() {
@@ -336,135 +251,6 @@ void LogicalCrossingRead::Serialize(Serializer &) const {
 
 void LogicalCrossingRead::ResolveTypes() {
 	types = output_types;
-}
-
-CrossingRead::CrossingRead(PhysicalPlan &physical_plan, vector<LogicalType> types_p,
-                           unique_ptr<CrossingBindData> bind_data_p, vector<column_t> column_ids_p,
-                           idx_t estimated_cardinality)
-    : PhysicalOperator(physical_plan, PhysicalOperatorType::EXTENSION, std::move(types_p), estimated_cardinality),
-      bind_data(std::move(bind_data_p)), column_ids(std::move(column_ids_p)) {
-}
-
-unique_ptr<GlobalSourceState> CrossingRead::GetGlobalSourceState(ClientContext &context) const {
-	if (!bind_data->fragment) {
-		throw InternalException("crossing: the scan of '%s' has no fragment", bind_data->SourceTable());
-	}
-	auto state = PrepareReadState(*bind_data->fragment, bind_data->SourceTable(), column_ids);
-
-	auto &catalog = ReadingCatalog(context, *bind_data);
-	auto &session = CrossingAttach::Of(catalog).Session(context, Transaction::Get(context, catalog));
-	state->scan = session.Read(context, *state->query);
-	CheckScanPartitions(*state, bind_data->SourceTable());
-	return std::move(state);
-}
-
-unique_ptr<LocalSourceState> CrossingRead::GetLocalSourceState(ExecutionContext &, GlobalSourceState &gstate) const {
-	auto &state = gstate.Cast<CrossingReadGlobalState>();
-	auto local = make_uniq<CrossingReadLocalState>();
-	local->source_chunk.Initialize(Allocator::DefaultAllocator(), state.query->types);
-	return std::move(local);
-}
-
-SourceResultType CrossingRead::GetDataInternal(ExecutionContext &context, DataChunk &output,
-                                               OperatorSourceInput &input) const {
-	auto &source_table = bind_data->SourceTable();
-	auto &state = input.global_state.Cast<CrossingReadGlobalState>();
-	auto &local = input.local_state.Cast<CrossingReadLocalState>();
-	while (true) {
-		if (!local.reader) {
-			auto claimed = state.next_partition.fetch_add(1);
-			if (claimed >= state.scan.partitions) {
-				return SourceResultType::FINISHED;
-			}
-			local.reader = state.scan.open(context.client, claimed);
-			if (!local.reader) {
-				throw InternalException("crossing: the scan of '%s' opened no reader for partition %llu", source_table,
-				                        claimed);
-			}
-			local.partition = claimed;
-		}
-		auto parking = CrossingParking::Of(input.interrupt_state);
-		local.source_chunk.Reset();
-		auto pulled = local.reader(context.client, local.source_chunk, parking->Waker());
-		if (pulled.outcome == CrossingReadResult::Outcome::WAIT) {
-			SourceResultType result;
-			if (ParkSource(*parking, state, result)) {
-				if (result == SourceResultType::FINISHED) {
-					local.reader = nullptr;
-				}
-				return result;
-			}
-			continue;
-		}
-		if (pulled.outcome == CrossingReadResult::Outcome::DONE || local.source_chunk.size() == 0) {
-			local.reader = nullptr;
-			state.finished_partitions++;
-			continue;
-		}
-		auto &expected = state.query->types;
-		auto produced = local.source_chunk.GetTypes();
-		if (produced != expected) {
-			throw InvalidInputException("crossing: the reader for '%s' filled a chunk of types [%s], the "
-			                            "query wants [%s]",
-			                            source_table, TypeList(produced), TypeList(expected));
-		}
-		// A reader may report its row count on the chunk alone; every vector read below needs it too.
-		local.source_chunk.SetChildCardinality(local.source_chunk.size());
-		CheckBatchIndex(state, local, pulled, source_table);
-		local.batch_index = pulled.batch_index;
-		EmitChunk(state, local.source_chunk, output);
-		return SourceResultType::HAVE_MORE_OUTPUT;
-	}
-}
-
-ProgressData CrossingRead::GetProgress(ClientContext &, GlobalSourceState &gstate) const {
-	auto &state = gstate.Cast<CrossingReadGlobalState>();
-	ProgressData progress;
-	progress.done = static_cast<double>(state.finished_partitions.load());
-	progress.total = static_cast<double>(state.scan.partitions);
-	return progress;
-}
-
-OperatorPartitionData CrossingRead::GetPartitionData(ExecutionContext &, DataChunk &, GlobalSourceState &gstate,
-                                                     LocalSourceState &lstate,
-                                                     const OperatorPartitionInfo &partition_info) const {
-	if (partition_info.RequiresPartitionColumns()) {
-		throw InternalException("crossing: a read cannot partition by columns");
-	}
-	auto &state = gstate.Cast<CrossingReadGlobalState>();
-	auto &local = lstate.Cast<CrossingReadLocalState>();
-	return OperatorPartitionData(state.scan.batch_indexed ? local.batch_index.GetIndex() : local.partition);
-}
-
-//! The source ran the ORDER BY: no operator above re-sorts, so the rows must keep the order they
-//! arrive in even when insertion order is not preserved.
-OrderPreservationType CrossingRead::SourceOrder() const {
-	auto &fragment = bind_data->fragment;
-	if (fragment && fragment->plan && PlanIsOrdered(*fragment->plan)) {
-		return OrderPreservationType::FIXED_ORDER;
-	}
-	return OrderPreservationType::INSERTION_ORDER;
-}
-
-string CrossingRead::GetName() const {
-	return "CROSSING_READ";
-}
-
-InsertionOrderPreservingMap<string> CrossingRead::ParamsToString() const {
-	return bind_data->Params();
-}
-
-bool ParkSource(CrossingParking &parking, GlobalSourceState &state, SourceResultType &result) {
-	const annotated_lock_guard<annotated_mutex> guard {state.lock};
-	if (parking.Park(state)) {
-		result = SourceResultType::BLOCKED;
-		return true;
-	}
-	if (!state.CanBlock()) {
-		result = SourceResultType::FINISHED;
-		return true;
-	}
-	return false;
 }
 
 } // namespace duckdb

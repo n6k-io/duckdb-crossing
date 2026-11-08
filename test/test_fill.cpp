@@ -14,32 +14,42 @@ SeamFill Split(unique_ptr<LogicalOperator> feed, CrossingFragment &fragment,
 	return FillSeamFromFeed(std::move(feed), fragment, StubSource(), stop, TestIndices());
 }
 
+const char *const READ_OF_THE_SOURCE = "proj{id, amt} | crossing[proj{id, amt} | scan]";
+
 } // namespace
 
-TEST_CASE("rows the target holds fill the seam", "[split]") {
+TEST_CASE("rows the target holds stay on the target", "[split]") {
 	auto fragment = FragmentOverSeam(TwoIntegers());
 
 	auto split = Split(PlanFromDSL("proj{c0, c1} | rows"), *fragment);
 
-	REQUIRE(!split.remainder);
-	REQUIRE_FRAGMENT(*fragment, "proj{c0, c1} | proj{c0, c1} | rows");
+	REQUIRE_PLAN(split.remainder, "proj{c0, c1} | rows");
+	REQUIRE(split.obstacle == "the feed reads nothing of the source");
 }
 
-TEST_CASE("a whole chain crosses at once", "[split]") {
+TEST_CASE("an operator a source stacks on the seam stays above the rows", "[split]") {
+	auto fragment = FragmentOverSeam(TwoIntegers());
+
+	Split(PlanFromDSL("proj{c0, c1} | rows"), *fragment);
+
+	REQUIRE_FRAGMENT(*fragment, "proj{c0, c1} | seam");
+}
+
+TEST_CASE("work the source could compute over rows stays with the rows", "[split]") {
 	auto fragment = FragmentOverSeam(TwoIntegers());
 
 	auto split = Split(PlanFromDSL("proj{c0, c1} | filter{true} | proj{c0, c1} | rows"), *fragment);
 
-	REQUIRE(!split.remainder);
+	REQUIRE_PLAN(split.remainder, "proj{c0, c1} | filter{true} | proj{c0, c1} | rows");
 	REQUIRE(split.seam_types == TwoIntegers());
 	REQUIRE(fragment->seam_types == TwoIntegers());
-	REQUIRE_FRAGMENT(*fragment, "proj{c0, c1} | proj{c0, c1} | filter{true} | proj{c0, c1} | rows");
+	REQUIRE_FRAGMENT(*fragment, "proj{c0, c1} | seam");
 }
 
 TEST_CASE("what fills the seam answers to the seam's index", "[split]") {
 	auto fragment = FragmentOverSeam(TwoIntegers());
 
-	Split(PlanFromDSL("proj{c0, c1} | rows"), *fragment);
+	Split(PlanFromDSL(READ_OF_THE_SOURCE), *fragment);
 
 	REQUIRE(!fragment->SeamSlot());
 	auto &above = fragment->plan->Cast<LogicalProjection>().expressions[0]->Cast<BoundColumnRefExpression>();
@@ -51,7 +61,7 @@ TEST_CASE("the fragment still emits what it did before the fill", "[split]") {
 	auto fragment = FragmentOverSeam(TwoIntegers());
 	auto before = fragment->plan->types;
 
-	Split(PlanFromDSL("proj{c0, c1} | rows"), *fragment);
+	Split(PlanFromDSL(READ_OF_THE_SOURCE), *fragment);
 
 	REQUIRE(fragment->plan->types == before);
 }
@@ -65,79 +75,71 @@ TEST_CASE("a read of the same source fills the seam with its own plan", "[split]
 	REQUIRE_FRAGMENT(*fragment, "proj{c0, c1} | proj{id, amt} | filter{amt > 100} | proj{id, amt} | scan");
 }
 
-TEST_CASE("a node the source cannot compute is where the feed splits", "[split]") {
+TEST_CASE("a node the source cannot compute keeps the whole feed on the target", "[split]") {
 	auto fragment = FragmentOverSeam(TwoIntegers());
 
 	auto split = Split(PlanFromDSL("proj{c0, c1} | filter{target_only(c0)} | rows"), *fragment);
 
-	REQUIRE_PLAN(split.remainder, "filter{target_only(c0)} | rows");
-	REQUIRE_FRAGMENT(*fragment, "proj{c0, c1} | proj{c0, c1} | seam");
+	REQUIRE_PLAN(split.remainder, "proj{c0, c1} | filter{target_only(c0)} | rows");
+	REQUIRE_FRAGMENT(*fragment, "proj{c0, c1} | seam");
 	REQUIRE(split.obstacle == "filter is not something the source can compute: the memory source has no target_only");
 	REQUIRE(split.seam_types == TwoIntegers());
 }
 
-TEST_CASE("everything above the split crosses", "[split]") {
+TEST_CASE("nothing above a node the source cannot compute crosses", "[split]") {
 	auto fragment = FragmentOverSeam(TwoIntegers());
 
 	auto split =
 	    Split(PlanFromDSL("proj{c0, c1} | filter{true} | proj{c0, c1} | filter{target_only(c0)} | rows"), *fragment);
 
-	REQUIRE_PLAN(split.remainder, "filter{target_only(c0)} | rows");
-	REQUIRE_FRAGMENT(*fragment, "proj{c0, c1} | proj{c0, c1} | filter{true} | proj{c0, c1} | seam");
+	REQUIRE_PLAN(split.remainder, "proj{c0, c1} | filter{true} | proj{c0, c1} | filter{target_only(c0)} | rows");
+	REQUIRE_FRAGMENT(*fragment, "proj{c0, c1} | seam");
 }
 
-TEST_CASE("a mixed filter leaves only the half the source cannot compute", "[split]") {
+TEST_CASE("a mixed filter over rows stays whole on the target", "[split]") {
 	auto fragment = FragmentOverSeam(TwoIntegers());
 
 	auto split = Split(PlanFromDSL("proj{c0, c1} | filter{c0 > 1, target_only(c0)} | rows"), *fragment);
 
-	REQUIRE_PLAN(split.remainder, "filter{target_only(c0)} | rows");
-	REQUIRE_FRAGMENT(*fragment, "proj{c0, c1} | proj{c0, c1} | filter{c0 > 1} | seam");
+	REQUIRE_PLAN(split.remainder, "proj{c0, c1} | filter{c0 > 1, target_only(c0)} | rows");
+	REQUIRE_FRAGMENT(*fragment, "proj{c0, c1} | seam");
 }
 
-TEST_CASE("a read of another source is the boundary", "[split]") {
+TEST_CASE("a read of another source keeps the whole feed on the target", "[split]") {
 	auto fragment = FragmentOverSeam(TwoIntegers());
 	auto feed = Build(Proj("id", "amt"), Filter(Gt(Col("amt"), Int(100))), ScanOf("elsewhere"));
 
 	auto split = Split(std::move(feed), *fragment);
 
-	REQUIRE_PLAN(split.remainder, "crossing[proj{id, amt} | scan]");
-	REQUIRE_FRAGMENT(*fragment, "proj{c0, c1} | proj{id, amt} | filter{amt > 100} | seam");
+	REQUIRE_PLAN(split.remainder, "proj{id, amt} | filter{amt > 100} | crossing[proj{id, amt} | scan]");
+	REQUIRE_FRAGMENT(*fragment, "proj{c0, c1} | seam");
 	REQUIRE(split.obstacle == "a read of another source stays on the target");
 }
 
-TEST_CASE("the seam takes the boundary's shape, not the row's", "[split]") {
+TEST_CASE("the seam keeps its shape when the feed stays", "[split]") {
 	auto fragment = FragmentOverSeam({LogicalType::INTEGER});
 
 	auto split = Split(PlanFromDSL("proj{c0} | filter{target_only(c0)} | rows"), *fragment);
 
-	REQUIRE(split.seam_types == TwoIntegers());
-	REQUIRE(fragment->seam_types == TwoIntegers());
-	REQUIRE_FRAGMENT(*fragment, "proj{c0} | proj{c0} | seam");
+	REQUIRE(split.seam_types == vector<LogicalType> {LogicalType::INTEGER});
+	REQUIRE(fragment->seam_types == vector<LogicalType> {LogicalType::INTEGER});
+	REQUIRE_FRAGMENT(*fragment, "proj{c0} | seam");
 	REQUIRE_NOTHROW(fragment->VerifyInvariants());
 }
 
-TEST_CASE("the crossed prefix reads the new seam", "[split]") {
-	auto fragment = FragmentOverSeam(TwoIntegers());
+TEST_CASE("a feed that stays must emit the seam's row", "[split]") {
+	auto fragment = FragmentOverSeam({LogicalType::INTEGER});
 
-	Split(PlanFromDSL("proj{c0, c1} | proj{c0, c1} | filter{target_only(c0)} | rows"), *fragment);
-
-	auto &seam = **fragment->SeamSlot();
-	auto seam_index = seam.Cast<LogicalGet>().table_index;
-	auto &above = *fragment->plan->children[0]->children[0];
-	for (auto &expr : above.expressions) {
-		REQUIRE(expr->Cast<BoundColumnRefExpression>().Binding().table_index == seam_index);
-	}
+	REQUIRE_THROWS_AS(Split(PlanFromDSL("proj{c0, c1} | rows"), *fragment), InternalException);
 }
 
-TEST_CASE("a stop at the root keeps the whole feed on the target", "[split]") {
+TEST_CASE("a stop keeps the whole feed on the target", "[split]") {
 	auto fragment = FragmentOverSeam(TwoIntegers());
-	auto feed = PlanFromDSL("proj{c0, c1} | rows");
 	SeamObstacle stop;
-	stop.node = feed.get();
+	stop.stays = true;
 	stop.obstacle = "the rows are wanted back";
 
-	auto split = Split(std::move(feed), *fragment, stop);
+	auto split = Split(PlanFromDSL("proj{c0, c1} | rows"), *fragment, stop);
 
 	REQUIRE_PLAN(split.remainder, "proj{c0, c1} | rows");
 	REQUIRE_FRAGMENT(*fragment, "proj{c0, c1} | seam");
@@ -145,31 +147,28 @@ TEST_CASE("a stop at the root keeps the whole feed on the target", "[split]") {
 	REQUIRE(split.seam_types == TwoIntegers());
 }
 
-TEST_CASE("a stop below the root crosses what is above it", "[split]") {
+TEST_CASE("a stop keeps a read of the same source on the target", "[split]") {
 	auto fragment = FragmentOverSeam(TwoIntegers());
-	auto feed = PlanFromDSL("proj{c0, c1} | proj{c0, c1} | rows");
 	SeamObstacle stop;
-	stop.node = feed->children[0].get();
-	stop.obstacle = "the rows are wanted back";
+	stop.stays = true;
 
-	auto split = Split(std::move(feed), *fragment, stop);
+	auto split = Split(PlanFromDSL(READ_OF_THE_SOURCE), *fragment, stop);
 
-	REQUIRE_PLAN(split.remainder, "proj{c0, c1} | rows");
-	REQUIRE_FRAGMENT(*fragment, "proj{c0, c1} | proj{c0, c1} | seam");
+	REQUIRE_PLAN(split.remainder, READ_OF_THE_SOURCE);
+	REQUIRE_FRAGMENT(*fragment, "proj{c0, c1} | seam");
 }
 
-TEST_CASE("a stop at the root of a row the seam does not take is refused", "[split]") {
+TEST_CASE("a stop of a row the seam does not take is refused", "[split]") {
 	auto fragment = FragmentOverSeam({LogicalType::INTEGER});
-	auto feed = PlanFromDSL("proj{c0, c1} | rows");
 	SeamObstacle stop;
-	stop.node = feed.get();
+	stop.stays = true;
 
-	REQUIRE_THROWS_AS(Split(std::move(feed), *fragment, stop), InternalException);
+	REQUIRE_THROWS_AS(Split(PlanFromDSL("proj{c0, c1} | rows"), *fragment, stop), InternalException);
 }
 
 TEST_CASE("a fragment with no seam cannot be split into", "[split]") {
 	auto fragment = FragmentOverSeam(TwoIntegers());
-	Split(PlanFromDSL("proj{c0, c1} | rows"), *fragment);
+	Split(PlanFromDSL(READ_OF_THE_SOURCE), *fragment);
 
-	REQUIRE_THROWS_AS(Split(PlanFromDSL("proj{c0, c1} | rows"), *fragment), InternalException);
+	REQUIRE_THROWS_AS(Split(PlanFromDSL(READ_OF_THE_SOURCE), *fragment), InternalException);
 }

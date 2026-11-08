@@ -1,5 +1,7 @@
 #include "crossing.hpp"
 #include "crossing_substrait.hpp"
+#include "internal/floor.hpp"
+#include "internal/seam.hpp"
 #include "substrait_types.hpp"
 
 #include "duckdb/catalog/catalog_entry/table_catalog_entry.hpp"
@@ -42,6 +44,7 @@
 #include "duckdb/storage/arena_allocator.hpp"
 
 #include <algorithm>
+#include <cmath>
 #include <unordered_map>
 
 namespace duckdb {
@@ -59,6 +62,7 @@ using duckdb_yyjson::yyjson_mut_obj_add_int;
 using duckdb_yyjson::yyjson_mut_obj_add_real;
 using duckdb_yyjson::yyjson_mut_obj_add_str;
 using duckdb_yyjson::yyjson_mut_obj_add_strcpy;
+using duckdb_yyjson::yyjson_mut_obj_add_strncpy;
 using duckdb_yyjson::yyjson_mut_obj_add_uint;
 using duckdb_yyjson::yyjson_mut_obj_add_val;
 using duckdb_yyjson::yyjson_mut_val;
@@ -85,19 +89,6 @@ const char *ComparisonName(ExpressionType type) {
 		return "is_not_distinct_from";
 	default:
 		return nullptr;
-	}
-}
-
-string SeamTableName(const LogicalColumnDataGet &rows) {
-	return "seam_" + std::to_string(rows.table_index.index);
-}
-
-void CollectSeams(const LogicalOperator &op, vector<SubstraitSeam> &out) {
-	if (auto rows = SeamRowsOf(op)) {
-		out.push_back(SubstraitSeam {SeamTableName(op.Cast<LogicalColumnDataGet>()), *rows});
-	}
-	for (auto &child : op.children) {
-		CollectSeams(*child, out);
 	}
 }
 
@@ -294,19 +285,140 @@ public:
 	string Render(const LogicalOperator &plan) {
 		vector<ColumnBinding> bindings;
 		auto *rel = Rel(const_cast<LogicalOperator &>(plan), bindings); // NOLINT(cppcoreguidelines-pro-type-const-cast)
+		auto *relations = yyjson_mut_arr(doc);
+		yyjson_mut_arr_add_val(relations, Root(rel, bindings.size()));
+		return Plan(relations);
+	}
 
+	string Render(const vector<SubstraitSlice> &slices) {
+		auto *relations = yyjson_mut_arr(doc);
+		for (auto &slice : slices) {
+			seam_slice = slice;
+			vector<ColumnBinding> bindings;
+			yyjson_mut_val *input = nullptr;
+			if (slice.source) {
+				input = Rel(const_cast<LogicalOperator &>(*slice.source), bindings); // NOLINT
+			}
+			if (slice.write) {
+				input = Write(*slice.write, input, bindings);
+				bindings.resize(slice.write->returning.empty() ? 1 : slice.write->returning.size());
+			}
+			auto *detail = Detail("Slice");
+			yyjson_mut_obj_add_uint(doc, detail, "id", slice.id);
+			yyjson_mut_obj_add_bool(doc, detail, "ordered", slice.ordered);
+			yyjson_mut_arr_add_val(relations, Root(ExtensionSingle(input, detail), bindings.size()));
+		}
+		seam_slice = nullptr;
+		return Plan(relations);
+	}
+
+private:
+	yyjson_mut_val *Root(yyjson_mut_val *rel, idx_t width) {
 		auto *root_obj = yyjson_mut_obj(doc);
 		auto *root = yyjson_mut_obj(doc);
 		yyjson_mut_obj_add_val(doc, root, "input", rel);
 		auto *names = yyjson_mut_arr(doc);
-		for (idx_t i = 0; i < bindings.size(); i++) {
+		for (idx_t i = 0; i < width; i++) {
 			yyjson_mut_arr_add_strcpy(doc, names, ("c" + std::to_string(i)).c_str());
 		}
 		yyjson_mut_obj_add_val(doc, root, "names", names);
 		yyjson_mut_obj_add_val(doc, root_obj, "root", root);
-		auto *relations = yyjson_mut_arr(doc);
-		yyjson_mut_arr_add_val(relations, root_obj);
+		return root_obj;
+	}
 
+	yyjson_mut_val *Strings(const vector<string> &values) {
+		auto *array = yyjson_mut_arr(doc);
+		for (auto &value : values) {
+			yyjson_mut_arr_add_strcpy(doc, array, value.c_str());
+		}
+		return array;
+	}
+
+	yyjson_mut_val *Exprs(const vector<reference<const Expression>> &values, const vector<ColumnBinding> &scope) {
+		auto *array = yyjson_mut_arr(doc);
+		for (auto &value : values) {
+			yyjson_mut_arr_add_val(array, Expr(value.get(), scope));
+		}
+		return array;
+	}
+
+	//! `bindings` are the source's.
+	yyjson_mut_val *Write(const SubstraitWrite &write, yyjson_mut_val *input, const vector<ColumnBinding> &bindings) {
+		vector<ColumnBinding> scope;
+		for (idx_t c = 0; c < write.target_columns.size(); c++) {
+			scope.emplace_back(TableIndex(write.target_index), ProjectionIndex(c));
+		}
+		if (write.source_index.IsValid()) {
+			for (idx_t c = 0; c < bindings.size(); c++) {
+				scope.emplace_back(TableIndex(write.source_index.GetIndex()), ProjectionIndex(c));
+			}
+		} else {
+			scope.insert(scope.end(), bindings.begin(), bindings.end());
+		}
+
+		auto *detail = Detail("Write");
+		yyjson_mut_obj_add_uint(doc, detail, "verb", static_cast<uint8_t>(write.verb));
+		yyjson_mut_obj_add_bool(doc, detail, "merge", write.merge);
+		yyjson_mut_obj_add_uint(doc, detail, "onConflict", write.on_conflict);
+		yyjson_mut_obj_add_strcpy(doc, detail, "catalog", write.catalog.c_str());
+		yyjson_mut_obj_add_strcpy(doc, detail, "schema", write.schema.c_str());
+		yyjson_mut_obj_add_strcpy(doc, detail, "table", write.table.c_str());
+		yyjson_mut_obj_add_val(doc, detail, "targetColumns", Strings(write.target_columns));
+		yyjson_mut_obj_add_uint(doc, detail, "sourceWidth", bindings.size());
+		if (write.condition) {
+			yyjson_mut_obj_add_val(doc, detail, "condition", Expr(*write.condition, scope));
+		}
+		yyjson_mut_obj_add_val(doc, detail, "setColumns", Strings(write.set_columns));
+		yyjson_mut_obj_add_val(doc, detail, "values", Exprs(write.values, scope));
+		yyjson_mut_obj_add_val(doc, detail, "returning", Strings(write.returning));
+		auto *returning_types = yyjson_mut_arr(doc);
+		for (auto &type : write.returning_types) {
+			yyjson_mut_arr_add_val(returning_types, Type(type));
+		}
+		yyjson_mut_obj_add_val(doc, detail, "returningTypes", returning_types);
+		auto *actions = yyjson_mut_arr(doc);
+		for (auto &action : write.actions) {
+			auto *entry = yyjson_mut_obj(doc);
+			yyjson_mut_obj_add_strcpy(doc, entry, "when", EnumUtil::ToChars(action.when));
+			yyjson_mut_obj_add_strcpy(doc, entry, "type", EnumUtil::ToChars(action.type));
+			if (action.condition) {
+				yyjson_mut_obj_add_val(doc, entry, "condition", Expr(*action.condition, scope));
+			}
+			yyjson_mut_obj_add_val(doc, entry, "columns", Strings(action.columns));
+			yyjson_mut_obj_add_val(doc, entry, "values", Exprs(action.values, scope));
+			yyjson_mut_arr_add_val(actions, entry);
+		}
+		yyjson_mut_obj_add_val(doc, detail, "actions", actions);
+		if (input) {
+			return ExtensionSingle(input, detail);
+		}
+		auto *rel = yyjson_mut_obj(doc);
+		yyjson_mut_obj_add_val(doc, rel, "detail", detail);
+		return Wrap("extensionLeaf", rel);
+	}
+
+	yyjson_mut_val *SeamRead(LogicalGet &get, vector<ColumnBinding> &out) {
+		if (!seam_slice) {
+			throw NotImplementedException("substrait: a seam outside a statement's slices");
+		}
+		auto *detail = Detail("Seam");
+		yyjson_mut_obj_add_uint(doc, detail, "id", seam_slice->id);
+		yyjson_mut_obj_add_bool(doc, detail, "ordered", seam_slice->seam_ordered);
+		if (seam_slice->seam_estimate.IsValid()) {
+			yyjson_mut_obj_add_uint(doc, detail, "estimate", seam_slice->seam_estimate.GetIndex());
+		}
+		auto *types = yyjson_mut_arr(doc);
+		for (auto &type : get.returned_types) {
+			yyjson_mut_arr_add_val(types, Type(type));
+		}
+		yyjson_mut_obj_add_val(doc, detail, "types", types);
+		auto *rel = yyjson_mut_obj(doc);
+		yyjson_mut_obj_add_val(doc, rel, "detail", detail);
+		out = get.GetColumnBindings();
+		return Wrap("extensionLeaf", rel);
+	}
+
+	string Plan(yyjson_mut_val *relations) {
 		auto *plan_obj = yyjson_mut_obj(doc);
 		auto *version = yyjson_mut_obj(doc);
 		yyjson_mut_obj_add_int(doc, version, "minorNumber", SUBSTRAIT_MINOR_VERSION);
@@ -391,6 +503,17 @@ private:
 		return Wrap("selection", sel);
 	}
 
+	yyjson_mut_val *TextCast(const Value &value) {
+		auto text = value.ToString();
+		auto *string_lit = yyjson_mut_obj(doc);
+		yyjson_mut_obj_add_strncpy(doc, string_lit, "string", text.data(), text.size());
+		auto *cast = yyjson_mut_obj(doc);
+		yyjson_mut_obj_add_val(doc, cast, "type", Type(value.type()));
+		yyjson_mut_obj_add_val(doc, cast, "input", Wrap("literal", string_lit));
+		yyjson_mut_obj_add_str(doc, cast, "failureBehavior", "FAILURE_BEHAVIOR_THROW_EXCEPTION");
+		return Wrap("cast", cast);
+	}
+
 	yyjson_mut_val *Literal(const Value &value) {
 		auto *lit = yyjson_mut_obj(doc);
 		auto &type = value.type();
@@ -415,26 +538,27 @@ private:
 			yyjson_mut_obj_add_strcpy(doc, lit, "i64", std::to_string(value.GetValue<int64_t>()).c_str());
 			break;
 		case LogicalTypeId::FLOAT:
+			if (!std::isfinite(value.GetValue<float>())) {
+				return TextCast(value);
+			}
 			yyjson_mut_obj_add_real(doc, lit, "fp32", value.GetValue<float>());
 			break;
 		case LogicalTypeId::DOUBLE:
+			if (!std::isfinite(value.GetValue<double>())) {
+				return TextCast(value);
+			}
 			yyjson_mut_obj_add_real(doc, lit, "fp64", value.GetValue<double>());
 			break;
-		case LogicalTypeId::VARCHAR:
-			yyjson_mut_obj_add_strcpy(doc, lit, "string", StringValue::Get(value).c_str());
+		case LogicalTypeId::VARCHAR: {
+			auto &text = StringValue::Get(value);
+			yyjson_mut_obj_add_strncpy(doc, lit, "string", text.data(), text.size());
 			break;
+		}
 		case LogicalTypeId::DATE:
 			yyjson_mut_obj_add_int(doc, lit, "date", value.GetValue<date_t>().days);
 			break;
-		default: {
-			auto *string_lit = yyjson_mut_obj(doc);
-			yyjson_mut_obj_add_strcpy(doc, string_lit, "string", value.ToString().c_str());
-			auto *cast = yyjson_mut_obj(doc);
-			yyjson_mut_obj_add_val(doc, cast, "type", Type(type));
-			yyjson_mut_obj_add_val(doc, cast, "input", Wrap("literal", string_lit));
-			yyjson_mut_obj_add_str(doc, cast, "failureBehavior", "FAILURE_BEHAVIOR_THROW_EXCEPTION");
-			return Wrap("cast", cast);
-		}
+		default:
+			return TextCast(value);
 		}
 		return Wrap("literal", lit);
 	}
@@ -714,7 +838,8 @@ private:
 		auto *items = yyjson_mut_arr(doc);
 		for (auto &column : get.GetColumnIds()) {
 			auto *item = yyjson_mut_obj(doc);
-			yyjson_mut_obj_add_uint(doc, item, "field", column.IsVirtualColumn() ? 0 : column.GetPrimaryIndex());
+			yyjson_mut_obj_add_uint(doc, item, "field",
+			                        column.IsVirtualColumn() ? get.names.size() : column.GetPrimaryIndex());
 			yyjson_mut_arr_add_val(items, item);
 		}
 		yyjson_mut_obj_add_val(doc, select, "structItems", items);
@@ -751,16 +876,25 @@ private:
 		return Wrap("read", read);
 	}
 
-	yyjson_mut_val *SeamRead(LogicalColumnDataGet &rows, vector<ColumnBinding> &out) {
+	yyjson_mut_val *RowsRead(LogicalColumnDataGet &get, vector<ColumnBinding> &out) {
+		auto *rows = yyjson_mut_arr(doc);
+		for (auto &chunk : get.collection->Chunks()) {
+			for (idx_t r = 0; r < chunk.size(); r++) {
+				auto *fields = yyjson_mut_arr(doc);
+				for (idx_t c = 0; c < chunk.ColumnCount(); c++) {
+					yyjson_mut_arr_add_val(fields, Literal(chunk.GetValue(c, r)));
+				}
+				auto *row = yyjson_mut_obj(doc);
+				yyjson_mut_obj_add_val(doc, row, "fields", fields);
+				yyjson_mut_arr_add_val(rows, row);
+			}
+		}
+		auto *table = yyjson_mut_obj(doc);
+		yyjson_mut_obj_add_val(doc, table, "expressions", rows);
 		auto *read = yyjson_mut_obj(doc);
-		auto *named = yyjson_mut_obj(doc);
-		auto *table_names = yyjson_mut_arr(doc);
-
-		yyjson_mut_arr_add_strcpy(doc, table_names, SeamTableName(rows).c_str());
-		yyjson_mut_obj_add_val(doc, read, "baseSchema", BaseSchema(rows.chunk_types));
-		yyjson_mut_obj_add_val(doc, named, "names", table_names);
-		yyjson_mut_obj_add_val(doc, read, "namedTable", named);
-		out = rows.GetColumnBindings();
+		yyjson_mut_obj_add_val(doc, read, "baseSchema", BaseSchema(get.chunk_types));
+		yyjson_mut_obj_add_val(doc, read, "virtualTable", table);
+		out = get.GetColumnBindings();
 		return Wrap("read", read);
 	}
 
@@ -949,9 +1083,12 @@ private:
 	yyjson_mut_val *Rel(LogicalOperator &op, vector<ColumnBinding> &out) {
 		switch (op.type) {
 		case LogicalOperatorType::LOGICAL_GET:
+			if (op.Cast<LogicalGet>().function.GetName() == CROSSING_SEAM_FUNCTION) {
+				return SeamRead(op.Cast<LogicalGet>(), out);
+			}
 			return Read(op.Cast<LogicalGet>(), out);
 		case LogicalOperatorType::LOGICAL_CHUNK_GET:
-			return SeamRead(op.Cast<LogicalColumnDataGet>(), out);
+			return RowsRead(op.Cast<LogicalColumnDataGet>(), out);
 		case LogicalOperatorType::LOGICAL_EMPTY_RESULT:
 			return EmptyRead(op.Cast<LogicalEmptyResult>(), out);
 		case LogicalOperatorType::LOGICAL_MATERIALIZED_CTE: {
@@ -1137,6 +1274,7 @@ private:
 	}
 
 	yyjson_mut_doc *doc;
+	optional_ptr<const SubstraitSlice> seam_slice;
 	std::unordered_map<string, uint32_t> anchors;
 	vector<FunctionEntry> function_list;
 	vector<std::pair<string, uint32_t>> uri_list;
@@ -1147,6 +1285,11 @@ private:
 string RenderSubstraitJson(const LogicalOperator &plan) {
 	Renderer renderer;
 	return renderer.Render(plan);
+}
+
+string RenderSubstraitSlices(const vector<SubstraitSlice> &slices) {
+	Renderer renderer;
+	return renderer.Render(slices);
 }
 
 bool SubstraitCanRenderCall(const Expression &expr, string &reason) {
@@ -1193,12 +1336,6 @@ bool SubstraitCanRenderCall(const Expression &expr, string &reason) {
 		}
 	}
 	return true;
-}
-
-vector<SubstraitSeam> SubstraitSeamsOf(const LogicalOperator &plan) {
-	vector<SubstraitSeam> out;
-	CollectSeams(plan, out);
-	return out;
 }
 
 bool SubstraitCanRenderOperator(const LogicalOperator &op, string &reason) {
