@@ -1267,11 +1267,7 @@ private:
 		}
 		if (auto *set = yyjson_obj_get(node, "set")) {
 			auto *inputs = Require(set, "inputs");
-			if (yyjson_arr_size(inputs) != 2) {
-				throw InvalidInputException("substrait: a set operation needs two inputs");
-			}
-			auto left = Rel(yyjson_arr_get(inputs, 0));
-			auto right = Rel(yyjson_arr_get(inputs, 1));
+			auto input_count = yyjson_arr_size(inputs);
 			auto op = StrOf(set, "op");
 			SetOperationType type;
 			if (op == "SET_OP_UNION_ALL" || op == "SET_OP_UNION_DISTINCT") {
@@ -1283,14 +1279,21 @@ private:
 			} else {
 				throw InvalidInputException("substrait: unsupported set op '%s'", op);
 			}
+			// Substrait's n-input MINUS_PRIMARY and INTERSECTION_PRIMARY are not chained EXCEPT and INTERSECT.
+			if (type == SetOperationType::UNION ? input_count < 2 : input_count != 2) {
+				throw InvalidInputException("substrait: set op '%s' cannot take %llu inputs", op, input_count);
+			}
 			bool all = op.size() >= 4 && op.compare(op.size() - 4, 4, "_ALL") == 0;
 			auto result = make_uniq<SetOperationNode>();
 			if (!all) {
 				result->modifiers.push_back(make_uniq<DistinctModifier>());
 			}
-			auto width = left.width;
-			result->children.push_back(std::move(left.node));
-			result->children.push_back(std::move(right.node));
+			idx_t width = 0;
+			for (idx_t i = 0; i < input_count; i++) {
+				auto child = Rel(yyjson_arr_get(inputs, i));
+				width = child.width;
+				result->children.push_back(std::move(child.node));
+			}
 			result->setop_type = type;
 			result->setop_all = all;
 			Built out;
