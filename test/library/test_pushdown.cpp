@@ -588,6 +588,64 @@ TEST_CASE("set operations, distinct, subqueries and CTEs over one source cross",
 	twin.Same("SELECT id, lag(amt, 1, 0) OVER (ORDER BY id) FROM far.orders ORDER BY id");
 }
 
+TEST_CASE("a chain of more than two UNION ALLs crosses", "[pushdown]") {
+	Twin twin;
+	twin.Seed();
+
+	twin.Same("SELECT count(*) FROM (SELECT tenant FROM far.orders UNION ALL SELECT tenant FROM far.orders UNION ALL "
+	          "SELECT tenant FROM far.orders)");
+}
+
+TEST_CASE("a chain of more than two UNIONs crosses", "[pushdown]") {
+	Twin twin;
+	twin.Seed();
+
+	twin.Same("SELECT tenant FROM far.orders UNION SELECT tenant FROM far.customers UNION SELECT tenant FROM "
+	          "far.orders ORDER BY tenant");
+}
+
+TEST_CASE("a chain of more than two UNION BY NAMEs crosses", "[pushdown]") {
+	Twin twin;
+	twin.Seed();
+
+	twin.Same("SELECT tenant, id FROM far.orders UNION BY NAME SELECT id, tenant FROM far.archive UNION BY NAME "
+	          "SELECT tenant FROM far.customers ORDER BY ALL");
+}
+
+TEST_CASE("a chain mixing UNION ALL and UNION crosses", "[pushdown]") {
+	Twin twin;
+	twin.Seed();
+
+	twin.Same("SELECT tenant FROM far.orders UNION ALL SELECT tenant FROM far.customers UNION SELECT tenant FROM "
+	          "far.orders ORDER BY tenant");
+}
+
+TEST_CASE("a chain of more than two EXCEPTs crosses", "[pushdown]") {
+	Twin twin;
+	twin.Seed();
+
+	twin.Same("SELECT id FROM far.orders EXCEPT SELECT id FROM far.orders WHERE tenant = 1 EXCEPT SELECT id FROM "
+	          "far.orders WHERE amt > 300 ORDER BY id");
+}
+
+TEST_CASE("a chain of more than two INTERSECTs crosses", "[pushdown]") {
+	Twin twin;
+	twin.Seed();
+
+	twin.Same("SELECT id FROM far.orders INTERSECT SELECT id FROM far.orders WHERE tenant = 1 INTERSECT SELECT id "
+	          "FROM far.orders WHERE amt > 100 ORDER BY id");
+}
+
+TEST_CASE("a chain of more than two UNION ALLs with a local branch crosses", "[pushdown]") {
+	Twin twin;
+	twin.Seed();
+	twin.Both("CREATE TABLE regions(tenant INTEGER)");
+	twin.Both("INSERT INTO regions VALUES (1), (2)");
+
+	twin.Same("SELECT count(*) FROM (SELECT tenant FROM far.orders UNION ALL SELECT tenant FROM regions UNION ALL "
+	          "SELECT tenant FROM far.customers)");
+}
+
 TEST_CASE("a sample that crosses returns the asked-for number of the source's rows", "[pushdown]") {
 	Twin twin;
 	twin.Seed();
