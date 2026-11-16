@@ -73,6 +73,10 @@ struct CrossingTable {
 	//! Constraints the source enforces. Declaring one your source does not enforce claims a
 	//! guarantee nothing keeps, so only pass what is real.
 	vector<unique_ptr<Constraint>> constraints;
+	//! Empty: no comment.
+	string comment;
+	//! Parallel to column_names, or empty. An empty string: no comment.
+	vector<string> column_comments;
 
 	void Column(string column_name, LogicalType type) {
 		column_names.push_back(std::move(column_name));

@@ -328,10 +328,16 @@ CatalogEntry &CrossingAttach::GetOrDescribe(SchemaState &state, const string &sc
 	for (idx_t c = 0; c < column_names.size(); c++) {
 		ColumnDefinition column(Identifier(column_names[c]), column_types[c]);
 		column.SetDefaultValue(SourceDefaultExpression());
+		if (c < described.column_comments.size() && !described.column_comments[c].empty()) {
+			column.SetComment(Value(described.column_comments[c]));
+		}
 		create_info->columns.AddColumn(std::move(column));
 	}
 	for (auto &constraint : described.constraints) {
 		create_info->constraints.push_back(constraint->Copy());
+	}
+	if (!described.comment.empty()) {
+		create_info->comment = Value(described.comment);
 	}
 	auto entry = make_uniq<CrossingTableCatalogEntry>(WriteCatalog(), owner, *create_info, *source, schema,
 	                                                  std::move(described));
