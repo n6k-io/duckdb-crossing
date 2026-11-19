@@ -5,8 +5,9 @@
 namespace {
 
 duckdb::shared_ptr<duckdb::FarStore> &Store() {
-	static duckdb::shared_ptr<duckdb::FarStore> store = duckdb::make_shared_ptr<duckdb::FarStore>();
-	return store;
+	// Leaked: destroying it from this module's atexit runs after statics in the host's duckdb are gone.
+	static auto *store = new duckdb::shared_ptr<duckdb::FarStore>(duckdb::make_shared_ptr<duckdb::FarStore>());
+	return *store;
 }
 
 } // namespace
