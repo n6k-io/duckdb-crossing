@@ -669,6 +669,7 @@ private:
 			}
 		}
 		window->OrderByMutable() = Orders(yyjson_obj_get(node, "sorts"), scope);
+		window->ArgOrdersMutable() = Orders(yyjson_obj_get(node, "argumentSorts"), scope);
 		window->DistinctMutable() = StrOf(node, "invocation") == "AGGREGATION_INVOCATION_DISTINCT";
 		bool range = StrOf(node, "boundsType") == "BOUNDS_TYPE_RANGE";
 		WindowBoundary start = WindowBoundary::INVALID;
@@ -1004,9 +1005,15 @@ private:
 				if (auto *filter_node = yyjson_obj_get(entry, "filter")) {
 					filter = Expr(filter_node, scope);
 				}
+				unique_ptr<OrderModifier> order;
+				auto orders = Orders(yyjson_obj_get(measure, "sorts"), scope);
+				if (!orders.empty()) {
+					order = make_uniq<OrderModifier>();
+					order->orders = std::move(orders);
+				}
 				bool distinct = StrOf(measure, "invocation") == "AGGREGATION_INVOCATION_DISTINCT";
 				select.push_back(make_uniq<FunctionExpression>(Identifier(name), std::move(args), std::move(filter),
-				                                               nullptr, distinct));
+				                                               std::move(order), distinct));
 			}
 		}
 		auto result = Numbered(AsRef(std::move(child), "crossing_select"), std::move(select));

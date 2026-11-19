@@ -120,6 +120,10 @@ struct Twin {
 		return store->LastWrite();
 	}
 
+	bool DidCross(LogicalOperatorType type) {
+		return LastRead().Has(type);
+	}
+
 private:
 	static vector<vector<Value>> Rows(TestResult &result) {
 		vector<vector<Value>> out;
