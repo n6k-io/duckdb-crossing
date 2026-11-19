@@ -219,9 +219,6 @@ string WindowObstacle(const BoundWindowExpression &window) {
 	if (window.WindowExclude() != WindowExcludeMode::NO_OTHER) {
 		return "a window EXCLUDE clause";
 	}
-	if (!window.ArgOrders().empty()) {
-		return "a window argument ORDER BY";
-	}
 	if (IsGroupsBoundary(window.WindowStart()) || IsGroupsBoundary(window.WindowEnd())) {
 		return "a GROUPS frame";
 	}
@@ -645,6 +642,9 @@ private:
 			args.push_back(Expr(*child, scope));
 		}
 		yyjson_mut_obj_add_val(doc, fn, "arguments", Arguments(args));
+		if (!window.ArgOrders().empty()) {
+			yyjson_mut_obj_add_val(doc, fn, "argumentSorts", Sorts(window.ArgOrders(), scope));
+		}
 		auto *partitions = yyjson_mut_arr(doc);
 		for (auto &partition : window.Partitions()) {
 			yyjson_mut_arr_add_val(partitions, Expr(*partition, scope));
@@ -778,9 +778,6 @@ private:
 	}
 
 	yyjson_mut_val *Measure(const BoundAggregateExpression &agg, const vector<ColumnBinding> &scope) {
-		if (agg.GetOrderBys() && !agg.GetOrderBys()->orders.empty()) {
-			throw NotImplementedException("substrait: an aggregate ORDER BY");
-		}
 		auto *measure = yyjson_mut_obj(doc);
 		auto *fn = yyjson_mut_obj(doc);
 		yyjson_mut_obj_add_uint(doc, fn, "functionReference",
@@ -794,6 +791,9 @@ private:
 			args.push_back(Expr(*child, scope));
 		}
 		yyjson_mut_obj_add_val(doc, fn, "arguments", Arguments(args));
+		if (agg.GetOrderBys()) {
+			yyjson_mut_obj_add_val(doc, fn, "sorts", Sorts(agg.GetOrderBys()->orders, scope));
+		}
 		yyjson_mut_obj_add_val(doc, measure, "measure", fn);
 		if (agg.GetFilter()) {
 			yyjson_mut_obj_add_val(doc, measure, "filter", Expr(*agg.GetFilter(), scope));
@@ -1316,13 +1316,6 @@ bool SubstraitCanRenderCall(const Expression &expr, string &reason) {
 	    expr.Cast<BoundFunctionExpression>().Function().HasBindLambdaCallback()) {
 		reason = "substrait cannot carry a lambda";
 		return false;
-	}
-	if (cls == ExpressionClass::BOUND_AGGREGATE) {
-		auto &order_bys = expr.Cast<BoundAggregateExpression>().GetOrderBys();
-		if (order_bys && !order_bys->orders.empty()) {
-			reason = "substrait cannot carry an aggregate ORDER BY";
-			return false;
-		}
 	}
 	if (BoundComparisonExpression::IsComparison(expr) && !ComparisonName(expr.GetExpressionType())) {
 		reason = string("substrait cannot carry comparison ") + EnumUtil::ToChars(expr.GetExpressionType());
